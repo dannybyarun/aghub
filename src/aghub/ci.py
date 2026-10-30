@@ -145,7 +145,8 @@ jobs:
 """
 
 
-def status(state, board):
+def status(state, board, heads=None):
+    heads = heads or {}
     tasks = list(state.tasks.values())
     open_tasks = [task for task in tasks if task.get("status") != "done"]
     waiting = [entry for entry in state.queue if entry.get("status") == "waiting"]
@@ -160,11 +161,12 @@ def status(state, board):
         task
         for task in open_tasks
         if service.review_decision(state, task["id"])[0] == "approved"
+        and not service.approval_gate(state, task, head=heads.get(task["id"]))
     ]
     gated = [
         task
         for task in open_tasks
-        if service.approval_gate(state, task)
+        if service.approval_gate(state, task, head=heads.get(task["id"]))
     ]
     return {
         "project": (state.project or {}).get("name"),

@@ -235,6 +235,7 @@ ROUTES = ["/items", "/items/{id}"]
 PY
 git_at be add -A
 git_at be commit -qm "api: billing deploy behind an approval gate"
+git_at be push -qu origin agent/be-1/T-008
 expect_fail "the task owner cannot self-approve" be review T-008 --approve --note "self approval"
 expect_fail "a task without approval cannot be submitted" be submit T-008
 fe review T-008 --request-changes --note "add a rollback check"
@@ -243,6 +244,15 @@ expect_fail "requested changes still block submit" be submit T-008
 fe review T-008 --approve --note "reviewed the billing rollout and rollback"
 fe review T-008 --json
 fe github sync --task T-008 --repo acme/store --dry-run
+cat > "$DEMO/be/src/api/billing.py" <<'PY'
+# Gated change: the update after approval must be re-reviewed.
+ROUTES = ["/items", "/items/{id}"]
+PY
+git_at be add -A
+git_at be commit -qm "api: adjust billing rollout after review"
+git_at be push -qu origin agent/be-1/T-008
+expect_fail "an approval for the old head is stale" be submit T-008
+fe review T-008 --approve --note "re-reviewed the current head"
 be submit T-008
 ci queue run
 ci verify

@@ -315,6 +315,24 @@ def _review_key(board, state, agent):
     return {}
 
 
+def _review_target(board, task, explicit=None, required=False):
+    """Resolve the commit a review applies to, preferring the pushed branch."""
+    if explicit:
+        return explicit
+    from . import review
+
+    head = review.branch_head(board, task, update=True)
+    if head or not required:
+        return head
+    branch = task.get("branch")
+    hint = (
+        f"push {branch} (or pass --commit SHA)"
+        if branch
+        else "claim the task, push its branch, and try again"
+    )
+    raise AghubError(f"{task['id']} has no commit to review — {hint}")
+
+
 def _record_review(
     board,
     agent,
@@ -356,7 +374,7 @@ def cmd_approve(args):
     task = state.tasks.get(args.task)
     if task is None:
         raise AghubError(f"unknown task {args.task}")
-    commit = args.commit or gitops.short(board.repo, "HEAD")
+    commit = _review_target(board, task, args.commit, required=True)
     record = _record_review(
         board, agent, args.task, "approved", args.note, commit, args.force
     )
@@ -371,7 +389,7 @@ def cmd_inbox(args):
 
     board = _fresh_board()
     state = board.load()
-    items = review.inbox(state)
+    items = review.inbox(state, board)
     project = (state.project or {}).get("name")
     if args.json:
         print(
@@ -396,7 +414,9 @@ def cmd_review(args):
 
     if args.approve or args.request_changes:
         decision = "approved" if args.approve else "changes_requested"
-        commit = args.commit or gitops.short(board.repo, "HEAD")
+        commit = _review_target(
+            board, task, args.commit, required=bool(args.approve)
+        )
         record = _record_review(
             board,
             agent,
@@ -1301,10 +1321,23 @@ def cmd_submit(args):
     branch = args.branch or task.get("branch")
     if not branch:
         raise AghubError(f"{args.task} has no branch — claim it first")
+    local = gitops.git(["rev-parse", branch], cwd=board.repo, check=False)
+    if local.returncode != 0:
+        detail = (local.stderr or local.stdout or "").strip()
+        raise AghubError(f"cannot resolve {branch}: {detail}")
+    head = local.stdout.strip()
+    missing = service.approval_gate(state, task, head=head)
+    if missing and not args.force:
+        raise AghubError(missing)
     push = gitops.git(["push", "-u", board.remote, branch], cwd=board.repo, check=False)
     if push.returncode != 0:
         detail = (push.stderr or push.stdout or "").strip()
         raise AghubError(f"could not push {branch}: {detail}")
+    local = gitops.git(["rev-parse", branch], cwd=board.repo, check=False)
+    head = local.stdout.strip() or head
+    missing = service.approval_gate(state, task, head=head)
+    if missing and not args.force:
+        raise AghubError(missing)
     key = (
         ensure_local_agent_key(board.common, agent)
         if service.eval_attestation_mode(state) == service.EVAL_ED25519_SCHEME
@@ -1320,6 +1353,7 @@ def cmd_submit(args):
             args.force,
             private_key=key.get("private_key"),
             public_key=key.get("public_key"),
+            head=head,
         ),
         agent=agent,
     )
@@ -1409,7 +1443,14 @@ def cmd_ci(args):
         return 0
     board = _fresh_board()
     state = board.load()
-    payload = ci.status(state, board)
+    from . import review
+
+    heads = {
+        task["id"]: review.branch_head(board, task, update=False)
+        for task in state.tasks.values()
+        if task.get("status") != "done" and task.get("requires_approval")
+    }
+    payload = ci.status(state, board, heads=heads)
     print(json.dumps(payload, indent=2, sort_keys=False))
     return 0 if payload["ok"] else 1
 
@@ -1482,6 +1523,10 @@ def cmd_github(args):
             )
         else:
             external_id = review_info.get("id")
+            if not info.get("sha"):
+                raise AghubError(
+                    "pull request head sha is missing; cannot bind this review to a commit"
+                )
             already = any(
                 item.get("source") == "github"
                 and str(item.get("external_id") or "") == str(external_id)

@@ -24,7 +24,7 @@ def _latest(entries):
     return entries[-1] if entries else None
 
 
-def inbox(state):
+def inbox(state, board=None):
     """Return actionable human-review items, highest priority first."""
     items = []
     ttl = int((state.project or {}).get("ttl_seconds", 600) or 600)
@@ -36,13 +36,19 @@ def inbox(state):
         latest_queue = _latest(entries)
         status = service.effective_status(state, task)
         decision, record = service.review_decision(state, task_id)
-        gap = service.approval_gate(state, task)
+        head = (
+            branch_head(board, task, update=True)
+            if board is not None and task.get("requires_approval")
+            else None
+        )
+        gap = service.approval_gate(state, task, head=head)
         base = {
             "task": task_id,
             "title": task.get("title") or "",
             "status": status,
             "owner": task.get("owner"),
             "branch": task.get("branch"),
+            "head": head,
             "queue": latest_queue.get("id") if latest_queue else None,
         }
 
@@ -156,6 +162,29 @@ def _fetch_branch(board, branch):
         check=False,
     )
     return ref if gitops.ref_exists(board.repo, ref) else None
+
+
+def branch_head(board, task, update=True, prefer="remote"):
+    """Resolve the task branch tip, preferring the remote for review."""
+    branch = (task or {}).get("branch")
+    if not branch:
+        return None
+    if update and board.remote:
+        _fetch_branch(board, branch)
+    refs = []
+    if board.remote:
+        refs.append(f"refs/remotes/{board.remote}/{branch}")
+    refs.append(f"refs/heads/{branch}")
+    if prefer == "local":
+        refs.reverse()
+    for ref in refs:
+        if not gitops.ref_exists(board.repo, ref):
+            continue
+        resolved = gitops.git(["rev-parse", ref], cwd=board.repo, check=False)
+        head = resolved.stdout.strip()
+        if head:
+            return head
+    return None
 
 
 def branch_changes(board, state, task, include_diff=False):
@@ -279,6 +308,13 @@ def review_packet(board, state, task_id, include_diff=False):
         raise AghubError(f"unknown task {task_id}")
     entries = _queue_for(state, task_id)
     decision, record = service.review_decision(state, task_id)
+    head = branch_head(board, task, update=True)
+    stale = bool(
+        decision == "approved"
+        and (record or {}).get("binding") == "commit"
+        and head
+        and not service.same_commit((record or {}).get("commit"), head)
+    )
     latest_handoff = next(
         (item for item in reversed(state.handoffs) if item.get("task") == task_id),
         None,
@@ -296,6 +332,9 @@ def review_packet(board, state, task_id, include_diff=False):
             "reviewer": (record or {}).get("agent"),
             "note": (record or {}).get("note") or "",
             "commit": (record or {}).get("commit"),
+            "binding": (record or {}).get("binding"),
+            "head": head,
+            "stale": stale,
             "source": (record or {}).get("source"),
             "external_id": (record or {}).get("external_id"),
             "reviews": _reviews(state, task_id),
@@ -308,6 +347,8 @@ def review_packet(board, state, task_id, include_diff=False):
         "changes": branch_changes(board, state, task, include_diff=include_diff),
         "actions": [],
     }
+    if stale:
+        packet["actions"].append(f"aghub review {task_id} --approve --note ...")
     if task.get("requires_approval") and decision != "approved":
         packet["actions"].append(f"aghub review {task_id} --approve --note ...")
         packet["actions"].append(
@@ -350,7 +391,13 @@ def render_review(packet, include_diff=False):
         label += f" by {approval['reviewer']}"
     if approval.get("note"):
         label += f" — {approval['note']}"
+    if approval.get("stale"):
+        label += " (stale; re-approve the current head)"
     lines.append(f"  review    {label}" + (" (required)" if approval["required"] else ""))
+    if approval.get("head"):
+        lines.append(f"  head      {str(approval['head'])[:7]}")
+    if approval.get("commit"):
+        lines.append(f"  reviewed  {str(approval['commit'])[:7]}")
 
     lines.append("")
     lines.append("contracts")

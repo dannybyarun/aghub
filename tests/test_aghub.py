@@ -902,6 +902,8 @@ class AghubTestCase(unittest.TestCase):
         w.aghub("be", "claim", "T-003", agent="be-1")
         git(w.be, "checkout", "-q", "agent/be-1/T-003")
         w.commit_file("be", "src/api/items.py", "print('ok')\n", "api")
+        git(w.be, "push", "-qu", "origin", "agent/be-1/T-003")
+        head = git(w.be, "rev-parse", "HEAD").stdout.strip()
 
         gated = w.aghub("be", "submit", "T-003", agent="be-1", check=False)
         self.assertEqual(gated.returncode, 1)
@@ -917,6 +919,8 @@ class AghubTestCase(unittest.TestCase):
         state = json.loads(w.aghub("fe", "status", "--json", agent="fe-1").stdout)
         approval = state["approvals"][-1]
         self.assertEqual(approval["agent"], "fe-1")
+        self.assertEqual(approval["binding"], "commit")
+        self.assertEqual(approval["commit"], head)
         self.assertEqual(approval["attestation"]["scheme"], "ed25519")
         verified = w.aghub("fe", "verify", agent="fe-1")
         self.assertEqual(verified.returncode, 0)
@@ -938,6 +942,7 @@ class AghubTestCase(unittest.TestCase):
         w.aghub("be", "claim", "T-003", agent="be-1")
         git(w.be, "checkout", "-q", "agent/be-1/T-003")
         w.commit_file("be", "src/api/items.py", "print('ok')\n", "api")
+        git(w.be, "push", "-qu", "origin", "agent/be-1/T-003")
 
         inbox = json.loads(w.aghub("fe", "inbox", "--json", agent="fe-1").stdout)
         approval = next(item for item in inbox["items"] if item["task"] == "T-003")
@@ -983,6 +988,82 @@ class AghubTestCase(unittest.TestCase):
         self.assertEqual(verified.returncode, 0)
         self.assertIn("0 invalid", verified.stdout)
 
+    def test_commit_bound_approval_goes_stale_and_can_be_reapproved(self):
+        w = self.world
+        self.bootstrap()
+        w.aghub(
+            "fe",
+            "task",
+            "add",
+            "Ship API",
+            "--paths",
+            "src/api/**",
+            "--requires-approval",
+            agent="fe-1",
+        )
+        w.aghub("be", "claim", "T-003", agent="be-1")
+        branch = "agent/be-1/T-003"
+        git(w.be, "checkout", "-q", branch)
+        w.commit_file(
+            "be",
+            "src/api/items.py",
+            '# one\nROUTES = ["/items", "/items/{id}"]\n',
+            "api one",
+        )
+        git(w.be, "push", "-qu", "origin", branch)
+        first = git(w.be, "rev-parse", "HEAD").stdout.strip()
+
+        w.aghub("fe", "review", "T-003", "--approve", "--note", "first pass", agent="fe-1")
+        w.aghub("be", "submit", "T-003", agent="be-1")
+
+        w.commit_file(
+            "be",
+            "src/api/items.py",
+            '# two\nROUTES = ["/items", "/items/{id}"]\n',
+            "api two",
+        )
+        git(w.be, "push", "-qu", "origin", branch)
+        second = git(w.be, "rev-parse", "HEAD").stdout.strip()
+        self.assertNotEqual(first, second)
+
+        packet = json.loads(
+            w.aghub("fe", "review", "T-003", "--json", agent="fe-1").stdout
+        )
+        self.assertTrue(packet["approval"]["stale"])
+        self.assertEqual(packet["approval"]["head"], second)
+        self.assertTrue(
+            any("aghub review T-003 --approve" in item for item in packet["actions"])
+        )
+
+        stale = w.aghub("be", "submit", "T-003", agent="be-1", check=False)
+        self.assertEqual(stale.returncode, 1)
+        self.assertIn("approval is for", stale.stderr)
+
+        w.aghub("ci", "init", "--project", "test", agent="ci")
+        queue = w.aghub("ci", "queue", "run", agent="ci")
+        self.assertIn("approval is for", queue.stdout)
+        self.assertIn("REJECTED", queue.stdout)
+
+        inbox = json.loads(w.aghub("fe", "inbox", "--json", agent="fe-1").stdout)
+        approval = next(
+            item
+            for item in inbox["items"]
+            if item["task"] == "T-003" and item["kind"] == "approval"
+        )
+        self.assertIn("re-approve the current head", approval["detail"])
+
+        w.aghub(
+            "fe", "review", "T-003", "--approve", "--note", "second pass", agent="fe-1"
+        )
+        state = json.loads(w.aghub("fe", "status", "--json", agent="fe-1").stdout)
+        records = [item for item in state["approvals"] if item["task"] == "T-003"]
+        self.assertEqual(records[-1]["commit"], second)
+        self.assertEqual(records[-1]["binding"], "commit")
+
+        w.aghub("be", "submit", "T-003", agent="be-1")
+        merged = w.aghub("ci", "queue", "run", agent="ci")
+        self.assertIn("merged", merged.stdout)
+
     def test_github_sync_records_trusted_review_once(self):
         w = self.world
         self.bootstrap()
@@ -998,6 +1079,10 @@ class AghubTestCase(unittest.TestCase):
         )
         w.aghub("be", "claim", "T-003", agent="be-1")
         branch = "agent/be-1/T-003"
+        git(w.be, "checkout", "-q", branch)
+        w.commit_file("be", "src/api/items.py", "print('ok')\n", "api")
+        git(w.be, "push", "-qu", "origin", branch)
+        head = git(w.be, "rev-parse", "HEAD").stdout.strip()
         event = {
             "action": "submitted",
             "number": 7,
@@ -1010,7 +1095,7 @@ class AghubTestCase(unittest.TestCase):
                 "user": {"login": "alice"},
                 "head": {
                     "ref": branch,
-                    "sha": "a" * 40,
+                    "sha": head,
                     "repo": {"full_name": "acme/repo"},
                 },
                 "base": {"ref": "main", "sha": "b" * 40},
@@ -1049,6 +1134,8 @@ class AghubTestCase(unittest.TestCase):
         self.assertEqual(records[0]["source"], "github")
         self.assertEqual(records[0]["external_id"], "9001")
         self.assertEqual(records[0]["agent"], "github-review")
+        self.assertEqual(records[0]["binding"], "commit")
+        self.assertEqual(records[0]["commit"], head)
         self.assertIn("alice", records[0]["note"])
 
         second = w.aghub(

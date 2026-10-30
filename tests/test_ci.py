@@ -61,6 +61,36 @@ class CiTests(unittest.TestCase):
         self.assertEqual(payload["approvals"]["gated"], 1)
         self.assertEqual(payload["approvals"]["approved"], 0)
 
+    def test_status_treats_a_stale_approval_as_gated(self):
+        task = {
+            "id": "T-001",
+            "title": "gated",
+            "status": "ready",
+            "requires_approval": True,
+            "paths": ["packages/web/**"],
+        }
+        review = {
+            "id": "R-1",
+            "at": "2026-01-01T00:00:00Z",
+            "task": "T-001",
+            "agent": "reviewer",
+            "decision": "approved",
+            "binding": "commit",
+            "commit": "a" * 40,
+        }
+        state = make_state(tasks={"T-001": task}, approvals=[review])
+        fresh = ci.status(
+            state, SimpleNamespace(head="abc1234"), heads={"T-001": "a" * 40}
+        )
+        self.assertEqual(fresh["approvals"]["approved"], 1)
+        self.assertEqual(fresh["approvals"]["gated"], 0)
+
+        stale = ci.status(
+            state, SimpleNamespace(head="abc1234"), heads={"T-001": "b" * 40}
+        )
+        self.assertEqual(stale["approvals"]["approved"], 0)
+        self.assertEqual(stale["approvals"]["gated"], 1)
+
     def test_github_review_workflow_is_safe_and_records_reviews(self):
         text = ci.github_workflow(project="demo", trunk="main")
         self.assertIn("name: aghub review", text)

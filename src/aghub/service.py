@@ -776,12 +776,43 @@ def review_decision(state, task_id):
     return record.get("decision") or "approved", record
 
 
-def approval_gate(state, task):
-    """Return a human-readable gap when a task still needs an approval."""
+def same_commit(left, right):
+    """Compare full or abbreviated commit ids without needing a repository."""
+    left = str(left or "").strip()
+    right = str(right or "").strip()
+    if not left or not right:
+        return False
+    if left == right:
+        return True
+    return len(left) >= 7 and len(right) >= 7 and (
+        left.startswith(right) or right.startswith(left)
+    )
+
+
+def approval_gate(state, task, head=None):
+    """Return a human-readable gap when a task still needs an approval.
+
+    When a review is commit-bound and a branch head is known, the approval must
+    match that head. Legacy approvals without a binding stay valid so older
+    boards keep working.
+    """
     if not (task or {}).get("requires_approval"):
         return None
     decision, record = review_decision(state, task["id"])
     if decision == "approved":
+        if str((record or {}).get("binding") or "") == "commit" and head is not None:
+            approved = (record or {}).get("commit")
+            if not approved:
+                return (
+                    f"{task['id']} approval is not bound to a commit — re-approve "
+                    f"with `aghub review {task['id']} --approve --note ...`"
+                )
+            if not same_commit(approved, head):
+                return (
+                    f"{task['id']} approval is for {str(approved)[:7]}, but the "
+                    f"current head is {str(head)[:7]} — re-approve the current head "
+                    f"with `aghub review {task['id']} --approve --note ...`"
+                )
         return None
     if decision == "changes_requested":
         reviewer = (record or {}).get("agent") or "a reviewer"
@@ -832,6 +863,8 @@ def _review_record(
         "note": note or "",
         "commit": commit,
     }
+    if commit:
+        record["binding"] = "commit"
     if source:
         record["source"] = source
     if external_id is not None:
@@ -911,6 +944,7 @@ def submit(
     force=False,
     private_key=None,
     public_key=None,
+    head=None,
 ):
     require_role(state, agent, "writer", "submit tasks")
     task = state.tasks.get(task_id)
@@ -925,7 +959,7 @@ def submit(
     for entry in state.queue:
         if entry.get("task") == task_id and entry.get("status") in ("waiting", "merging"):
             raise AghubError(f"{task_id} is already in the queue ({entry['status']})")
-    missing = approval_gate(state, task)
+    missing = approval_gate(state, task, head=head)
     if missing and not force:
         raise AghubError(missing)
     entry_id = f"Q-{new_ulid()}"
@@ -936,6 +970,8 @@ def submit(
         "agent": agent,
         "branch": branch,
     }
+    if head:
+        submission["commit"] = head
     if private_key and public_key:
         register_agent_key(state, agent, public_key)
         attest_record(submission, private_key, public_key, signer=agent)
@@ -947,6 +983,7 @@ def submit(
         "status": "waiting",
         "reason": None,
         "commit": None,
+        "submitted_commit": head,
         "submitted_at": submission["at"],
         "started_at": None,
         "finished_at": None,
@@ -1303,7 +1340,24 @@ def path_violations(claimed_paths, changed_paths):
     ]
 
 
-def integrate(board, entry, task, project):
+def remote_branch_head(board, branch):
+    """Fetch one remote branch and return its full commit id, if available."""
+    remote = board.remote
+    if not remote or not branch:
+        return None
+    ref = f"refs/remotes/{remote}/{branch}"
+    fetched = gitops.git(
+        ["fetch", remote, f"+refs/heads/{branch}:{ref}"],
+        cwd=board.repo,
+        check=False,
+    )
+    if fetched.returncode != 0:
+        return None
+    resolved = gitops.git(["rev-parse", ref], cwd=board.repo, check=False)
+    return resolved.stdout.strip() or None
+
+
+def integrate(board, entry, task, project, expected_head=None):
     """Rehearse the merge on a detached worktree, check it, then push trunk."""
     remote = board.remote
     if not remote:
@@ -1319,6 +1373,23 @@ def integrate(board, entry, task, project):
     )
     agent_ref = f"refs/remotes/{remote}/{branch}"
     trunk_ref = f"refs/remotes/{remote}/{trunk}"
+
+    if expected_head:
+        current = gitops.git(["rev-parse", agent_ref], cwd=board.repo).stdout.strip()
+        if current != expected_head:
+            return {
+                "status": "rejected",
+                "reason": (
+                    f"branch moved after review: approved head {str(expected_head)[:7]}, "
+                    f"remote head {str(current)[:7]} — re-approve the current head"
+                ),
+                "trace": {
+                    "kind": "approval",
+                    "approved": expected_head,
+                    "head": current,
+                    "branch": branch,
+                },
+            }
 
     if gitops.is_ancestor(board.repo, agent_ref, trunk_ref):
         return {"status": "merged", "commit": gitops.short(board.repo, trunk_ref), "reason": "already merged"}
@@ -1480,16 +1551,26 @@ def run_queue(board, agent, printer=print, private_key=None, public_key=None):
         state = board.load()
         task = state.tasks.get(entry["task"], {})
         printer(f"→ {entry['task']} {task.get('title', '')} ({entry['agent']}) on {entry['branch']}")
-        missing = approval_gate(state, task)
+        head = remote_branch_head(board, entry["branch"]) if task.get("requires_approval") else None
+        missing = approval_gate(state, task, head=head)
         if missing:
             result = {
                 "status": "rejected",
                 "reason": missing,
                 "trace": {"kind": "approval", "task": task.get("id")},
             }
+        elif task.get("requires_approval") and head is None:
+            result = {
+                "status": "rejected",
+                "reason": (
+                    f"cannot verify the approval for {task['id']}: branch "
+                    f"{entry['branch']} is not available on {board.remote or 'the remote'}"
+                ),
+                "trace": {"kind": "approval", "task": task.get("id")},
+            }
         else:
             try:
-                result = integrate(board, entry, task, state.project)
+                result = integrate(board, entry, task, state.project, expected_head=head)
             except AghubError as exc:
                 result = {"status": "rejected", "reason": str(exc)}
         entry = board.transaction(

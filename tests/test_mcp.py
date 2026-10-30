@@ -123,7 +123,8 @@ class McpTests(unittest.TestCase):
         )
         self.assertFalse(created["isError"], created)
         approved = self.call(
-            "aghub_approve", {"task": "T-001", "note": "mcp approval"}
+            "aghub_approve",
+            {"task": "T-001", "note": "mcp approval", "commit": "abc1234"},
         )
         self.assertFalse(approved["isError"], approved)
         self.assertIn("approved T-001", approved["content"][0]["text"])

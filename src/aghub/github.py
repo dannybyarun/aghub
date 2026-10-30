@@ -13,7 +13,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-from . import __version__
+from . import __version__, service
 from .errors import AghubError
 
 API_URL = "https://api.github.com"
@@ -206,14 +206,17 @@ def upsert_check(repo=None, sha=None, check=None, token=None, api=None):
 
 
 def mark_stale_approval(packet, head_sha):
-    """Flag a GitHub approval that was recorded for a different PR head."""
+    """Flag an approval that was recorded for a different commit."""
     approval = packet.get("approval") or {}
     approval["stale"] = bool(
-        approval.get("decision") == "approved"
-        and approval.get("source") == "github"
-        and approval.get("commit")
-        and head_sha
-        and str(approval["commit"]) != str(head_sha)
+        approval.get("stale")
+        or (
+            approval.get("decision") == "approved"
+            and (approval.get("source") == "github" or approval.get("binding") == "commit")
+            and approval.get("commit")
+            and head_sha
+            and not service.same_commit(approval["commit"], head_sha)
+        )
     )
     return approval
 

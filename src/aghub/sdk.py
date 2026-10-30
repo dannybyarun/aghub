@@ -110,8 +110,11 @@ class Agent:
             argv.append("--requires-approval")
         return self.call(*argv)
 
-    def approve(self, task, note=""):
-        return self.call("approve", task, "--note", note)
+    def approve(self, task, note="", commit=None):
+        argv = ["approve", task, "--note", note]
+        if commit:
+            argv.extend(["--commit", commit])
+        return self.call(*argv)
 
     def eval_run(self, suite, command, timeout=300, sandbox="auto", task=None):
         argv = [

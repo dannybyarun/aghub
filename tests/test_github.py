@@ -363,6 +363,31 @@ class GitHubTests(unittest.TestCase):
         )
         self.assertFalse(github.mark_stale_approval(local, "b" * 40)["stale"])
 
+        bound = packet(
+            approval={
+                **approval,
+                "source": None,
+                "binding": "commit",
+                "commit": "a" * 40,
+            }
+        )
+        self.assertTrue(github.mark_stale_approval(bound, "b" * 40)["stale"])
+
+        short = packet(
+            approval={
+                **approval,
+                "source": None,
+                "binding": "commit",
+                "commit": "a" * 7,
+            }
+        )
+        self.assertFalse(github.mark_stale_approval(short, "a" * 40)["stale"])
+
+        already = packet(
+            approval={**approval, "source": None, "stale": True}
+        )
+        self.assertTrue(github.mark_stale_approval(already, "a" * 40)["stale"])
+
     def test_upsert_comment_creates_then_updates_marker(self):
         fake = FakeGitHub()
         server = ThreadingHTTPServer(("127.0.0.1", 0), fake.handler())
