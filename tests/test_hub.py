@@ -1,5 +1,7 @@
 import json
+import socket
 import sys
+import tempfile
 import threading
 import unittest
 import urllib.error
@@ -9,7 +11,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from aghub import hubclient  # noqa: E402
-from aghub.hub import HubStore, build_server  # noqa: E402
+from aghub.errors import AghubError  # noqa: E402
+from aghub.hub import HubStore, build_server, load_tokens  # noqa: E402
 from aghub.util import ago_iso  # noqa: E402
 
 
@@ -91,6 +94,35 @@ class HubStoreTests(unittest.TestCase):
         self.assertEqual(result["released"], 1)
         self.assertEqual(self.store.board("p")["leases"], [])
 
+    def test_quota_counter_is_shared_in_store(self):
+        first = self.store.consume_quota("tenant", 2)
+        second = self.store.consume_quota("tenant", 2)
+        third = self.store.consume_quota("tenant", 2)
+        self.assertTrue(first["allowed"])
+        self.assertTrue(second["allowed"])
+        self.assertFalse(third["allowed"])
+        self.assertEqual(third["remaining"], 0)
+        # A zero limit disables quota entirely.
+        self.assertTrue(self.store.consume_quota("unlimited", 0)["allowed"])
+
+    def test_audit_actor_filter(self):
+        self.store.publish("audited", {"project": {"name": "audited"}}, actor="alpha")
+        self.store.claim(
+            "audited", "T-1", "a", ["src/api/**"], 60, actor="alpha"
+        )
+        self.store.claim("audited", "T-2", "b", ["docs/**"], 60, actor="beta")
+        alpha = self.store.audit("audited", actor="alpha")
+        beta = self.store.audit("audited", actor="beta")
+        self.assertTrue(alpha)
+        self.assertTrue(beta)
+        self.assertTrue(all(item["actor"] == "alpha" for item in alpha))
+        self.assertTrue(all(item["actor"] == "beta" for item in beta))
+        self.assertTrue(any(item["type"] == "lease.claim" for item in alpha))
+        self.assertEqual(
+            [item["type"] for item in alpha if item["type"] == "lease.claim"],
+            ["lease.claim"],
+        )
+
 
 class HubHttpTests(unittest.TestCase):
     @classmethod
@@ -105,6 +137,22 @@ class HubHttpTests(unittest.TestCase):
         cls.server.shutdown()
         cls.server.server_close()
         cls.store.close()
+
+    def _local_server(self, db=":memory:", **kwargs):
+        server, store = build_server("127.0.0.1", 0, db, **kwargs)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(store.close)
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        return server, store, f"http://127.0.0.1:{server.server_address[1]}"
+
+    @staticmethod
+    def _dead_url():
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            port = sock.getsockname()[1]
+        return f"http://127.0.0.1:{port}"
 
     def test_health_is_open_and_api_requires_token(self):
         self.assertTrue(hubclient.health(self.base)["ok"])
@@ -350,6 +398,219 @@ class HubHttpTests(unittest.TestCase):
             with self.assertRaises(hubclient.HubError) as empty:
                 request()
             self.assertIn("no project scope", str(empty.exception))
+
+    def test_token_request_and_size_quotas(self):
+        _, _, base = self._local_server(
+            token="root",
+            tokens={
+                "rate": {
+                    "role": "writer",
+                    "projects": ["rate"],
+                    "name": "rate-tenant",
+                    "quota": {"requests_per_minute": 2},
+                },
+                "size": {
+                    "role": "writer",
+                    "projects": ["size"],
+                    "name": "size-tenant",
+                    "quota": {"max_request_bytes": 256},
+                },
+            },
+            rate_limit=0,
+        )
+        rate = {"project": {"name": "rate"}, "tasks": []}
+        hubclient.publish(base, "rate", rate, token="rate")
+        hubclient.board(base, "rate", token="rate")
+        with self.assertRaises(hubclient.HubError) as limited:
+            hubclient.projects(base, token="rate")
+        self.assertIn("token quota", str(limited.exception))
+
+        with self.assertRaises(hubclient.HubError) as oversized:
+            hubclient.publish(
+                base,
+                "size",
+                {"project": {"name": "size"}, "blob": "x" * 1024},
+                token="size",
+            )
+        self.assertIn("exceeds 256 bytes", str(oversized.exception))
+        hubclient.publish(base, "size", {"project": {"name": "size"}}, token="size")
+        self.assertEqual(
+            hubclient.board(base, "size", token="size")["project"], "size"
+        )
+
+    def test_quota_is_shared_across_hubs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = str(Path(tmp) / "hub.db")
+            tokens = {
+                "tenant": {
+                    "role": "writer",
+                    "projects": ["tenant"],
+                    "name": "tenant",
+                    "quota": {"requests_per_minute": 2},
+                }
+            }
+            _, _, first = self._local_server(
+                db=db, token="root", tokens=tokens, rate_limit=0
+            )
+            _, _, second = self._local_server(
+                db=db, token="root", tokens=tokens, rate_limit=0
+            )
+            hubclient.projects(first, token="tenant")
+            hubclient.projects(second, token="tenant")
+            with self.assertRaises(hubclient.HubError) as limited:
+                hubclient.projects(first, token="tenant")
+            self.assertIn("token quota", str(limited.exception))
+
+    def test_per_token_audit_export(self):
+        _, _, base = self._local_server(
+            token="root",
+            tokens={
+                "alpha": {
+                    "role": "writer",
+                    "projects": ["alpha"],
+                    "name": "alpha",
+                },
+                "beta": {"role": "writer", "projects": ["beta"], "name": "beta"},
+            },
+            rate_limit=0,
+        )
+        for name in ("alpha", "beta"):
+            hubclient.publish(
+                base,
+                name,
+                {"project": {"name": name}, "tasks": []},
+                token=name,
+            )
+            hubclient.claim(
+                base,
+                name,
+                "T-1",
+                f"agent-{name}",
+                ["src/**"],
+                60,
+                token=name,
+            )
+
+        own = hubclient.audit_export(base, token="alpha")
+        rows = [json.loads(line) for line in own.splitlines() if line]
+        self.assertTrue(rows)
+        self.assertTrue(all(row["actor"] == "alpha" for row in rows))
+        self.assertTrue(all(row["project"] == "alpha" for row in rows))
+        self.assertTrue(any(row["type"] == "snapshot.publish" for row in rows))
+        self.assertTrue(any(row["type"] == "lease.claim" for row in rows))
+
+        everything = hubclient.audit_export(base, token="root")
+        actors = {json.loads(line)["actor"] for line in everything.splitlines() if line}
+        self.assertEqual(actors, {"alpha", "beta"})
+
+        with self.assertRaises(hubclient.HubError) as denied:
+            hubclient.audit_export(base, actor="beta", token="alpha")
+        self.assertIn("another actor", str(denied.exception))
+
+        with self.assertRaises(hubclient.HubError) as admin_only:
+            hubclient.audit(base, token="alpha")
+        self.assertIn("403", str(admin_only.exception))
+
+        csv_text = hubclient.audit_export(base, fmt="csv", token="root")
+        self.assertTrue(
+            csv_text.startswith("seq,at,project,actor,type,payload")
+        )
+        self.assertIn("alpha", csv_text)
+        self.assertIn("beta", csv_text)
+
+    def test_load_tokens_validates_quota(self):
+        with tempfile.NamedTemporaryFile(
+            "w", suffix=".json", delete=False, encoding="utf-8"
+        ) as handle:
+            json.dump(
+                {
+                    "tokens": {
+                        "tok": {
+                            "role": "writer",
+                            "projects": ["p"],
+                            "name": "ci",
+                            "quota": {
+                                "requests_per_minute": 5,
+                                "max_request_bytes": 128,
+                            },
+                        }
+                    }
+                },
+                handle,
+            )
+            path = Path(handle.name)
+        try:
+            tokens = load_tokens(str(path))
+        finally:
+            path.unlink()
+        self.assertEqual(tokens["tok"]["actor"], "ci")
+        self.assertEqual(tokens["tok"]["quota"]["requests_per_minute"], 5)
+        self.assertEqual(tokens["tok"]["quota"]["max_request_bytes"], 128)
+
+        with tempfile.NamedTemporaryFile(
+            "w", suffix=".json", delete=False, encoding="utf-8"
+        ) as handle:
+            json.dump(
+                {"tokens": {"tok": {"role": "writer", "quota": {"bogus": 1}}}},
+                handle,
+            )
+            bad = Path(handle.name)
+        try:
+            with self.assertRaises(AghubError):
+                load_tokens(str(bad))
+        finally:
+            bad.unlink()
+
+    def test_client_failover_across_hubs(self):
+        _, _, live = self._local_server(token="secret", rate_limit=0)
+        dead = self._dead_url()
+        self.assertTrue(hubclient.health([dead, live], token="secret")["ok"])
+        snapshot = {"project": {"name": "failover"}, "tasks": []}
+        hubclient.publish([dead, live], "failover", snapshot, token="secret")
+        self.assertEqual(
+            hubclient.board([dead, live], "failover", token="secret")["project"],
+            "failover",
+        )
+
+    def test_failover_never_overrides_a_conflict(self):
+        _, _, first = self._local_server(token="secret", rate_limit=0)
+        _, _, second = self._local_server(token="secret", rate_limit=0)
+        snapshot = {"project": {"name": "split"}, "tasks": []}
+        hubclient.publish(first, "split", snapshot, token="secret")
+        hubclient.publish(second, "split", snapshot, token="secret")
+        hubclient.claim(
+            first, "split", "T-1", "a", ["src/api/**"], 60, token="secret"
+        )
+        with self.assertRaises(hubclient.HubConflict):
+            hubclient.claim(
+                [first, second],
+                "split",
+                "T-1",
+                "b",
+                ["src/web/**"],
+                60,
+                token="secret",
+            )
+        self.assertEqual(
+            hubclient.board(second, "split", token="secret")["leases"], []
+        )
+
+    def test_health_reports_store_failure(self):
+        _, store, base = self._local_server(token="secret", rate_limit=0)
+        original = store.health
+
+        def broken():
+            raise RuntimeError("db down")
+
+        store.health = broken
+        try:
+            with self.assertRaises(urllib.error.HTTPError) as caught:
+                urllib.request.urlopen(base + "/api/health", timeout=3)
+            self.assertEqual(caught.exception.code, 503)
+            body = json.loads(caught.exception.read().decode("utf-8"))
+            self.assertFalse(body["ok"])
+        finally:
+            store.health = original
 
     def test_rate_limit_returns_429(self):
         server, store = build_server(

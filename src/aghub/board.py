@@ -406,14 +406,27 @@ class State:
 class Board:
     """The board branch, checked out in its own worktree under .git."""
 
-    def __init__(self, repo, common, worktree, remote, hub=None, hub_token=None):
+    def __init__(
+        self, repo, common, worktree, remote, hub=None, hub_token=None, hub_failover=None
+    ):
         self.repo = repo
         self.common = common
         self.dir = worktree
         self.remote = remote
         self.hub = hub
         self.hub_token = hub_token
+        if isinstance(hub_failover, str):
+            hub_failover = [hub_failover]
+        self.hub_failover = hub_failover or []
         self.branch = BOARD_BRANCH
+
+    @property
+    def hub_urls(self):
+        urls = []
+        for url in [self.hub, *(self.hub_failover or [])]:
+            if url and url not in urls:
+                urls.append(url)
+        return urls
 
     @classmethod
     def discover(cls, cwd=None):
@@ -432,6 +445,7 @@ class Board:
             config.get("remote"),
             config.get("hub"),
             config.get("hub_token"),
+            config.get("hub_failover"),
         )
 
     @property
@@ -533,12 +547,12 @@ class Board:
         project = state.project.get("name") or "default"
         try:
             hubclient.publish(
-                self.hub, project, render.snapshot(state, self), self.hub_token
+                self.hub_urls, project, render.snapshot(state, self), self.hub_token
             )
             if agent:
                 record = state.agents.get(agent) or {}
                 hubclient.heartbeat(
-                    self.hub,
+                    self.hub_urls,
                     project,
                     agent,
                     record.get("current_task"),
@@ -604,6 +618,7 @@ def init_board(
             "branch": branch,
             "hub": None,
             "hub_token": None,
+            "hub_failover": [],
         },
     )
     board = Board(repo, common, target, remote)

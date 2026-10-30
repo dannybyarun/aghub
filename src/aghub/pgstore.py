@@ -8,6 +8,7 @@ dependency-free while providing a real shared database for multi-process hubs.
 
 import json
 import threading
+import time
 from contextlib import contextmanager
 
 from .errors import AghubError
@@ -55,7 +56,15 @@ CREATE TABLE IF NOT EXISTS events (
   project TEXT NOT NULL,
   at TEXT NOT NULL,
   type TEXT NOT NULL,
-  payload TEXT NOT NULL
+  payload TEXT NOT NULL,
+  actor TEXT
+);
+ALTER TABLE events ADD COLUMN IF NOT EXISTS actor TEXT;
+CREATE TABLE IF NOT EXISTS quota_windows (
+  actor TEXT NOT NULL,
+  window_start BIGINT NOT NULL,
+  used BIGINT NOT NULL,
+  PRIMARY KEY (actor, window_start)
 );
 CREATE TABLE IF NOT EXISTS board_events (
   seq BIGINT PRIMARY KEY,
@@ -67,6 +76,8 @@ CREATE INDEX IF NOT EXISTS board_events_project
   ON board_events(project, seq);
 CREATE INDEX IF NOT EXISTS events_project
   ON events(project, seq);
+CREATE INDEX IF NOT EXISTS events_actor
+  ON events(project, actor, seq);
 """
 
 
@@ -145,7 +156,7 @@ class PostgresStore:
             else:
                 self.conn.commit()
 
-    def publish(self, project, snapshot):
+    def publish(self, project, snapshot, actor=None):
         stamp = now_iso()
         with self.lock:
             seq = self._next_seq()
@@ -163,10 +174,7 @@ class PostgresStore:
                 "INSERT INTO board_events(seq, project, at, payload) VALUES(%s,%s,%s,%s)",
                 (seq, project, stamp, json.dumps(self.board(project))),
             )
-            self._write(
-                "INSERT INTO events(project, at, type, payload) VALUES(%s,%s,%s,%s)",
-                (project, stamp, "snapshot.publish", json.dumps({"seq": seq})),
-            )
+            self._event(project, "snapshot.publish", {"seq": seq}, actor=actor)
             self._write(
                 """
                 DELETE FROM board_events WHERE project=%s AND seq <= (
@@ -313,7 +321,7 @@ class PostgresStore:
             (project, agent, stamp, task, branch, machine),
         )
 
-    def claim(self, project, task, agent, paths, ttl=600, steal=False, force=False):
+    def claim(self, project, task, agent, paths, ttl=600, steal=False, force=False, actor=None):
         ttl = max(1, min(int(ttl or 600), 86400))
         stamp = now_iso()
         with self._project_transaction(project):
@@ -379,6 +387,7 @@ class PostgresStore:
                     "fencing": fencing,
                     "stolen_from": stolen_from,
                 },
+                actor=actor,
             )
             return {
                 "status": 200,
@@ -388,7 +397,7 @@ class PostgresStore:
                 "stolen_from": stolen_from,
             }
 
-    def release(self, project, task, agent, force=False):
+    def release(self, project, task, agent, force=False, actor=None):
         with self._project_transaction(project):
             row = self._fetchone(
                 "SELECT * FROM leases WHERE project=%s AND task=%s", (project, task)
@@ -413,10 +422,11 @@ class PostgresStore:
                 project,
                 "lease.release",
                 {"task": task, "agent": agent, "owner": row["agent"]},
+                actor=actor,
             )
             return {"status": 200, "ok": True, "released": True}
 
-    def expire(self, project, agent, ttl=600):
+    def expire(self, project, agent, ttl=600, actor=None):
         stale = ago_iso(int(ttl) + 5)
         with self._project_transaction(project):
             self._write(
@@ -426,7 +436,12 @@ class PostgresStore:
             released = self._write(
                 "DELETE FROM leases WHERE project=%s AND agent=%s", (project, agent)
             )
-            self._event(project, "lease.expire", {"agent": agent, "released": released})
+            self._event(
+                project,
+                "lease.expire",
+                {"agent": agent, "released": released},
+                actor=actor,
+            )
             return {
                 "ok": True,
                 "agent": agent,
@@ -476,37 +491,75 @@ class PostgresStore:
         )
         return value
 
-    def _event(self, project, kind, payload):
+    def _event(self, project, kind, payload, actor=None):
         self._write(
-            "INSERT INTO events(project, at, type, payload) VALUES(%s,%s,%s,%s)",
-            (project, now_iso(), kind, json.dumps(payload)),
+            "INSERT INTO events(project, at, type, payload, actor) VALUES(%s,%s,%s,%s,%s)",
+            (project, now_iso(), kind, json.dumps(payload), actor),
         )
 
-    def audit(self, project=None, after=0, limit=100):
-        limit = max(1, min(int(limit or 100), 500))
+    def audit(self, project=None, after=0, limit=100, actor=None):
+        limit = max(1, min(int(limit or 100), 10000))
         with self.lock:
+            clauses = ["seq>%s"]
+            params = [int(after or 0)]
             if project:
-                rows = self._fetchall(
-                    "SELECT seq, project, at, type, payload FROM events "
-                    "WHERE project=%s AND seq>%s ORDER BY seq LIMIT %s",
-                    (project, int(after or 0), limit),
-                )
-            else:
-                rows = self._fetchall(
-                    "SELECT seq, project, at, type, payload FROM events "
-                    "WHERE seq>%s ORDER BY seq LIMIT %s",
-                    (int(after or 0), limit),
-                )
+                clauses.append("project=%s")
+                params.append(project)
+            if actor:
+                clauses.append("actor=%s")
+                params.append(actor)
+            params.append(limit)
+            rows = self._fetchall(
+                "SELECT seq, project, at, type, payload, actor FROM events WHERE "
+                + " AND ".join(clauses)
+                + " ORDER BY seq LIMIT %s",
+                params,
+            )
             return [
                 {
                     "seq": row["seq"],
                     "project": row["project"],
                     "at": row["at"],
+                    "actor": row["actor"],
                     "type": row["type"],
                     "payload": json.loads(row["payload"]),
                 }
                 for row in rows
             ]
+
+    def consume_quota(self, actor, limit, window=60):
+        """Count one request for an actor in a fixed window.
+
+        Quota rows live in Postgres, so several hubs sharing this database
+        enforce one shared budget instead of one budget per process.
+        """
+        limit = int(limit or 0)
+        window = int(window or 60)
+        now = int(time.time())
+        start = now - (now % window)
+        retry_after = max(1, window - (now % window))
+        if limit <= 0:
+            return {"allowed": True, "remaining": 0, "retry_after": 0}
+        with self.lock:
+            self._write(
+                "DELETE FROM quota_windows WHERE window_start < %s", (start,)
+            )
+            row = self._fetchone(
+                """
+                INSERT INTO quota_windows(actor, window_start, used) VALUES(%s,%s,1)
+                ON CONFLICT(actor, window_start)
+                DO UPDATE SET used=quota_windows.used+1
+                RETURNING used
+                """,
+                (actor, start),
+            )
+            self.conn.commit()
+        used = int(row["used"] if row else 1)
+        return {
+            "allowed": used <= limit,
+            "remaining": max(0, limit - used),
+            "retry_after": retry_after,
+        }
 
     @staticmethod
     def _lease(row):

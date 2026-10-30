@@ -104,7 +104,7 @@ def _undo_claim(board, project, task_id, agent, leased):
     if leased:
         try:
             hubclient.release(
-                board.hub, project, task_id, agent, token=board.hub_token
+                board.hub_urls, project, task_id, agent, token=board.hub_token
             )
         except hubclient.HubError:
             pass
@@ -1056,7 +1056,7 @@ def _hub_presence(board, state):
         return None
     try:
         payload = hubclient.board(
-            board.hub, state.project.get("name") or "default", board.hub_token
+            board.hub_urls, state.project.get("name") or "default", board.hub_token
         )
     except hubclient.HubError:
         return "offline"
@@ -1079,7 +1079,7 @@ def cmd_claim(args):
     if board.hub:
         try:
             hubclient.claim(
-                board.hub,
+                board.hub_urls,
                 project,
                 task["id"],
                 agent,
@@ -1106,7 +1106,7 @@ def cmd_claim(args):
     except Exception:
         if leased:
             try:
-                hubclient.release(board.hub, project, args.task, agent, token=board.hub_token)
+                hubclient.release(board.hub_urls, project, args.task, agent, token=board.hub_token)
             except hubclient.HubError:
                 pass
         raise
@@ -1145,7 +1145,7 @@ def cmd_release(args):
     if board.hub:
         try:
             hubclient.release(
-                board.hub,
+                board.hub_urls,
                 state.project.get("name") or "default",
                 args.task,
                 agent,
@@ -1193,7 +1193,7 @@ def cmd_handoff(args):
     if args.done and board.hub:
         try:
             hubclient.release(
-                board.hub,
+                board.hub_urls,
                 state.project.get("name") or "default",
                 args.task,
                 agent,
@@ -1338,7 +1338,7 @@ def cmd_heartbeat(args):
         state = board.load()
         try:
             hubclient.heartbeat(
-                board.hub,
+                board.hub_urls,
                 state.project.get("name") or "default",
                 agent,
                 record.get("current_task"),
@@ -1386,7 +1386,7 @@ def cmd_debug(args):
     if board.hub:
         try:
             hubclient.expire(
-                board.hub,
+                board.hub_urls,
                 board.load().project.get("name") or "default",
                 target,
                 int(board.load().project.get("ttl_seconds", 600)),
@@ -1406,6 +1406,18 @@ def cmd_mcp(args):
         return 0
     mcp.serve(agent=getattr(args, "mcp_agent", None) or args.agent)
     return 0
+
+
+def _hub_urls(config):
+    """Return the primary + failover hub URLs from local config."""
+    extra = config.get("hub_failover") or []
+    if isinstance(extra, str):
+        extra = [extra]
+    urls = []
+    for url in [config.get("hub"), *extra]:
+        if url and url not in urls:
+            urls.append(url)
+    return urls
 
 
 def cmd_hub(args):
@@ -1433,18 +1445,34 @@ def cmd_hub(args):
         raise AghubError("aghub is not initialized here — run `aghub init --project <name>`")
 
     if args.hub_command == "connect":
-        url = args.url.rstrip("/")
+        urls = []
+        for raw in args.url:
+            url = raw.rstrip("/")
+            if url and url not in urls:
+                urls.append(url)
+        if not urls:
+            raise AghubError("at least one hub URL is required")
+        primary = urls[0]
+        token = args.token if args.token is not None else config.get("hub_token")
         try:
-            info = hubclient.health(url, args.token or config.get("hub_token"))
+            info = hubclient.health(primary, token)
         except hubclient.HubError as exc:
-            raise AghubError(f"cannot reach a hub at {url}: {exc}")
-        config["hub"] = url
-        config["hub_token"] = args.token
+            raise AghubError(f"cannot reach a hub at {primary}: {exc}")
+        config["hub"] = primary
+        config["hub_failover"] = urls[1:]
+        config["hub_token"] = token
         write_local_config(common, config)
         print(
-            f"connected to {url} "
+            f"connected to {primary} "
             f"(v{info.get('version')}, {info.get('projects', 0)} project(s))"
         )
+        for url in urls[1:]:
+            try:
+                hubclient.health(url, token)
+            except hubclient.HubError as exc:
+                print(f"  failover {url} unreachable ({exc})", file=sys.stderr)
+            else:
+                print(f"  failover {url} ok")
         try:
             board = Board.discover()
             agent = _resolve_agent(args, config)
@@ -1454,29 +1482,65 @@ def cmd_hub(args):
                 f"aghub: warning: connected, but the first snapshot failed: {exc}",
                 file=sys.stderr,
             )
-        print(f"  board  {url}/")
+        print(f"  board  {primary}/")
         return 0
 
     if args.hub_command == "disconnect":
         config["hub"] = None
         config["hub_token"] = None
+        config["hub_failover"] = []
         write_local_config(common, config)
         print("disconnected from hub — continuing with git-only state")
         return 0
 
-    hub = config.get("hub")
-    if not hub:
+    hubs = _hub_urls(config)
+    if not hubs:
         raise AghubError("not connected to a hub — run `aghub hub connect <url>`")
+
+    if args.hub_command == "audit":
+        try:
+            text = hubclient.audit_export(
+                hubs,
+                project=args.project,
+                actor=args.actor,
+                after=args.after,
+                limit=args.limit,
+                fmt=args.format,
+                token=config.get("hub_token"),
+            )
+        except hubclient.HubError as exc:
+            raise AghubError(f"audit export failed: {exc}")
+        if args.out:
+            path = os.path.abspath(args.out)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(text)
+            print(f"wrote {path} ({len(text.splitlines())} records)")
+        else:
+            sys.stdout.write(text)
+        return 0
+
+    healthy = None
+    for index, url in enumerate(hubs):
+        label = "primary" if index == 0 else f"failover {index}"
+        try:
+            info = hubclient.health(url, config.get("hub_token"))
+        except hubclient.HubError as exc:
+            print(f"hub {url} unreachable ({label}): {exc}")
+            continue
+        print(
+            f"hub {url} ok ({label}, v{info.get('version')}, "
+            f"{info.get('projects', 0)} projects, "
+            f"{info.get('live_leases', 0)} live leases)"
+        )
+        if healthy is None:
+            healthy = (url, info)
+    if healthy is None:
+        raise AghubError("no hub in the failover set is reachable")
     try:
-        info = hubclient.health(hub, config.get("hub_token"))
-        data = hubclient.board(hub, None, config.get("hub_token"))
+        data = hubclient.board(healthy[0], None, config.get("hub_token"))
     except hubclient.HubError as exc:
-        raise AghubError(f"hub at {hub} is unreachable: {exc}")
-    print(
-        f"hub {hub} ok "
-        f"(v{info.get('version')}, {info.get('projects', 0)} projects, "
-        f"{info.get('live_leases', 0)} live leases)"
-    )
+        raise AghubError(f"hub at {healthy[0]} is unreachable: {exc}")
     if data:
         print(
             f"project {data['project']} · updated {data.get('updated_at')} · "
@@ -1800,9 +1864,18 @@ def build_parser():
     )
     hub_serve.add_argument("--verbose", action="store_true")
     hub_connect = hub_sub.add_parser("connect")
-    hub_connect.add_argument("url")
+    hub_connect.add_argument(
+        "url", nargs="+", help="primary hub URL followed by optional failover URLs"
+    )
     hub_connect.add_argument("--token", default=None)
     hub_sub.add_parser("disconnect")
+    hub_audit = hub_sub.add_parser("audit", help="export the hub operation log")
+    hub_audit.add_argument("--format", choices=["jsonl", "csv"], default="jsonl")
+    hub_audit.add_argument("--actor", default=None)
+    hub_audit.add_argument("--project", default=None)
+    hub_audit.add_argument("--after", type=int, default=0)
+    hub_audit.add_argument("--limit", type=int, default=1000)
+    hub_audit.add_argument("--out", default=None, metavar="PATH")
     hub_sub.add_parser("status")
     hub.set_defaults(func=cmd_hub)
 

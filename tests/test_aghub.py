@@ -979,8 +979,24 @@ class AghubTestCase(unittest.TestCase):
 
         w = self.world
         self.bootstrap()
-        w.aghub("fe", "hub", "connect", url, "--token", "secret", agent="fe-1")
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            dead = f"http://127.0.0.1:{sock.getsockname()[1]}"
+        w.aghub(
+            "fe",
+            "hub",
+            "connect",
+            url,
+            dead,
+            "--token",
+            "secret",
+            agent="fe-1",
+        )
         w.aghub("be", "hub", "connect", url, "--token", "secret", agent="be-1")
+        status = w.aghub("fe", "hub", "status", agent="fe-1")
+        self.assertIn("primary", status.stdout)
+        self.assertIn("failover 1", status.stdout)
+        self.assertIn("unreachable", status.stdout)
 
         w.aghub("fe", "claim", "T-001", agent="fe-1")
         data = hubclient.board(url, "test", token="secret")
@@ -993,6 +1009,16 @@ class AghubTestCase(unittest.TestCase):
         refused = w.aghub("fe", "claim", "T-002", agent="fe-1", check=False)
         self.assertEqual(refused.returncode, 1)
         self.assertIn("hub rejected", refused.stderr)
+
+        export = self.world.base / "audit.jsonl"
+        wrote = w.aghub(
+            "fe", "hub", "audit", "--out", str(export), agent="fe-1"
+        )
+        self.assertIn("records", wrote.stdout)
+        rows = [json.loads(line) for line in export.read_text().splitlines()]
+        self.assertTrue(rows)
+        self.assertTrue(all(row["actor"] == "admin" for row in rows))
+        self.assertIn("lease.claim", {row["type"] for row in rows})
 
         state = json.loads(w.aghub("fe", "status", "--json", agent="fe-1").stdout)
         task = next(item for item in state["tasks"] if item["id"] == "T-002")

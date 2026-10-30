@@ -14,6 +14,10 @@ class HubConflict(HubError):
     """The hub rejected a lease because someone else holds it."""
 
 
+class _RetryableHubError(HubError):
+    """A hub was unreachable or returned a transient gateway error."""
+
+
 _warned = False
 
 
@@ -29,9 +33,7 @@ def _token(token=None):
     return token or os.environ.get("AGHUB_HUB_TOKEN")
 
 
-def request(base, method, path, payload=None, token=None, timeout=5):
-    if not base:
-        raise HubError("no hub configured")
+def _request_one(base, method, path, payload=None, token=None, timeout=5, raw=False):
     url = base.rstrip("/") + path
     data = None
     if payload is not None:
@@ -44,7 +46,12 @@ def request(base, method, path, payload=None, token=None, timeout=5):
     try:
         with urllib.request.urlopen(req, timeout=timeout) as response:
             body = response.read().decode("utf-8")
-            return json.loads(body) if body else {}
+            if raw:
+                return body
+            try:
+                return json.loads(body) if body else {}
+            except ValueError as exc:
+                raise _RetryableHubError(f"invalid JSON response: {exc}")
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8", errors="replace")
         try:
@@ -54,9 +61,40 @@ def request(base, method, path, payload=None, token=None, timeout=5):
         message = detail.get("error") or body or f"HTTP {exc.code}"
         if exc.code == 409:
             raise HubConflict(message)
+        if exc.code in (502, 503, 504):
+            raise _RetryableHubError(f"{exc.code}: {message}")
         raise HubError(f"{exc.code}: {message}")
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
-        raise HubError(str(getattr(exc, "reason", exc)))
+        raise _RetryableHubError(str(getattr(exc, "reason", exc)))
+
+
+def request(base, method, path, payload=None, token=None, timeout=5, raw=False):
+    """Call a hub, failing over across a list of URLs on transport errors.
+
+    A 409, 401, 403, 429 or other 4xx is authoritative and is never retried
+    against another hub. Only connection failures and 502/503/504 fail over.
+    """
+    if isinstance(base, str):
+        candidates = [base] if base else []
+    else:
+        candidates = [str(item) for item in (base or []) if item]
+    candidates = list(dict.fromkeys(candidates))
+    if not candidates:
+        raise HubError("no hub configured")
+    if len(candidates) == 1:
+        try:
+            return _request_one(
+                candidates[0], method, path, payload, token, timeout, raw
+            )
+        except _RetryableHubError as exc:
+            raise HubError(str(exc))
+    failures = []
+    for candidate in candidates:
+        try:
+            return _request_one(candidate, method, path, payload, token, timeout, raw)
+        except _RetryableHubError as exc:
+            failures.append(f"{candidate}: {exc}")
+    raise HubError("all hubs failed: " + "; ".join(failures))
 
 
 def health(base, token=None):
@@ -71,11 +109,26 @@ def overview(base, token=None):
     return request(base, "GET", "/api/overview", token=token)
 
 
-def audit(base, project=None, after=0, limit=100, token=None):
+def audit(base, project=None, after=0, limit=100, actor=None, token=None):
     query = f"?after={int(after)}&limit={int(limit)}"
     if project:
         query += "&project=" + quote(project)
+    if actor:
+        query += "&actor=" + quote(actor)
     return request(base, "GET", "/api/audit" + query, token=token)
+
+
+def audit_export(
+    base, project=None, actor=None, after=0, limit=1000, fmt="jsonl", token=None
+):
+    query = f"?format={quote(fmt)}&after={int(after)}&limit={int(limit)}"
+    if project:
+        query += "&project=" + quote(project)
+    if actor:
+        query += "&actor=" + quote(actor)
+    return request(
+        base, "GET", "/api/audit/export" + query, token=token, raw=True
+    )
 
 
 def board(base, project=None, token=None):

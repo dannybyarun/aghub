@@ -157,7 +157,7 @@ Git cannot arbitrate a race that happens in the next two seconds. The hub can.
 
 ```bash
 aghub hub serve --port 8787 --db ~/.aghub/hub.db   # once, anywhere reachable
-aghub hub connect http://127.0.0.1:8787            # per clone
+aghub hub connect http://hub-a:8787 http://hub-b:8787   # per clone; first is primary
 aghub hub status
 ```
 
@@ -165,6 +165,9 @@ aghub hub status
 - **Presence is live.** Every board transaction publishes a snapshot and a heartbeat. `status` overlays hub presence and prints `· hub live` or `· hub offline`.
 - **The web board never touches git.** `GET /` is a self-contained page: ready / in-flight / blocked lanes, agents, live leases, evals, dependency/fix graph, contracts and their latest diff, merge queue, approvals, handoffs, a replay scrubber, and a multi-project overview. It consumes `/api/events` over server-sent events, resumes with `Last-Event-ID`, and falls back to polling `/api/board` every 3s if the stream drops.
 - **An outage degrades, it does not block.** The first unreachable hub produces one warning, then claims continue git-only. A reachable hub that returns 409 is always obeyed.
+- **Failover is conservative.** Clients try the configured URLs in order on connection failures and `502`/`503`/`504`. Any other HTTP response — especially a lease `409` or a quota `429` — is authoritative and is never replayed against another hub.
+- **Tenant quotas are shared.** A token can set `requests_per_minute` and `max_request_bytes`. Counters live in the hub store, so several hubs sharing one SQLite file or Postgres database enforce one budget per tenant.
+- **Audit export is per tenant.** `/api/audit/export` streams JSONL or CSV. Admins can export any actor; non-admin tokens are pinned to their own actor label.
 - **The hub is not the durable record.** Snapshots and leases are a live mirror. Tasks, contracts, handoffs and merges still live on `aghub/board`.
 
 Default bind is `127.0.0.1:8787`. The server refuses a non-loopback address without a token. For hosted use:
@@ -177,18 +180,37 @@ aghub hub serve --host 0.0.0.0 --port 8787 \
   --rate-limit 600
 ```
 
-`hub-tokens.json` accepts either a token → role map or per-token scopes:
+`hub-tokens.json` accepts either a token → role map or per-token scopes, audit labels, and quotas:
 
 ```json
 {
   "tokens": {
-    "writer-token": {"role": "writer", "projects": ["acme-store"]},
-    "ci-token": {"role": "admin", "projects": ["acme-store", "acme-infra"]}
+    "writer-token": {
+      "role": "writer",
+      "projects": ["acme-store"],
+      "name": "frontend-ci",
+      "quota": {"requests_per_minute": 120, "max_request_bytes": 1048576}
+    },
+    "ci-token": {
+      "role": "admin",
+      "projects": ["acme-store", "acme-infra"],
+      "name": "release-bot"
+    }
   }
 }
 ```
 
-Roles are `reader`, `writer`, and `admin`. Project scopes reject reads and writes outside the listed project ids, and an empty scope is rejected rather than falling back to the latest global board. `/api/health` is always open; other endpoints are rate-limited per IP, and request bodies are capped at 16 MiB. Hosted deployments can use Postgres instead of SQLite by installing `psycopg[binary]` and passing `--postgres postgresql://…` (the core install remains dependency-free).
+Roles are `reader`, `writer`, and `admin`. Project scopes reject reads and writes outside the listed project ids, and an empty scope is rejected rather than falling back to the latest global board. `name` is the label used in the audit log and the key for quota accounting; when it is omitted, the hub derives `token-<sha256[:10]>` so tokens stay distinguishable without storing the secret. Give each independent tenant a unique name: tokens that share one share both their quota budget and their export scope. Quotas are optional and enforced per actor in the shared store: `requests_per_minute` applies a fixed-window budget, and `max_request_bytes` caps request bodies below the global 16 MiB ceiling. A zero limit disables that quota.
+
+For per-token audit export:
+
+```bash
+aghub hub audit --format jsonl --limit 1000 --out audit.jsonl   # admin: every actor
+curl -H "Authorization: Bearer $TOKEN" \
+  'http://127.0.0.1:8787/api/audit/export?format=csv&actor=frontend-ci'
+```
+
+Non-admin tokens can export only their own actor; asking for another actor returns 403. Admin tokens may export any actor, project, or the whole hub. Use `after=SEQ` to page. `/api/health` is always open; it returns `200` when the store responds and `503` with `{"ok": false}` when it does not, so a load balancer can distinguish a live process from a broken backend. Other endpoints are rate-limited per IP, and request bodies are capped at 16 MiB. Hosted deployments can use Postgres instead of SQLite by installing `psycopg[binary]` and passing `--postgres postgresql://…` (the core install remains dependency-free). Postgres stores the quota counters too, so every hub process sharing that database enforces the same budget.
 
 | Endpoint | Purpose |
 |---|---|
@@ -199,7 +221,8 @@ Roles are `reader`, `writer`, and `admin`. Project scopes reject reads and write
 | `GET /api/board?project=NAME` | snapshot + live agents + active leases |
 | `GET /api/events?project=NAME` | server-sent board updates (SSE; `Last-Event-ID` replays) |
 | `GET /api/history?project=NAME&after=SEQ&limit=N` | bounded board history (max 100) |
-| `GET /api/audit?project=NAME&after=SEQ&limit=N` | hub operation audit log (admin token) |
+| `GET /api/audit?project=NAME&after=SEQ&limit=N&actor=NAME` | hub operation audit log (admin token) |
+| `GET /api/audit/export?format=jsonl\|csv&actor=NAME&project=NAME&after=SEQ&limit=N` | per-token audit export (JSONL/CSV) |
 | `POST /api/snapshot` | publish a board snapshot |
 | `POST /api/heartbeat` | presence + lease extension |
 | `POST /api/claim` | acquire a lease (409 on conflict) |
@@ -498,8 +521,9 @@ reimplemented or bypassed.
 | `aghub mcp serve [--agent ID]` / `mcp tools` | MCP stdio server and tool catalog |
 | `aghub sync` | fetch board + trunk |
 | `aghub hub serve [--host H] [--port P] [--db PATH] [--token T] [--read-token T] [--tokens-file F] [--rate-limit N] [--postgres DSN]` | run the lease/presence hub + web board |
-| `aghub hub connect URL [--token T]` | point this clone at a hub |
-| `aghub hub status` | probe the hub and the published project |
+| `aghub hub connect URL [URL ...] [--token T]` | point this clone at a hub, with optional failover URLs |
+| `aghub hub audit [--format jsonl\|csv] [--actor ID] [--project NAME] [--after SEQ] [--limit N] [--out PATH]` | export the hub operation log |
+| `aghub hub status` | probe every configured hub and the published project |
 | `aghub hub disconnect` | fall back to git-only state |
 | `aghub debug expire AGENT` | simulate a dead agent (demo/test) |
 
@@ -543,6 +567,9 @@ and delete their own rows; still, point them at a scratch database.
 - **Legacy and pre-key events may be unsigned.** Records created before a key exists are reported as unsigned; `verify --strict` fails on unsigned records, while chain errors and invalid signatures always fail.
 - **Live updates send full snapshots.** SSE pushes the whole board on change and keeps the last 100 per project for `Last-Event-ID` replay; there are no per-task deltas or websocket fan-out yet. A reconnect older than the window gets the oldest retained snapshot and then the current board.
 - **Postgres is optional.** The default hub is a single SQLite file. `--postgres` requires `psycopg[binary]` in the runtime environment, uses per-project advisory transaction locks for lease decisions, and serializes concurrent first startup with a schema lock; the default suite skips Postgres integration tests unless `AGHUB_TEST_POSTGRES_DSN` is set.
+- **Failover needs one authority.** A failover set must point at hubs backed by the same store (Postgres, or the same SQLite file with one writer). Two independent databases are two independent worlds: failover provides availability, not consensus.
+- **Quotas are coarse fixed windows.** `requests_per_minute` uses a per-actor counter in the shared store, not a token bucket, so a tenant can burst at a window boundary. `max_request_bytes` is checked from `Content-Length`; chunked request bodies are not accepted. A quota `429` is authoritative and is never retried against another hub.
+- **Audit export is not the signed git history.** `/api/audit/export` records hub requests and lease operations with a token actor label. Tamper evidence for tasks, contracts, handoffs, and merges still comes from `aghub verify` over the hash-chained board.
 - **The merge check is sandboxed by default but is still not a security boundary.** `submit`/`queue run` execute `project.check` through the same sandbox runner as evals (`auto` uses Bubblewrap, otherwise a scrubbed snapshot). `--check-sandbox off` and `--sandbox off` intentionally opt out. Traces are signed evidence, not proof of isolation; re-run the command to reproduce.
 - **Codegen covers an OpenAPI subset.** Paths, methods, `operationId`, component schemas, `$ref`, arrays, enums, unions, examples, common scalar formats, and a starting SQL migration. Security schemes, callbacks, discriminators, and parameter validation are not generated.
 - **Eval fingerprints identify an input, not a whole environment.** They cover command, suite, commit, tree, dirty/untracked input, and timeout. `eval rerun` compares fingerprints but does not pin toolchain or container images, and ignored files are not hashed.
@@ -553,6 +580,6 @@ and delete their own rows; still, point them at a scratch database.
 
 ## Next
 
-1. Hosted multi-tenant operations (quotas, per-token audit export, failover).
-2. Richer policy: required reviewers, expiring approvals, and approval conditions tied to diffs.
-3. Deeper codegen: parameter validation, auth schemes, and dialect-aware migrations.
+1. Richer policy: required reviewers, expiring approvals, and approval conditions tied to diffs.
+2. Deeper codegen: parameter validation, auth schemes, and dialect-aware migrations.
+3. Hosted operations UX: tenant dashboards, token rotation, and quota/health alerting.

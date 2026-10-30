@@ -10,6 +10,7 @@ Example::
       /tmp/opencode/aghub-pg-venv/bin/python -m unittest tests.test_postgres -v
 """
 
+import json
 import os
 import sys
 import threading
@@ -171,6 +172,41 @@ class PostgresStoreTests(unittest.TestCase):
         self.assertIn("lease.release", kinds)
         self.assertIn("lease.expire", kinds)
 
+    def test_audit_records_and_filters_actor_labels(self):
+        self.store.publish(self.project, snapshot(self.project), actor="alpha")
+        self.store.claim(
+            self.project, "T-1", "a", ["src/api/**"], 60, actor="alpha"
+        )
+        self.store.claim(self.project, "T-2", "b", ["docs/**"], 60, actor="beta")
+
+        alpha = self.store.audit(self.project, actor="alpha")
+        beta = self.store.audit(self.project, actor="beta")
+        self.assertTrue(alpha)
+        self.assertTrue(beta)
+        self.assertTrue(all(item["actor"] == "alpha" for item in alpha))
+        self.assertTrue(all(item["actor"] == "beta" for item in beta))
+        self.assertIn("lease.claim", {item["type"] for item in alpha})
+        self.assertIn("lease.claim", {item["type"] for item in beta})
+
+    def test_quota_counter_is_shared_across_connections(self):
+        actor = f"quota-{uuid.uuid4().hex[:12]}"
+        other = PostgresStore(DSN)
+        try:
+            self.assertTrue(self.store.consume_quota(actor, 2)["allowed"])
+            self.assertTrue(other.consume_quota(actor, 2)["allowed"])
+            refused = other.consume_quota(actor, 2)
+            self.assertFalse(refused["allowed"])
+            self.assertEqual(refused["remaining"], 0)
+            self.assertGreater(refused["retry_after"], 0)
+            # A zero limit stays unlimited.
+            self.assertTrue(other.consume_quota(actor, 0)["allowed"])
+        finally:
+            other.conn.execute(
+                "DELETE FROM quota_windows WHERE actor=%s", (actor,)
+            )
+            other.conn.commit()
+            other.close()
+
     def _assert_project_lock_is_free(self, other):
         result = []
         thread = threading.Thread(
@@ -259,7 +295,13 @@ class PostgresHttpTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.server, cls.store = build_server(
-            "127.0.0.1", 0, ":memory:", token="secret", postgres=DSN, rate_limit=0
+            "127.0.0.1",
+            0,
+            ":memory:",
+            token="secret",
+            tokens={"tenant": {"role": "writer", "name": "tenant"}},
+            postgres=DSN,
+            rate_limit=0,
         )
         cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
         cls.thread.start()
@@ -317,6 +359,35 @@ class PostgresHttpTests(unittest.TestCase):
         hubclient.release(self.base, self.project, "T-1", "http-a", token="secret")
         data = hubclient.board(self.base, self.project, token="secret")
         self.assertEqual(data["leases"], [])
+
+    def test_audit_export_is_pinned_to_token_actor(self):
+        hubclient.publish(
+            self.base, self.project, snapshot(self.project), token="secret"
+        )
+        hubclient.publish(
+            self.base, self.project, snapshot(self.project), token="tenant"
+        )
+        hubclient.claim(
+            self.base,
+            self.project,
+            "T-1",
+            "tenant-agent",
+            ["src/api/**"],
+            60,
+            token="tenant",
+        )
+        own = hubclient.audit_export(self.base, token="tenant")
+        rows = [json.loads(line) for line in own.splitlines() if line]
+        self.assertTrue(rows)
+        self.assertTrue(
+            all(row["actor"] == "tenant" and row["project"] == self.project for row in rows)
+        )
+        self.assertIn("lease.claim", {row["type"] for row in rows})
+
+        everything = hubclient.audit_export(self.base, token="secret")
+        actors = {json.loads(line)["actor"] for line in everything.splitlines() if line}
+        self.assertIn("tenant", actors)
+        self.assertIn("admin", actors)
 
 
 @unittest.skipUnless(POSTGRES_READY, SKIP_REASON)

@@ -6,7 +6,10 @@ concurrent claims. Agents publish a snapshot after every board transaction, so
 the web view never has to touch a repository.
 """
 
+import csv
+import hashlib
 import hmac
+import io
 import json
 import os
 import sqlite3
@@ -64,7 +67,14 @@ CREATE TABLE IF NOT EXISTS events (
   project TEXT NOT NULL,
   at TEXT NOT NULL,
   type TEXT NOT NULL,
-  payload TEXT NOT NULL
+  payload TEXT NOT NULL,
+  actor TEXT
+);
+CREATE TABLE IF NOT EXISTS quota_windows (
+  actor TEXT NOT NULL,
+  window_start INTEGER NOT NULL,
+  used INTEGER NOT NULL,
+  PRIMARY KEY (actor, window_start)
 );
 CREATE TABLE IF NOT EXISTS board_events (
   seq INTEGER PRIMARY KEY,
@@ -103,6 +113,14 @@ class HubStore:
                     ON CONFLICT(key) DO UPDATE SET value=excluded.value
                     """
                 )
+            event_columns = {
+                row["name"] for row in self.conn.execute("PRAGMA table_info(events)")
+            }
+            if "actor" not in event_columns:
+                self.conn.execute("ALTER TABLE events ADD COLUMN actor TEXT")
+            self.conn.execute(
+                "CREATE INDEX IF NOT EXISTS events_actor ON events(project, actor, seq)"
+            )
             self.conn.commit()
 
     def close(self):
@@ -111,7 +129,7 @@ class HubStore:
 
     # -- snapshots -------------------------------------------------------
 
-    def publish(self, project, snapshot):
+    def publish(self, project, snapshot, actor=None):
         stamp = now_iso()
         with self.lock:
             seq = self._next_seq()
@@ -129,7 +147,7 @@ class HubStore:
                 "INSERT INTO board_events(seq, project, at, payload) VALUES(?,?,?,?)",
                 (seq, project, stamp, json.dumps(self.board(project))),
             )
-            self._event(project, "snapshot.publish", {"seq": seq})
+            self._event(project, "snapshot.publish", {"seq": seq}, actor=actor)
             oldest = self.conn.execute(
                 """
                 SELECT seq FROM board_events WHERE project=?
@@ -232,36 +250,73 @@ class HubStore:
                 )
             return {"projects": projects}
 
-    def audit(self, project=None, after=0, limit=100):
+    def audit(self, project=None, after=0, limit=100, actor=None):
         """Immutable-ish hub operation log for operators and hosted deployments."""
-        limit = max(1, min(int(limit or 100), 500))
+        limit = max(1, min(int(limit or 100), 10000))
         with self.lock:
+            clauses = ["seq>?"]
+            params = [int(after or 0)]
             if project:
-                rows = self.conn.execute(
-                    """
-                    SELECT seq, project, at, type, payload FROM events
-                    WHERE project=? AND seq>? ORDER BY seq LIMIT ?
-                    """,
-                    (project, int(after or 0), limit),
-                ).fetchall()
-            else:
-                rows = self.conn.execute(
-                    """
-                    SELECT seq, project, at, type, payload FROM events
-                    WHERE seq>? ORDER BY seq LIMIT ?
-                    """,
-                    (int(after or 0), limit),
-                ).fetchall()
+                clauses.append("project=?")
+                params.append(project)
+            if actor:
+                clauses.append("actor=?")
+                params.append(actor)
+            params.append(limit)
+            rows = self.conn.execute(
+                """
+                SELECT seq, project, at, type, payload, actor FROM events
+                WHERE """
+                + " AND ".join(clauses)
+                + " ORDER BY seq LIMIT ?",
+                params,
+            ).fetchall()
             return [
                 {
                     "seq": row["seq"],
                     "project": row["project"],
                     "at": row["at"],
+                    "actor": row["actor"],
                     "type": row["type"],
                     "payload": json.loads(row["payload"]),
                 }
                 for row in rows
             ]
+
+    def consume_quota(self, actor, limit, window=60):
+        """Count one request for an actor in a fixed window.
+
+        The counter lives in the shared store, so a token cannot multiply its
+        quota by connecting through several hubs.
+        """
+        limit = int(limit or 0)
+        now = int(time.time())
+        start = now - (now % int(window or 60))
+        retry_after = max(1, int(window or 60) - (now % int(window or 60)))
+        if limit <= 0:
+            return {"allowed": True, "remaining": 0, "retry_after": 0}
+        with self.lock:
+            self.conn.execute(
+                "DELETE FROM quota_windows WHERE window_start < ?", (start,)
+            )
+            self.conn.execute(
+                """
+                INSERT INTO quota_windows(actor, window_start, used) VALUES(?,?,1)
+                ON CONFLICT(actor, window_start) DO UPDATE SET used=used+1
+                """,
+                (actor, start),
+            )
+            row = self.conn.execute(
+                "SELECT used FROM quota_windows WHERE actor=? AND window_start=?",
+                (actor, start),
+            ).fetchone()
+            self.conn.commit()
+        used = int(row["used"] if row else 1)
+        return {
+            "allowed": used <= limit,
+            "remaining": max(0, limit - used),
+            "retry_after": retry_after,
+        }
 
     def history(self, project=None, after=0, limit=100):
         """Bounded board history, oldest first. Used for SSE replay and the API."""
@@ -327,7 +382,7 @@ class HubStore:
 
     # -- leases ----------------------------------------------------------
 
-    def claim(self, project, task, agent, paths, ttl=600, steal=False, force=False):
+    def claim(self, project, task, agent, paths, ttl=600, steal=False, force=False, actor=None):
         ttl = max(1, min(int(ttl or 600), 86400))
         stamp = now_iso()
         with self.lock:
@@ -387,6 +442,7 @@ class HubStore:
                 project,
                 "lease.claim",
                 {"task": task, "agent": agent, "paths": paths or [], "fencing": fencing, "stolen_from": stolen_from},
+                actor=actor,
             )
             self.conn.commit()
             return {
@@ -397,7 +453,7 @@ class HubStore:
                 "stolen_from": stolen_from,
             }
 
-    def release(self, project, task, agent, force=False):
+    def release(self, project, task, agent, force=False, actor=None):
         with self.lock:
             row = self.conn.execute(
                 "SELECT * FROM leases WHERE project=? AND task=?", (project, task)
@@ -417,11 +473,11 @@ class HubStore:
                 "UPDATE agents SET current_task=NULL, branch=NULL WHERE project=? AND id=? AND current_task=?",
                 (project, row["agent"], task),
             )
-            self._event(project, "lease.release", {"task": task, "agent": agent, "owner": row["agent"]})
+            self._event(project, "lease.release", {"task": task, "agent": agent, "owner": row["agent"]}, actor=actor)
             self.conn.commit()
             return {"status": 200, "ok": True, "released": True}
 
-    def expire(self, project, agent, ttl=600):
+    def expire(self, project, agent, ttl=600, actor=None):
         stale = ago_iso(int(ttl) + 5)
         with self.lock:
             self.conn.execute(
@@ -430,7 +486,7 @@ class HubStore:
             released = self.conn.execute(
                 "DELETE FROM leases WHERE project=? AND agent=?", (project, agent)
             ).rowcount
-            self._event(project, "lease.expire", {"agent": agent, "released": released})
+            self._event(project, "lease.expire", {"agent": agent, "released": released}, actor=actor)
             self.conn.commit()
             return {"ok": True, "agent": agent, "released": released, "last_seen": stale}
 
@@ -445,6 +501,7 @@ class HubStore:
         return {
             "ok": True,
             "version": __version__,
+            "backend": "sqlite",
             "projects": projects,
             "live_leases": leases,
             "agents": agents,
@@ -463,10 +520,10 @@ class HubStore:
         )
         return value
 
-    def _event(self, project, kind, payload):
+    def _event(self, project, kind, payload, actor=None):
         self.conn.execute(
-            "INSERT INTO events(project, at, type, payload) VALUES(?,?,?,?)",
-            (project, now_iso(), kind, json.dumps(payload)),
+            "INSERT INTO events(project, at, type, payload, actor) VALUES(?,?,?,?,?)",
+            (project, now_iso(), kind, json.dumps(payload), actor),
         )
 
     @staticmethod
@@ -512,7 +569,14 @@ class Handler(BaseHTTPRequestHandler):
             return self._html(PAGE)
 
         if path == "/api/health":
-            return self._json(200, self.server.store.health())
+            try:
+                return self._json(200, self.server.store.health())
+            except Exception as exc:
+                return self._json(
+                    503,
+                    {"ok": False, "error": f"store unavailable: {exc}"},
+                    headers={"Retry-After": "1"},
+                )
 
         if not path.startswith("/api/"):
             return self._json(404, {"error": "not found"})
@@ -530,6 +594,23 @@ class Handler(BaseHTTPRequestHandler):
                 401,
                 {"error": "unauthorized — pass ?token= or Authorization: Bearer"},
             )
+
+        quota = identity.get("quota") or {}
+        limit = int(quota.get("requests_per_minute") or 0)
+        if limit > 0:
+            decision = self.server.store.consume_quota(
+                identity.get("actor") or "anonymous", limit
+            )
+            if not decision["allowed"]:
+                return self._json(
+                    429,
+                    {"error": "token quota exceeded; retry shortly"},
+                    headers={
+                        "Retry-After": str(decision["retry_after"]),
+                        "X-Quota-Limit": str(limit),
+                        "X-Quota-Remaining": "0",
+                    },
+                )
 
         if method == "GET":
             needed = "admin" if path == "/api/audit" else "reader"
@@ -571,7 +652,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/overview":
             return self._json(200, self.server.store.overview(allowed))
         if path == "/api/audit":
-            return self._audit(query, allowed)
+            return self._audit(query, identity)
+        if path == "/api/audit/export":
+            return self._audit_export(query, identity)
         if path == "/api/events":
             return self._events(
                 project,
@@ -644,19 +727,85 @@ class Handler(BaseHTTPRequestHandler):
         )
         self.wfile.flush()
 
-    def _audit(self, query, allowed):
+    def _audit(self, query, identity):
         project = query.get("project", [None])[0]
+        allowed = identity.get("projects")
         if project and allowed is not None and project not in allowed:
             return self._json(403, {"error": f"token cannot read project {project}"})
+        actor = query.get("actor", [None])[0] or None
         try:
             after = int(query.get("after", ["0"])[0] or 0)
             limit = int(query.get("limit", ["100"])[0] or 100)
         except (TypeError, ValueError):
             return self._json(400, {"error": "after and limit must be integers"})
-        records = self.server.store.audit(project, after, limit)
+        limit = max(1, min(limit, 500))
+        records = self.server.store.audit(project, after, limit, actor=actor)
         if allowed is not None:
             records = [item for item in records if item["project"] in allowed]
         return self._json(200, {"events": records})
+
+    def _audit_export(self, query, identity):
+        """Export audit records as JSONL or CSV, scoped to the calling token.
+
+        Admins can export any actor. Everyone else is pinned to their own
+        actor label, so a reader token cannot enumerate another tenant's
+        operations by guessing its name.
+        """
+        project = query.get("project", [None])[0]
+        allowed = identity.get("projects")
+        if project and allowed is not None and project not in allowed:
+            return self._json(403, {"error": f"token cannot read project {project}"})
+        actor = query.get("actor", [None])[0] or None
+        if identity.get("role") != "admin":
+            if actor and actor != identity.get("actor"):
+                return self._json(403, {"error": "token cannot export another actor"})
+            actor = identity.get("actor")
+        fmt = (query.get("format", ["jsonl"])[0] or "jsonl").lower()
+        if fmt not in ("jsonl", "csv"):
+            return self._json(400, {"error": "format must be jsonl or csv"})
+        try:
+            after = int(query.get("after", ["0"])[0] or 0)
+            limit = int(query.get("limit", ["1000"])[0] or 1000)
+        except (TypeError, ValueError):
+            return self._json(400, {"error": "after and limit must be integers"})
+        limit = max(1, min(limit, 10000))
+        records = self.server.store.audit(project, after, limit, actor=actor)
+        if allowed is not None:
+            records = [item for item in records if item["project"] in allowed]
+        if fmt == "csv":
+            stream = io.StringIO()
+            writer = csv.writer(stream)
+            writer.writerow(["seq", "at", "project", "actor", "type", "payload"])
+            for item in records:
+                writer.writerow(
+                    [
+                        item["seq"],
+                        item["at"],
+                        item["project"],
+                        item["actor"] or "",
+                        item["type"],
+                        json.dumps(item["payload"], separators=(",", ":")),
+                    ]
+                )
+            body = stream.getvalue()
+            content_type = "text/csv; charset=utf-8"
+        else:
+            body = "".join(
+                json.dumps(item, separators=(",", ":")) + "\n" for item in records
+            )
+            content_type = "application/x-ndjson; charset=utf-8"
+        stamp = now_iso().replace("-", "").replace(":", "")
+        return self._raw(
+            200,
+            body,
+            content_type,
+            {
+                "Content-Disposition": (
+                    f'attachment; filename="aghub-audit-{stamp}.{fmt}"'
+                ),
+                "X-Audit-Records": str(len(records)),
+            },
+        )
 
     def _history(self, project, query):
         try:
@@ -670,7 +819,7 @@ class Handler(BaseHTTPRequestHandler):
         )
 
     def _post(self, path, identity):
-        body = self._body()
+        body = self._body(identity)
         store = self.server.store
         project = body.get("project")
         if not project and isinstance(body.get("snapshot"), dict):
@@ -685,7 +834,7 @@ class Handler(BaseHTTPRequestHandler):
             project = body.get("project") or (snapshot.get("project") or {}).get("name")
             if not project:
                 raise AghubError("project is required")
-            stamp = store.publish(project, snapshot)
+            stamp = store.publish(project, snapshot, actor=identity.get("actor"))
             return self._json(200, {"ok": True, "project": project, "updated_at": stamp})
 
         if path == "/api/heartbeat":
@@ -712,17 +861,28 @@ class Handler(BaseHTTPRequestHandler):
                 body.get("ttl") or 600,
                 bool(body.get("steal")),
                 bool(body.get("force")),
+                actor=identity.get("actor"),
             )
             return self._json(result.pop("status"), result)
 
         if path == "/api/release":
             project, task, agent = self._require(body, "project", "task", "agent")
-            result = store.release(project, task, agent, bool(body.get("force")))
+            result = store.release(
+                project, task, agent, bool(body.get("force")), actor=identity.get("actor")
+            )
             return self._json(result.pop("status"), result)
 
         if path == "/api/debug/expire":
             project, agent = self._require(body, "project", "agent")
-            return self._json(200, store.expire(project, agent, body.get("ttl") or 600))
+            return self._json(
+                200,
+                store.expire(
+                    project,
+                    agent,
+                    body.get("ttl") or 600,
+                    actor=identity.get("actor"),
+                ),
+            )
 
         return self._json(404, {"error": "not found"})
 
@@ -737,7 +897,7 @@ class Handler(BaseHTTPRequestHandler):
             values.append(value)
         return values
 
-    def _body(self):
+    def _body(self, identity=None):
         raw_length = self.headers.get("Content-Length") or "0"
         try:
             length = int(raw_length)
@@ -748,6 +908,10 @@ class Handler(BaseHTTPRequestHandler):
         if not length:
             return {}
         maximum = int(getattr(self.server, "max_body", MAX_BODY_BYTES))
+        quota = (identity or {}).get("quota") or {}
+        token_max = int(quota.get("max_request_bytes") or 0)
+        if token_max > 0:
+            maximum = min(maximum, token_max)
         if length > maximum:
             raise AghubError(f"request body exceeds {maximum} bytes")
         raw = self.rfile.read(length)
@@ -800,6 +964,17 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _raw(self, status, text, content_type, headers=None):
+        body = text.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        for key, value in (headers or {}).items():
+            self.send_header(key, value)
+        self.end_headers()
+        self.wfile.write(body)
+
     def _html(self, text):
         body = text.encode("utf-8")
         self.send_response(200)
@@ -809,11 +984,71 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
 
+ROLES = {"reader", "writer", "admin"}
+QUOTA_KEYS = {"requests_per_minute", "max_request_bytes"}
+
+
+def _token_actor(token, name=None):
+    name = str(name).strip() if name else ""
+    if name:
+        return name
+    return "token-" + hashlib.sha256(str(token).encode("utf-8")).hexdigest()[:10]
+
+
+def _token_quota(value):
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise AghubError("token quota must be an object")
+    quota = {}
+    for key in ("requests_per_minute", "max_request_bytes"):
+        if key in value:
+            try:
+                number = int(value[key])
+            except (TypeError, ValueError):
+                raise AghubError(f"token quota '{key}' must be an integer")
+            if number < 0:
+                raise AghubError(f"token quota '{key}' must be >= 0")
+            quota[key] = number
+    unknown = sorted(set(value) - QUOTA_KEYS)
+    if unknown:
+        raise AghubError(f"unknown token quota '{unknown[0]}'")
+    return quota
+
+
+def _token_projects(value):
+    if value is None:
+        return None
+    if not isinstance(value, list):
+        raise AghubError("token projects must be a list")
+    return [str(item) for item in value]
+
+
+def _identity(token, role, projects=None, name=None, quota=None, actor=None):
+    role = role or "writer"
+    if role not in ROLES:
+        raise AghubError(f"unknown token role '{role}'")
+    return {
+        "role": role,
+        "projects": _token_projects(projects),
+        "actor": actor or _token_actor(token, name),
+        "quota": _token_quota(quota),
+    }
+
+
 def load_tokens(path):
     """Load hosted-hub token definitions from JSON.
 
-    Accepted shape: {"tokens": {"TOKEN": {"role": "writer", "projects": ["web"]}}}
-    or a plain mapping of token -> role string.
+    Accepted shape::
+
+        {"tokens": {"TOKEN": {"role": "writer", "projects": ["web"],
+                              "name": "frontend-ci",
+                              "quota": {"requests_per_minute": 120,
+                                        "max_request_bytes": 1048576}}}}
+
+    or a plain mapping of token -> role string. The optional `name` is the
+    audit actor (defaults to a short token fingerprint), and quota limits are
+    enforced per actor in the shared store.
     """
     with open(os.path.expanduser(path), "r", encoding="utf-8") as handle:
         data = json.load(handle)
@@ -825,15 +1060,17 @@ def load_tokens(path):
         raise AghubError("tokens file must contain an object or list")
     for token, value in raw.items():
         if isinstance(value, str):
-            tokens[str(token)] = {"role": value, "projects": None}
+            tokens[str(token)] = _identity(token, value)
         elif isinstance(value, dict):
-            role = value.get("role") or "writer"
-            if role not in ("reader", "writer", "admin"):
-                raise AghubError(f"unknown token role '{role}'")
-            tokens[str(token)] = {
-                "role": role,
-                "projects": value.get("projects"),
-            }
+            tokens[str(token)] = _identity(
+                token,
+                value.get("role") or "writer",
+                value.get("projects"),
+                value.get("name"),
+                value.get("quota"),
+            )
+        else:
+            raise AghubError(f"token '{token}' must be a role string or object")
     return tokens
 
 
@@ -858,17 +1095,23 @@ def build_server(
     server.store = store
     identities = {}
     if token:
-        identities[str(token)] = {"role": "admin", "projects": None}
+        identities[str(token)] = _identity(token, "admin", None, "admin")
     if read_token:
-        identities[str(read_token)] = {"role": "reader", "projects": None}
+        identities[str(read_token)] = _identity(read_token, "reader", None, "reader")
     for key, value in (tokens or {}).items():
         if isinstance(value, str):
-            identities[str(key)] = {"role": value, "projects": None}
+            identities[str(key)] = _identity(key, value)
+        elif isinstance(value, dict):
+            identities[str(key)] = _identity(
+                key,
+                value.get("role") or "writer",
+                value.get("projects"),
+                value.get("name"),
+                value.get("quota"),
+                actor=value.get("actor"),
+            )
         else:
-            identities[str(key)] = {
-                "role": value.get("role") or "writer",
-                "projects": value.get("projects"),
-            }
+            raise AghubError(f"token '{key}' must be a role string or object")
     server.token = token
     server.tokens = identities
     server.verbose = verbose
