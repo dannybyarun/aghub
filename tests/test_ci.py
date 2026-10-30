@@ -40,6 +40,45 @@ class CiTests(unittest.TestCase):
         self.assertEqual(payload["approvals"]["gated"], 1)
         self.assertFalse(payload["ok"])
 
+    def test_status_treats_changes_requested_as_gated(self):
+        task = {
+            "id": "T-001",
+            "title": "gated",
+            "status": "ready",
+            "requires_approval": True,
+            "paths": ["packages/web/**"],
+        }
+        review = {
+            "id": "R-1",
+            "at": "2026-01-01T00:00:00Z",
+            "task": "T-001",
+            "agent": "reviewer",
+            "decision": "changes_requested",
+            "note": "needs tests",
+        }
+        state = make_state(tasks={"T-001": task}, approvals=[review])
+        payload = ci.status(state, SimpleNamespace(head="abc1234"))
+        self.assertEqual(payload["approvals"]["gated"], 1)
+        self.assertEqual(payload["approvals"]["approved"], 0)
+
+    def test_github_review_workflow_is_safe_and_records_reviews(self):
+        text = ci.github_workflow(project="demo", trunk="main")
+        self.assertIn("name: aghub review", text)
+        self.assertIn("pull_request_review", text)
+        self.assertIn("types: [submitted]", text)
+        self.assertIn("aghub github sync", text)
+        self.assertIn("--record-reviews", text)
+        self.assertIn("refs/pull/${PR_NUMBER}/head", text)
+        self.assertIn("Checkout trusted base", text)
+        self.assertIn("Fetch pull request head (not checked out)", text)
+        self.assertIn("github.event.pull_request.head.repo.full_name == github.repository", text)
+        self.assertIn("contents: write", text)
+        self.assertIn("pull-requests: write", text)
+        self.assertIn("checks: write", text)
+        self.assertIn("AGHUB_AGENT_KEY", text)
+        self.assertNotIn("pull_request_target", text)
+        self.assertNotIn("ref: ${{ github.event.pull_request.head.sha }}", text)
+
     def test_workflow_contains_the_gate_steps(self):
         text = ci.workflow(project="demo")
         self.assertIn("name: aghub", text)

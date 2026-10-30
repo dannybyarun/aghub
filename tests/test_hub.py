@@ -314,7 +314,7 @@ class HubHttpTests(unittest.TestCase):
         self.assertIn('id="modal"', body)
         self.assertIn('id="replay"', body)
         self.assertIn("/api/overview", body)
-        self.assertIn("Approvals", body)
+        self.assertIn("Reviews", body)
 
     def test_audit_and_overview_apis(self):
         hubclient.publish(

@@ -1279,7 +1279,7 @@ PAGE = r"""<!doctype html>
     <div class="panel"><h2>Contracts</h2><div id="contracts"></div></div>
     <div class="panel"><h2>Contract diff</h2><div id="contract-diff"></div></div>
     <div class="panel"><h2>Merge queue</h2><div id="queue"></div></div>
-    <div class="panel"><h2>Approvals</h2><div id="approvals"></div></div>
+    <div class="panel"><h2>Reviews</h2><div id="approvals"></div></div>
     <div class="panel"><h2>Handoffs</h2><div id="handoffs"></div></div>
     <div class="panel"><h2>Replay</h2>
       <input id="replay" type="range" min="0" max="0" value="0" style="width:100%">
@@ -1362,6 +1362,26 @@ function statusOf(task, snap, agents) {
   return blockers(task, snap).length ? "blocked" : "ready";
 }
 
+function reviewOf(taskId, snap) {
+  const records = (snap.approvals || []).filter((item) => item.task === taskId);
+  records.sort((a, b) =>
+    String(a.at || "").localeCompare(String(b.at || ""))
+    || String(a.id || "").localeCompare(String(b.id || ""))
+  );
+  return records.length ? records[records.length - 1] : null;
+}
+
+function isApproved(taskId, snap) {
+  const record = reviewOf(taskId, snap);
+  return !!record && (record.decision || "approved") === "approved";
+}
+
+function approvalLabel(taskId, snap) {
+  const record = reviewOf(taskId, snap);
+  if (record && record.decision === "changes_requested") return "changes requested";
+  return isApproved(taskId, snap) ? "approved" : "needs approval";
+}
+
 function card(task, snap, agents) {
   const status = statusOf(task, snap, agents);
   const agent = task.owner ? agents.find((a) => a.id === task.owner) : null;
@@ -1373,9 +1393,8 @@ function card(task, snap, agents) {
   const fixTag = source ? '<span class="tag">fix ' + esc(source) + "</span>" : "";
   const evalTags = (task.evals || []).map((e) => '<span class="tag">eval ' + esc(e) + "</span>").join("");
   const depTags = (task.depends_on || []).map((d) => '<span class="tag">dep ' + esc(d) + "</span>").join("");
-  const approved = (snap.approvals || []).some((a) => a.task === task.id);
   const approvalTag = task.requires_approval
-    ? '<span class="tag">' + (approved ? "approved" : "needs approval") + "</span>" : "";
+    ? '<span class="tag">' + esc(approvalLabel(task.id, snap)) + "</span>" : "";
   const sandboxTag = task.require_sandbox ? '<span class="tag">sandbox required</span>' : "";
   const tags = (task.contracts || []).map((c) => '<span class="tag">' + esc(c) + "</span>").join("")
     + evalTags + depTags + fixTag + approvalTag + sandboxTag;
@@ -1537,12 +1556,17 @@ function render(data) {
 
   const approvals = (snap.approvals || []).slice(-5).reverse();
   document.getElementById("approvals").innerHTML = approvals.length
-    ? approvals.map((record) => '<div class="line"><span>' + esc(record.task) + " "
-        + '<span class="sub">' + esc(record.agent) + "</span></span>"
-        + '<span class="badge ' + (record.attestation ? "green" : "yellow") + '">'
-        + (record.attestation ? "signed" : "unsigned") + "</span></div>"
-        + (record.note ? '<div class="sub">' + esc(record.note) + "</div>" : "")).join("")
-    : '<div class="empty">no approvals yet</div>';
+    ? approvals.map((record) => {
+        const decision = record.decision || "approved";
+        const label = decision === "changes_requested"
+          ? "changes requested" : (record.attestation ? "approved" : "unsigned");
+        const tone = decision === "changes_requested" ? "red" : (record.attestation ? "green" : "yellow");
+        return '<div class="line"><span>' + esc(record.task) + " "
+          + '<span class="sub">' + esc(record.agent) + "</span></span>"
+          + '<span class="badge ' + tone + '">' + esc(label) + "</span></div>"
+          + (record.note ? '<div class="sub">' + esc(record.note) + "</div>" : "");
+      }).join("")
+    : '<div class="empty">no reviews yet</div>';
 
   const handoffs = (snap.handoffs || []).slice(-8).reverse();
   document.getElementById("handoffs").innerHTML = handoffs.length
@@ -1597,8 +1621,9 @@ function showTask(taskId) {
   kv("updated", esc(task.updated_at || "—"));
   if (task.require_sandbox) kv("sandbox", badge("bubblewrap required", "yellow"));
   if (task.requires_approval) {
-    const approved = (snap.approvals || []).some((item) => item.task === task.id);
-    kv("approval", badge(approved ? "approved" : "waiting for human", approved ? "green" : "yellow"));
+    const label = approvalLabel(task.id, snap);
+    const tone = label === "approved" ? "green" : (label === "changes requested" ? "red" : "yellow");
+    kv("approval", badge(label, tone));
   }
   if (task.acceptance) kv("acceptance", esc(task.acceptance));
 
@@ -1629,11 +1654,15 @@ function showTask(taskId) {
 
   const approvals = (snap.approvals || []).filter((item) => item.task === task.id);
   if (approvals.length) {
-    body += "<h3>Approvals</h3>";
+    body += "<h3>Reviews</h3>";
     for (const record of approvals) {
+      const decision = record.decision || "approved";
+      const label = decision === "changes_requested"
+        ? "changes requested" : (record.attestation ? "approved" : "unsigned");
+      const tone = decision === "changes_requested" ? "red" : (record.attestation ? "green" : "yellow");
       body += '<div class="line"><span>' + esc(record.agent) + " "
         + '<span class="sub">' + esc(record.note || record.commit || "") + "</span></span>"
-        + badge(record.attestation ? "signed" : "unsigned", record.attestation ? "green" : "yellow")
+        + badge(label, tone)
         + "</div>";
     }
   }

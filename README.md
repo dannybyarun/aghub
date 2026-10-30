@@ -4,7 +4,7 @@
 
 Two agents, two clones, one project. One takes the backend, one takes the frontend. Neither sends a message. They read a board, claim a lane, build against a frozen contract, and hand off in writing.
 
-This is a working vertical slice of that protocol: the board, claims, contracts, handoffs, codegen from frozen contracts, a serial merge queue that turns failures into trace-carrying tasks, locally signed and sandboxed evals, hash-chained board history, project ACLs, human approval gates, an MCP server and Python SDK, and a hub that arbitrates live leases and serves a web board.
+This is a working vertical slice of that protocol: the board, claims, contracts, handoffs, codegen from frozen contracts, a serial merge queue that turns failures into trace-carrying tasks, locally signed and sandboxed evals, hash-chained board history, project ACLs, human review inboxes and approval gates, a GitHub pull-request bridge, an MCP server and Python SDK, and a hub that arbitrates live leases and serves a web board.
 
 ```
 $ aghub status
@@ -36,7 +36,7 @@ Chat does not fix this. It is nondeterministic, expensive in context, and leaves
 - **Frozen contracts** let both sides build without coordinating, because the boundary is pinned before work starts.
 - **Handoffs** replace conversation with a structured delta: what changed, what is next.
 - **A merge queue** is the single authority that turns parallel branches into a serial trunk.
-- **Signed history + approvals** let humans and other agents verify what happened and stop high-risk merges.
+- **Signed history + reviews** let humans and other agents verify what happened, request changes, and stop high-risk merges.
 
 Claims are advisory at write time (fast, works offline, catches most races). The queue is authoritative at merge time (path check + contract check + serial merge). That split is deliberate: you cannot make git leases truly authoritative across machines without a leader, so don't pretend — enforce at integration. With a hub, live leases become authoritative at write time too.
 
@@ -83,7 +83,7 @@ Creates a bare origin, three clones (`fe`, `be`, `ci`), and walks through:
 4. Parallel work with signed handoffs instead of messages.
 5. Serial merge queue, a reproducibility check (`eval rerun` / `eval diff`), and the CI bridge.
 6. A local eval gate, a simulated dead agent, lease expiry, and `--steal`.
-7. An approval-gated task where the owner cannot self-approve.
+7. An approval-gated task where the owner cannot self-approve: request changes, see the review inbox, approve, then preview the GitHub review comment and check.
 8. A cross-lane edit rejected by the queue; a fix task is opened with the changed files attached.
 9. A semantic drift (`/health` not in the contract) rejected by the check; the fix task carries the failing command and output.
 10. Signed board verification, then ACLs locking writes to known roles.
@@ -132,7 +132,7 @@ Every durable action that can be attributed to an agent is signed with a per-age
 - handoffs
 - queue submissions and queue results
 - failure traces
-- human approvals
+- human reviews
 - board events (when a local key exists)
 
 Private keys live in `.git/aghub.local.json` (mode `0600`) and never leave the clone. Only the public key is published on `agents/<id>.yaml`. Key rotation keeps the previous public key so old scorecards still verify; revocation makes old and future signatures from that key fail.
@@ -163,7 +163,7 @@ aghub hub status
 
 - **Leases are authoritative at write time.** `claim` asks the hub first. A 409 aborts the claim; a grant carries a fencing token that increases on every lease. Heartbeats extend the lease.
 - **Presence is live.** Every board transaction publishes a snapshot and a heartbeat. `status` overlays hub presence and prints `· hub live` or `· hub offline`.
-- **The web board never touches git.** `GET /` is a self-contained page: ready / in-flight / blocked lanes, agents, live leases, evals, dependency/fix graph, contracts and their latest diff, merge queue, approvals, handoffs, a replay scrubber, and a multi-project overview. It consumes `/api/events` over server-sent events, resumes with `Last-Event-ID`, and falls back to polling `/api/board` every 3s if the stream drops.
+- **The web board never touches git.** `GET /` is a self-contained page: ready / in-flight / blocked lanes, agents, live leases, evals, dependency/fix graph, contracts and their latest diff, merge queue, reviews, handoffs, a replay scrubber, and a multi-project overview. It consumes `/api/events` over server-sent events, resumes with `Last-Event-ID`, and falls back to polling `/api/board` every 3s if the stream drops.
 - **An outage degrades, it does not block.** The first unreachable hub produces one warning, then claims continue git-only. A reachable hub that returns 409 is always obeyed.
 - **Failover is conservative.** Clients try the configured URLs in order on connection failures and `502`/`503`/`504`. Any other HTTP response — especially a lease `409` or a quota `429` — is authoritative and is never replayed against another hub.
 - **Tenant quotas are shared.** A token can set `requests_per_minute` and `max_request_bytes`. Counters live in the hub store, so several hubs sharing one SQLite file or Postgres database enforce one budget per tenant.
@@ -229,7 +229,7 @@ Non-admin tokens can export only their own actor; asking for another actor retur
 | `POST /api/release` | release a lease |
 | `POST /api/debug/expire` | simulate a dead agent |
 
-### ACLs and approvals
+### ACLs and reviews
 
 ACLs are opt-in. Until a board runs `aghub acl init`, every participant is a writer, preserving compatibility with existing boards.
 
@@ -252,10 +252,29 @@ Approval gates are per task:
 
 ```bash
 aghub task add "Deploy billing" --paths 'src/billing/**' --requires-approval
-aghub approve T-007 --note "reviewed migration and rollout plan"
+aghub review T-007 --request-changes --note "add a rollback check"
+aghub review T-007 --approve --note "reviewed migration and rollout plan"
 ```
 
-`submit` and `queue run` refuse a gated task until a signed approval exists. The task owner cannot approve their own work unless `--force` is passed, and with ACLs enabled only an admin can approve. Approvals are stored on the board and shown in the web task detail.
+`submit` and `queue run` refuse a gated task until the **latest valid review**
+is an approval. A request for changes blocks submission until a later approval;
+a reviewer can inspect the whole packet first with `aghub review T-007 --diff`.
+The task owner cannot review their own work unless `--force` is passed, and with
+ACLs enabled only an admin can review. Reviews are signed records on the board,
+shown in the web task detail, and the legacy `aghub approve` command still
+records an approval for compatibility.
+
+`aghub inbox` is the human queue: pending approvals, requested changes, rejected
+queue entries, and stale leases, each with the next command to run. Use
+`aghub inbox --check` in a cron or agent loop when you only need a nonzero exit
+status.
+
+```bash
+aghub inbox
+aghub inbox --json
+aghub review T-007                 # task, contracts, evals, queue, reviews, diffstat
+aghub review T-007 --diff          # include the patch
+```
 
 ### Contracts are the anti-conversation device
 
@@ -450,6 +469,55 @@ runner generates a fresh local key as usual. The template assumes `bin/aghub`
 is present in the repository (as it is here); replace that path if your project
 installs or vendors the CLI differently.
 
+### Review inbox and the GitHub bridge
+
+The review layer has two entry points. `aghub inbox` is local and read-only;
+`aghub github sync` publishes the same review packet onto a pull request.
+
+```bash
+aghub ci workflow --github-review --out .github/workflows/aghub-review.yml
+```
+
+The generated workflow:
+
+- runs on pull-request updates and submitted pull-request reviews;
+- checks out the **base** commit and only fetches the pull-request head for diffing,
+  so no untrusted pull-request code is executed;
+- attaches the shared board, records trusted `APPROVED` / `CHANGES_REQUESTED`
+  reviews, then updates one sticky PR comment and one `aghub/review` check run;
+- skips fork pull requests by default: they receive a read-only token and no
+  secrets, so they cannot publish to the board or GitHub.
+
+Set `AGHUB_AGENT_KEY` to a stable 32-byte hex Ed25519 seed for the workflow
+identity (default `github-review`); the board review is signed by that identity
+and the note records the actual GitHub login. If ACLs are enabled, give that
+identity an admin role so it can record reviews. `AGHUB_HUB_TOKEN` is optional
+and only mirrors board changes to a hub. The workflow needs `contents: write`,
+`pull-requests: write`, and `checks: write`.
+
+Task resolution is intentionally boring: the PR branch must equal the task
+branch, or the title/body must contain `aghub-task: T-003` (or a plain `T-003`).
+The bridge only records reviews for gated tasks, only from
+`OWNER,MEMBER,COLLABORATOR` by default, and deduplicates by GitHub review id.
+Change the trust set with `--allow-association`; fork approval recording is
+refused unless `--allow-fork-reviews` is passed explicitly.
+
+For local or one-off syncs:
+
+```bash
+aghub github sync --task T-007 --dry-run --json  # inspect the comment and check
+aghub github sync --record-reviews           # use GITHUB_EVENT_PATH + GITHUB_TOKEN
+aghub github sync --task T-007 --no-comment --check
+```
+
+The check is `success` when merged or ready for the queue, `failure` when the
+queue rejected the branch, `action_required` for a pending approval or requested
+changes, and `neutral` while work is in progress. If a GitHub approval was
+recorded for an earlier head SHA, the comment and check mark it as stale and ask
+for a fresh approval; the board's own review gate is still latest-review based
+until diff-conditioned approvals land. The comment marker
+`<!-- aghub:review -->` is what makes it sticky across updates.
+
 ### MCP and the Python SDK
 
 `aghub mcp serve` exposes the board over newline-delimited JSON-RPC 2.0 on stdio,
@@ -500,7 +568,9 @@ reimplemented or bypassed.
 | `aghub acl init\|list\|set\|remove\|revoke-key` | manage roles and key revocation |
 | `aghub task add TITLE --paths GLOB [--contract api@1] [--eval smoke] [--depends T-001] [--requires-approval] [--requires-sandbox]` | define work |
 | `aghub task show TASK` | full task YAML, including any failure trace |
-| `aghub approve TASK [--note TEXT] [--commit SHA] [--force]` | record a human approval |
+| `aghub approve TASK [--note TEXT] [--commit SHA] [--force]` | legacy alias for `review --approve` |
+| `aghub inbox [--json] [--check]` | pending approvals, requested changes, failed queue entries, stale leases |
+| `aghub review TASK [--diff] [--json] [--approve\|--request-changes] [--note TEXT] [--force]` | inspect one task and record a signed human review |
 | `aghub verify [--strict] [--json]` / `board verify` | verify the event chain and signed records |
 | `aghub registry profile [--model M] [--skills a,b] [--note TEXT]` | publish this agent's profile |
 | `aghub registry show [AGENT]` / `registry list` | inspect the registry |
@@ -517,7 +587,8 @@ reimplemented or bypassed.
 | `aghub release TASK` | give work back |
 | `aghub submit TASK` | push branch and enqueue |
 | `aghub queue run\|list\|show [ID]\|verify [ID]` | integration and queue inspection |
-| `aghub ci workflow [--out PATH] [--trunk BRANCH] [--contract NAME] [--codegen-out DIR]` / `ci status [--json]` | CI template and gate |
+| `aghub ci workflow [--out PATH] [--trunk BRANCH] [--contract NAME] [--codegen-out DIR] [--github-review]` / `ci status [--json]` | CI template, review bridge, and gate |
+| `aghub github sync [--task TASK] [--event PATH] [--repo OWNER/NAME] [--record-reviews] [--dry-run] [--json]` | publish review comment/check and record trusted PR reviews |
 | `aghub mcp serve [--agent ID]` / `mcp tools` | MCP stdio server and tool catalog |
 | `aghub sync` | fetch board + trunk |
 | `aghub hub serve [--host H] [--port P] [--db PATH] [--token T] [--read-token T] [--tokens-file F] [--rate-limit N] [--postgres DSN]` | run the lease/presence hub + web board |
@@ -533,7 +604,7 @@ Agent identity: `--agent`, `$AGHUB_AGENT`, or the clone-local `.git/aghub.local.
 
 ```
 bin/aghub              entrypoint
-src/aghub/             board, service, codegen, render, sandbox, hub, client, MCP, SDK, CI, CLI
+src/aghub/             board, service, review, github, codegen, render, sandbox, hub, client, MCP, SDK, CI, CLI
 demo/run_demo.sh       the two-agent story
 demo/run_hub.sh        the live layer: leases, presence, web board
 tests/                 protocol, trust, codegen, hub, MCP, sandbox, and end-to-end tests
@@ -564,6 +635,9 @@ and delete their own rows; still, point them at a scratch database.
 - **Integration needs a shared remote.** `submit`/`queue run` require `origin`; local-only mode supports the board but not merging.
 - **Board authorization is guardrails, not a git firewall.** ACLs stop accidental reader writes through the CLI, but anyone who can force-push `aghub/board` can rewrite it. Event hashes and signatures make tampering visible; they do not make the branch immutable. Hub tokens protect the HTTP API, not git.
 - **Signatures bind records to published keys, not to people.** Private keys live outside the board, so a board writer cannot read them or mint a valid record for another agent without replacing that agent's published key. Old records stay valid until their key is revoked. The Ed25519 helper is pure Python, not constant-time, and is intended for local trusted-repo use rather than hostile co-tenants.
+- **Latest review wins by board time.** Review order is the signed record's `at` timestamp, with its ULID as the tie-breaker; clock skew between reviewers can therefore reorder reviews. There are no required-reviewer counts, review expiry, or diff-conditioned approvals yet. The GitHub bridge flags an approval recorded for an older head SHA, but the board gate itself does not reject it yet.
+- **The GitHub bridge is a workflow, not an App.** It runs only on the events in the generated workflow, needs a same-repository PR by default, publishes one sticky comment and one `aghub/review` check, and records only GitHub `APPROVED` / `CHANGES_REQUESTED` reviews. Fork PRs are skipped (read-only token, no secrets) and fork approvals are refused unless explicitly allowed. Dismissed or commented reviews are not treated as decisions, and the workflow identity must be an admin when ACLs are enabled.
+- **A review packet needs the task branch locally.** `aghub review --diff` fetches the branch from the board's remote when possible; if the owner has not pushed it yet, the packet shows the task and gate state but not a patch.
 - **Legacy and pre-key events may be unsigned.** Records created before a key exists are reported as unsigned; `verify --strict` fails on unsigned records, while chain errors and invalid signatures always fail.
 - **Live updates send full snapshots.** SSE pushes the whole board on change and keeps the last 100 per project for `Last-Event-ID` replay; there are no per-task deltas or websocket fan-out yet. A reconnect older than the window gets the oldest retained snapshot and then the current board.
 - **Postgres is optional.** The default hub is a single SQLite file. `--postgres` requires `psycopg[binary]` in the runtime environment, uses per-project advisory transaction locks for lease decisions, and serializes concurrent first startup with a schema lock; the default suite skips Postgres integration tests unless `AGHUB_TEST_POSTGRES_DSN` is set.
@@ -580,6 +654,7 @@ and delete their own rows; still, point them at a scratch database.
 
 ## Next
 
-1. Richer policy: required reviewers, expiring approvals, and approval conditions tied to diffs.
-2. Deeper codegen: parameter validation, auth schemes, and dialect-aware migrations.
-3. Hosted operations UX: tenant dashboards, token rotation, and quota/health alerting.
+1. Web review workspace: a real reviewer queue with inline diff review and signed approve / request-changes actions.
+2. Policy: required reviewers, expiring approvals, and approval conditions tied to diffs.
+3. GitHub App path: OAuth/webhooks, fork-safe review recording, richer check annotations, and multi-repository boards.
+4. Deeper codegen: parameter validation, auth schemes, and dialect-aware migrations.

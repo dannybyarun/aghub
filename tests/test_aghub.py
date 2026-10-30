@@ -70,15 +70,17 @@ class World:
         self.be = self.base / "be"
         self.ci = self.base / "ci"
 
-    def aghub(self, where, *args, agent=None, check=True):
+    def aghub(self, where, *args, agent=None, check=True, env=None):
         cwd = getattr(self, where) if isinstance(where, str) else where
-        env = {**os.environ, "PYTHONPATH": PYTHONPATH}
+        merged = {**os.environ, "PYTHONPATH": PYTHONPATH}
         if agent:
-            env["AGHUB_AGENT"] = agent
+            merged["AGHUB_AGENT"] = agent
+        if env:
+            merged.update(env)
         proc = subprocess.run(
             [sys.executable, "-m", "aghub", *args],
             cwd=cwd,
-            env=env,
+            env=merged,
             capture_output=True,
             text=True,
         )
@@ -919,6 +921,259 @@ class AghubTestCase(unittest.TestCase):
         verified = w.aghub("fe", "verify", agent="fe-1")
         self.assertEqual(verified.returncode, 0)
         self.assertIn("0 invalid", verified.stdout)
+
+    def test_review_inbox_and_changes_requested_gate(self):
+        w = self.world
+        self.bootstrap()
+        w.aghub(
+            "fe",
+            "task",
+            "add",
+            "Ship API",
+            "--paths",
+            "src/api/**",
+            "--requires-approval",
+            agent="fe-1",
+        )
+        w.aghub("be", "claim", "T-003", agent="be-1")
+        git(w.be, "checkout", "-q", "agent/be-1/T-003")
+        w.commit_file("be", "src/api/items.py", "print('ok')\n", "api")
+
+        inbox = json.loads(w.aghub("fe", "inbox", "--json", agent="fe-1").stdout)
+        approval = next(item for item in inbox["items"] if item["task"] == "T-003")
+        self.assertEqual(approval["kind"], "approval")
+        self.assertIn("requires a human approval", approval["detail"])
+
+        changes = w.aghub(
+            "fe",
+            "review",
+            "T-003",
+            "--request-changes",
+            "--note",
+            "missing tests",
+            agent="fe-1",
+        )
+        self.assertIn("requested changes on T-003", changes.stdout)
+
+        gated = w.aghub("be", "submit", "T-003", agent="be-1", check=False)
+        self.assertEqual(gated.returncode, 1)
+        self.assertIn("has changes requested by fe-1", gated.stderr)
+
+        inbox = json.loads(w.aghub("fe", "inbox", "--json", agent="fe-1").stdout)
+        change_item = next(item for item in inbox["items"] if item["task"] == "T-003")
+        self.assertEqual(change_item["kind"], "changes")
+        self.assertIn("missing tests", change_item["detail"])
+
+        w.aghub(
+            "fe", "review", "T-003", "--approve", "--note", "tests look good", agent="fe-1"
+        )
+        approved = json.loads(w.aghub("fe", "review", "T-003", "--json", agent="fe-1").stdout)
+        self.assertEqual(approved["approval"]["decision"], "approved")
+        self.assertEqual(approved["approval"]["reviewer"], "fe-1")
+        self.assertEqual(len(approved["approval"]["reviews"]), 2)
+
+        w.aghub("be", "submit", "T-003", agent="be-1")
+        state = json.loads(w.aghub("fe", "status", "--json", agent="fe-1").stdout)
+        decisions = [item["decision"] for item in state["approvals"] if item["task"] == "T-003"]
+        self.assertEqual(decisions, ["changes_requested", "approved"])
+
+        clear = w.aghub("fe", "inbox", "--check", agent="fe-1")
+        self.assertEqual(clear.returncode, 0)
+        verified = w.aghub("fe", "verify", agent="fe-1")
+        self.assertEqual(verified.returncode, 0)
+        self.assertIn("0 invalid", verified.stdout)
+
+    def test_github_sync_records_trusted_review_once(self):
+        w = self.world
+        self.bootstrap()
+        w.aghub(
+            "fe",
+            "task",
+            "add",
+            "Ship API",
+            "--paths",
+            "src/api/**",
+            "--requires-approval",
+            agent="fe-1",
+        )
+        w.aghub("be", "claim", "T-003", agent="be-1")
+        branch = "agent/be-1/T-003"
+        event = {
+            "action": "submitted",
+            "number": 7,
+            "pull_request": {
+                "number": 7,
+                "title": "Ship API",
+                "body": "",
+                "html_url": "https://github.com/acme/repo/pull/7",
+                "draft": False,
+                "user": {"login": "alice"},
+                "head": {
+                    "ref": branch,
+                    "sha": "a" * 40,
+                    "repo": {"full_name": "acme/repo"},
+                },
+                "base": {"ref": "main", "sha": "b" * 40},
+            },
+            "review": {
+                "id": 9001,
+                "state": "approved",
+                "user": {"login": "alice"},
+                "author_association": "MEMBER",
+                "body": "ship it",
+            },
+        }
+        event_path = Path(w.base) / "review-event.json"
+        event_path.write_text(json.dumps(event))
+
+        first = w.aghub(
+            "fe",
+            "github",
+            "sync",
+            "--event",
+            str(event_path),
+            "--repo",
+            "acme/repo",
+            "--record-reviews",
+            "--reviewer-agent",
+            "github-review",
+            "--no-comment",
+            "--no-check",
+            agent="fe-1",
+        )
+        self.assertIn("recorded GitHub approved", first.stdout)
+
+        state = json.loads(w.aghub("fe", "status", "--json", agent="fe-1").stdout)
+        records = [item for item in state["approvals"] if item["task"] == "T-003"]
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["source"], "github")
+        self.assertEqual(records[0]["external_id"], "9001")
+        self.assertEqual(records[0]["agent"], "github-review")
+        self.assertIn("alice", records[0]["note"])
+
+        second = w.aghub(
+            "fe",
+            "github",
+            "sync",
+            "--event",
+            str(event_path),
+            "--repo",
+            "acme/repo",
+            "--record-reviews",
+            "--reviewer-agent",
+            "github-review",
+            "--no-comment",
+            "--no-check",
+            agent="fe-1",
+        )
+        self.assertIn("already recorded", second.stdout)
+        state = json.loads(w.aghub("fe", "status", "--json", agent="fe-1").stdout)
+        self.assertEqual(
+            len([item for item in state["approvals"] if item["task"] == "T-003"]), 1
+        )
+
+        event["pull_request"]["head"]["sha"] = "e" * 40
+        event_path.write_text(json.dumps(event))
+        stale = w.aghub(
+            "fe",
+            "github",
+            "sync",
+            "--event",
+            str(event_path),
+            "--repo",
+            "acme/repo",
+            "--record-reviews",
+            "--dry-run",
+            "--json",
+            agent="fe-1",
+        )
+        payload = json.loads(stale.stdout)
+        self.assertTrue(payload["approval"]["stale"])
+        self.assertEqual(payload["check"]["conclusion"], "action_required")
+        self.assertIn("older commit", payload["check"]["output"]["summary"])
+
+        w.aghub("be", "submit", "T-003", agent="be-1")
+
+    def test_github_sync_refuses_untrusted_or_fork_reviews(self):
+        w = self.world
+        self.bootstrap()
+        w.aghub(
+            "fe",
+            "task",
+            "add",
+            "Ship API",
+            "--paths",
+            "src/api/**",
+            "--requires-approval",
+            agent="fe-1",
+        )
+        w.aghub("be", "claim", "T-003", agent="be-1")
+
+        def event(association="CONTRIBUTOR", head_repo="acme/repo"):
+            return {
+                "action": "submitted",
+                "number": 8,
+                "pull_request": {
+                    "number": 8,
+                    "title": "Ship API",
+                    "body": "",
+                    "html_url": "https://github.com/acme/repo/pull/8",
+                    "draft": False,
+                    "user": {"login": "mallory"},
+                    "head": {
+                        "ref": "agent/be-1/T-003",
+                        "sha": "c" * 40,
+                        "repo": {"full_name": head_repo},
+                    },
+                    "base": {"ref": "main", "sha": "d" * 40},
+                },
+                "review": {
+                    "id": 9002,
+                    "state": "approved",
+                    "user": {"login": "mallory"},
+                    "author_association": association,
+                    "body": "approve",
+                },
+            }
+
+        path = Path(w.base) / "untrusted.json"
+        path.write_text(json.dumps(event()))
+        refused = w.aghub(
+            "fe",
+            "github",
+            "sync",
+            "--event",
+            str(path),
+            "--repo",
+            "acme/repo",
+            "--record-reviews",
+            "--no-comment",
+            "--no-check",
+            agent="fe-1",
+            check=False,
+        )
+        self.assertEqual(refused.returncode, 1)
+        self.assertIn("is not trusted", refused.stderr)
+
+        path.write_text(json.dumps(event(association="MEMBER", head_repo="fork/repo")))
+        fork = w.aghub(
+            "fe",
+            "github",
+            "sync",
+            "--event",
+            str(path),
+            "--repo",
+            "acme/repo",
+            "--record-reviews",
+            "--no-comment",
+            "--no-check",
+            agent="fe-1",
+        )
+        self.assertIn("refusing to record", fork.stderr)
+        state = json.loads(w.aghub("fe", "status", "--json", agent="fe-1").stdout)
+        self.assertFalse(
+            [item for item in state["approvals"] if item["task"] == "T-003"]
+        )
 
     def test_monorepo_scope_rejects_tasks_and_merges_outside_the_subtree(self):
         tmp = tempfile.mkdtemp(prefix="aghub-scope-")

@@ -734,6 +734,7 @@ def handoff(
 
 
 def approvals_for(state, task_id):
+    """Every approved review record for a task, oldest first."""
     return [
         record
         for record in getattr(state, "approvals", [])
@@ -741,23 +742,108 @@ def approvals_for(state, task_id):
     ]
 
 
+def review_records(state, task_id):
+    """Valid review records for a task, oldest first.
+
+    A review is either an approval or a request for changes. Signatures are
+    enforced when the board uses Ed25519 attestations, matching the approval
+    gate's existing behavior.
+    """
+    records = [
+        record
+        for record in getattr(state, "approvals", [])
+        if record.get("task") == task_id
+    ]
+    if eval_attestation_mode(state) == EVAL_ED25519_SCHEME:
+        records = [
+            record for record in records if verify_attestation(state, record) is True
+        ]
+    return sorted(
+        records,
+        key=lambda record: (str(record.get("at") or ""), str(record.get("id") or "")),
+    )
+
+
+def latest_review(state, task_id):
+    records = review_records(state, task_id)
+    return records[-1] if records else None
+
+
+def review_decision(state, task_id):
+    record = latest_review(state, task_id)
+    if record is None:
+        return None, None
+    return record.get("decision") or "approved", record
+
+
 def approval_gate(state, task):
     """Return a human-readable gap when a task still needs an approval."""
     if not (task or {}).get("requires_approval"):
         return None
-    approved = approvals_for(state, task["id"])
-    if eval_attestation_mode(state) == EVAL_ED25519_SCHEME:
-        approved = [
-            record
-            for record in approved
-            if verify_attestation(state, record) is True
-        ]
-    if approved:
+    decision, record = review_decision(state, task["id"])
+    if decision == "approved":
         return None
+    if decision == "changes_requested":
+        reviewer = (record or {}).get("agent") or "a reviewer"
+        return (
+            f"{task['id']} has changes requested by {reviewer} — address them, then "
+            f"run `aghub review {task['id']} --approve --note ...`"
+        )
     return (
         f"{task['id']} requires a human approval — run "
-        f"`aghub approve {task['id']} --note ...`"
+        f"`aghub review {task['id']} --approve --note ...`"
     )
+
+
+def _review_gate(state, task_id, agent, force):
+    task = state.tasks.get(task_id)
+    if task is None:
+        raise AghubError(f"unknown task {task_id}")
+    if role_map(state) is not None:
+        require_role(state, agent, "admin", "review tasks")
+    if task.get("owner") == agent and not force:
+        raise AghubError(
+            f"{agent} owns {task_id}; review with a separate human identity "
+            "(or pass --force)"
+        )
+    return task
+
+
+def _review_record(
+    state,
+    task_id,
+    agent,
+    decision,
+    note="",
+    commit=None,
+    private_key=None,
+    public_key=None,
+    force=False,
+    source=None,
+    external_id=None,
+):
+    task = _review_gate(state, task_id, agent, force)
+    record = {
+        "id": new_ulid(),
+        "at": now_iso(),
+        "task": task_id,
+        "agent": agent,
+        "decision": decision,
+        "note": note or "",
+        "commit": commit,
+    }
+    if source:
+        record["source"] = source
+    if external_id is not None:
+        record["external_id"] = str(external_id)
+    if private_key and public_key:
+        register_agent_key(state, agent, public_key)
+        attest_record(record, private_key, public_key, signer=agent)
+    state.new_approvals.append(record)
+    state.approvals.append(record)
+    kind = "task.approved" if decision == "approved" else "task.changes_requested"
+    state.emit(kind, agent=agent, task=task_id, review=record["id"], note=record["note"])
+    return record
 
 
 def approve(
@@ -769,33 +855,49 @@ def approve(
     private_key=None,
     public_key=None,
     force=False,
+    source=None,
+    external_id=None,
 ):
-    task = state.tasks.get(task_id)
-    if task is None:
-        raise AghubError(f"unknown task {task_id}")
-    if role_map(state) is not None:
-        require_role(state, agent, "admin", "approve tasks")
-    if task.get("owner") == agent and not force:
-        raise AghubError(
-            f"{agent} owns {task_id}; approve with a separate human identity "
-            "(or pass --force)"
-        )
-    record = {
-        "id": new_ulid(),
-        "at": now_iso(),
-        "task": task_id,
-        "agent": agent,
-        "decision": "approved",
-        "note": note or "",
-        "commit": commit,
-    }
-    if private_key and public_key:
-        register_agent_key(state, agent, public_key)
-        attest_record(record, private_key, public_key, signer=agent)
-    state.new_approvals.append(record)
-    state.approvals.append(record)
-    state.emit("task.approved", agent=agent, task=task_id, approval=record["id"])
-    return record
+    return _review_record(
+        state,
+        task_id,
+        agent,
+        "approved",
+        note,
+        commit,
+        private_key,
+        public_key,
+        force,
+        source,
+        external_id,
+    )
+
+
+def request_changes(
+    state,
+    task_id,
+    agent,
+    note="",
+    commit=None,
+    private_key=None,
+    public_key=None,
+    force=False,
+    source=None,
+    external_id=None,
+):
+    return _review_record(
+        state,
+        task_id,
+        agent,
+        "changes_requested",
+        note,
+        commit,
+        private_key,
+        public_key,
+        force,
+        source,
+        external_id,
+    )
 
 
 # -- queue ---------------------------------------------------------------

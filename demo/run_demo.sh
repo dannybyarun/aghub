@@ -176,6 +176,7 @@ ci eval verify "$first_eval"
 ci eval rerun "$first_eval"
 ci eval diff "$first_eval" "$(eval_id_at ci ci)"
 ci ci workflow --out .github/workflows/aghub.yml
+ci ci workflow --github-review --out .github/workflows/aghub-review.yml
 ci ci status --json
 ci verify
 note "the eval ran locally; the board stores a signed scorecard, not the run"
@@ -224,7 +225,7 @@ ci queue run
 note "T-007 carries the failing case: command, exit code, output, changed files"
 ci task show T-007
 
-bold "10 · A human approval is a signed gate, not a message"
+bold "10 · A human review is a signed gate, not a message"
 be task add "Billing deploy" --paths 'src/api/**' --requires-approval
 be claim T-008
 git_at be checkout -q agent/be-1/T-008
@@ -234,9 +235,14 @@ ROUTES = ["/items", "/items/{id}"]
 PY
 git_at be add -A
 git_at be commit -qm "api: billing deploy behind an approval gate"
-expect_fail "the task owner cannot self-approve" be approve T-008 --note "self approval"
+expect_fail "the task owner cannot self-approve" be review T-008 --approve --note "self approval"
 expect_fail "a task without approval cannot be submitted" be submit T-008
-fe approve T-008 --note "reviewed the billing rollout"
+fe review T-008 --request-changes --note "add a rollback check"
+fe inbox
+expect_fail "requested changes still block submit" be submit T-008
+fe review T-008 --approve --note "reviewed the billing rollout and rollback"
+fe review T-008 --json
+fe github sync --task T-008 --repo acme/store --dry-run
 be submit T-008
 ci queue run
 ci verify

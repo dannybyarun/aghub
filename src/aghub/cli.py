@@ -309,6 +309,46 @@ def cmd_acl(args):
     raise AghubError(f"unknown acl command {args.acl_command}")
 
 
+def _review_key(board, state, agent):
+    if service.eval_attestation_mode(state) == service.EVAL_ED25519_SCHEME:
+        return ensure_local_agent_key(board.common, agent)
+    return {}
+
+
+def _record_review(
+    board,
+    agent,
+    task_id,
+    decision,
+    note="",
+    commit=None,
+    force=False,
+    source=None,
+    external_id=None,
+):
+    """Record an approval or a changes-requested review under the local key."""
+    state = board.load()
+    key = _review_key(board, state, agent)
+    reviewer = service.approve if decision == "approved" else service.request_changes
+    label = "approve" if decision == "approved" else "request changes"
+    return board.transaction(
+        f"{label} {task_id}",
+        lambda current: reviewer(
+            current,
+            task_id,
+            agent,
+            note,
+            commit,
+            private_key=key.get("private_key"),
+            public_key=key.get("public_key"),
+            force=force,
+            source=source,
+            external_id=external_id,
+        ),
+        agent=agent,
+    )
+
+
 def cmd_approve(args):
     board = _fresh_board()
     state = board.load()
@@ -316,29 +356,70 @@ def cmd_approve(args):
     task = state.tasks.get(args.task)
     if task is None:
         raise AghubError(f"unknown task {args.task}")
-    key = (
-        ensure_local_agent_key(board.common, agent)
-        if service.eval_attestation_mode(state) == service.EVAL_ED25519_SCHEME
-        else {}
-    )
     commit = args.commit or gitops.short(board.repo, "HEAD")
-    record = board.transaction(
-        f"approve {args.task}",
-        lambda current: service.approve(
-            current,
-            args.task,
-            agent,
-            args.note,
-            commit,
-            private_key=key.get("private_key"),
-            public_key=key.get("public_key"),
-            force=args.force,
-        ),
-        agent=agent,
+    record = _record_review(
+        board, agent, args.task, "approved", args.note, commit, args.force
     )
     print(f"approved {record['task']} by {record['agent']} ({record['id']})")
     if record.get("note"):
         print(f"  note {record['note']}")
+    return 0
+
+
+def cmd_inbox(args):
+    from . import review
+
+    board = _fresh_board()
+    state = board.load()
+    items = review.inbox(state)
+    project = (state.project or {}).get("name")
+    if args.json:
+        print(
+            json.dumps(
+                {"project": project, "items": items}, indent=2, sort_keys=False
+            )
+        )
+    else:
+        print(review.render_inbox(project, items))
+    return 1 if args.check and items else 0
+
+
+def cmd_review(args):
+    from . import review
+
+    board = _fresh_board()
+    state = board.load()
+    agent = _resolve_agent(args, read_local_config(board.common))
+    task = state.tasks.get(args.task)
+    if task is None:
+        raise AghubError(f"unknown task {args.task}")
+
+    if args.approve or args.request_changes:
+        decision = "approved" if args.approve else "changes_requested"
+        commit = args.commit or gitops.short(board.repo, "HEAD")
+        record = _record_review(
+            board,
+            agent,
+            args.task,
+            decision,
+            args.note,
+            commit,
+            args.force,
+        )
+        if args.json:
+            print(json.dumps(record, indent=2, sort_keys=False))
+        else:
+            verb = "approved" if decision == "approved" else "requested changes on"
+            print(f"{verb} {record['task']} by {record['agent']} ({record['id']})")
+            if record.get("note"):
+                print(f"  note {record['note']}")
+        return 0
+
+    packet = review.review_packet(board, state, args.task, include_diff=args.diff)
+    if args.json:
+        print(json.dumps(packet, indent=2, sort_keys=False))
+    else:
+        print(review.render_review(packet, include_diff=args.diff))
     return 0
 
 
@@ -1306,13 +1387,20 @@ def cmd_ci(args):
         board = _fresh_board()
         state = board.load()
         project = args.project or state.project.get("name")
-        text = ci.workflow(
-            python=args.python,
-            project=project,
-            trunk=args.trunk or state.project.get("trunk") or "main",
-            contract=args.contract,
-            codegen_out=args.codegen_out,
-        )
+        if args.github_review:
+            text = ci.github_workflow(
+                python=args.python,
+                project=project,
+                trunk=args.trunk or state.project.get("trunk") or "main",
+            )
+        else:
+            text = ci.workflow(
+                python=args.python,
+                project=project,
+                trunk=args.trunk or state.project.get("trunk") or "main",
+                contract=args.contract,
+                codegen_out=args.codegen_out,
+            )
         path = args.out
         os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
         with open(path, "w", encoding="utf-8") as handle:
@@ -1324,6 +1412,168 @@ def cmd_ci(args):
     payload = ci.status(state, board)
     print(json.dumps(payload, indent=2, sort_keys=False))
     return 0 if payload["ok"] else 1
+
+
+def cmd_github(args):
+    from . import github, review
+
+    def log(*values, **kwargs):
+        kwargs.setdefault("file", sys.stderr if args.json else sys.stdout)
+        print(*values, **kwargs)
+
+    board = _fresh_board()
+    state = board.load()
+    agent = _resolve_agent(args, read_local_config(board.common))
+    event = github.load_event(args.event)
+    info = github.pull_request_info(event)
+
+    task = None
+    if args.task:
+        task = state.tasks.get(args.task)
+        if task is None:
+            raise AghubError(f"unknown task {args.task}")
+    else:
+        task = github.find_task(
+            state.tasks,
+            info.get("branch"),
+            (info.get("body") or "") + "\n" + (info.get("title") or ""),
+        )
+    if task is None:
+        where = f"PR #{info.get('number')}" if info.get("number") else "this event"
+        message = f"no aghub task for {where} (branch {info.get('branch') or '—'})"
+        if args.json:
+            print(
+                json.dumps(
+                    {"task": None, "reason": message},
+                    indent=2,
+                    sort_keys=False,
+                )
+            )
+        else:
+            print(message)
+        return 0
+
+    recorded = None
+    review_info = info.get("review") or {}
+    if (
+        args.record_reviews
+        and info.get("action") == "submitted"
+        and review_info.get("state") in ("approved", "changes_requested")
+        and task.get("requires_approval")
+    ):
+        allowed = {
+            item.strip().upper()
+            for item in (args.allow_association or "").split(",")
+            if item.strip()
+        }
+        if review_info.get("association") not in allowed:
+            raise AghubError(
+                f"GitHub reviewer {review_info.get('login') or '?'} is not trusted "
+                f"({review_info.get('association') or 'no association'})"
+            )
+        head_repo = info.get("head_repo")
+        repository = args.repo or os.environ.get("GITHUB_REPOSITORY")
+        fork = bool(head_repo and repository and head_repo.lower() != repository.lower())
+        if fork and not args.allow_fork_reviews:
+            print(
+                "aghub: warning: refusing to record an approval from a fork PR "
+                "(pass --allow-fork-reviews to change this)",
+                file=sys.stderr,
+            )
+        else:
+            external_id = review_info.get("id")
+            already = any(
+                item.get("source") == "github"
+                and str(item.get("external_id") or "") == str(external_id)
+                for item in state.approvals
+            )
+            if already:
+                log(f"review {external_id} already recorded")
+            else:
+                decision = (
+                    "approved"
+                    if review_info["state"] == "approved"
+                    else "changes_requested"
+                )
+                note = f"GitHub review by {review_info.get('login') or '?'}"
+                if review_info.get("body"):
+                    note += f": {review_info['body']}"
+                if args.dry_run:
+                    print(
+                        f"would record {decision} for {task['id']} from "
+                        f"{review_info.get('login') or '?'}",
+                        file=sys.stderr,
+                    )
+                else:
+                    reviewer_agent = args.reviewer_agent or agent
+                    recorded = _record_review(
+                        board,
+                        reviewer_agent,
+                        task["id"],
+                        decision,
+                        note,
+                        info.get("sha") or None,
+                        False,
+                        source="github",
+                        external_id=external_id,
+                    )
+                    state = board.load()
+                    log(
+                        f"recorded GitHub {review_info['state']} from "
+                        f"{review_info.get('login') or '?'} as {reviewer_agent}"
+                    )
+
+    packet = review.review_packet(board, state, task["id"])
+    github.mark_stale_approval(packet, info.get("sha"))
+    markdown = github.comment_body(packet)
+    details_url = args.details_url or info.get("url") or None
+    check = github.check_payload(packet, details_url=details_url)
+
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "task": task["id"],
+                    "recorded": recorded,
+                    "approval": packet["approval"],
+                    "comment": markdown,
+                    "check": check,
+                },
+                indent=2,
+                sort_keys=False,
+            )
+        )
+        return 0
+
+    if args.dry_run:
+        print(markdown)
+        print(
+            f"\ncheck: {check['name']} · {check['conclusion']} · "
+            f"{check['output']['title']}"
+        )
+        return 0
+
+    if not info.get("number") or not info.get("sha"):
+        raise AghubError(
+            "GitHub sync needs a pull_request or pull_request_review payload "
+            "with a PR number and head sha"
+        )
+    repo = args.repo or os.environ.get("GITHUB_REPOSITORY")
+    if args.comment:
+        result = github.upsert_comment(
+            repo, info["number"], markdown, token=args.token
+        )
+        log(
+            f"comment {result['id']} {'updated' if result['updated'] else 'created'} "
+            f"on PR #{info['number']}"
+        )
+    if args.check:
+        result = github.upsert_check(repo, info["sha"], check, token=args.token)
+        log(
+            f"check {result['id']} {'updated' if result['updated'] else 'created'} "
+            f"on {info['sha'][:12]} ({check['conclusion']})"
+        )
+    return 0
 
 
 def cmd_heartbeat(args):
@@ -1699,6 +1949,29 @@ def build_parser():
     nxt = sub.add_parser("next", help="show the next claimable task")
     nxt.set_defaults(func=cmd_next)
 
+    inbox = sub.add_parser("inbox", help="what needs a human now")
+    inbox.add_argument("--json", action="store_true")
+    inbox.add_argument(
+        "--check", action="store_true", help="exit 1 when the inbox is not clear"
+    )
+    inbox.set_defaults(func=cmd_inbox)
+
+    review = sub.add_parser("review", help="inspect a task and record a human review")
+    review.add_argument("task")
+    review.add_argument("--json", action="store_true")
+    review.add_argument("--diff", action="store_true", help="include the full patch")
+    verdict = review.add_mutually_exclusive_group()
+    verdict.add_argument("--approve", action="store_true", help="record approval")
+    verdict.add_argument(
+        "--request-changes", action="store_true", help="record changes requested"
+    )
+    review.add_argument("--note", default="")
+    review.add_argument("--commit", default=None)
+    review.add_argument(
+        "--force", action="store_true", help="allow the task owner to review it"
+    )
+    review.set_defaults(func=cmd_review)
+
     task = sub.add_parser("task", help="create and list tasks")
     task_sub = task.add_subparsers(dest="task_command", required=True)
     task_add = task_sub.add_parser("add")
@@ -1824,9 +2097,54 @@ def build_parser():
     ci_workflow.add_argument(
         "--codegen-out", default="generated", help="generated output directory"
     )
+    ci_workflow.add_argument(
+        "--github-review",
+        action="store_true",
+        help="write the pull-request review bridge workflow instead",
+    )
     ci_status = ci_sub.add_parser("status", help="machine-readable board/queue gate")
     ci_status.add_argument("--json", action="store_true", default=True)
     ci.set_defaults(func=cmd_ci)
+
+    github = sub.add_parser(
+        "github", help="sync a task review onto a pull request and check"
+    )
+    github_sub = github.add_subparsers(dest="github_command", required=True)
+    github_sync = github_sub.add_parser(
+        "sync", help="record trusted PR reviews and publish the review comment/check"
+    )
+    github_sync.add_argument("--task", default=None, help="explicit task id")
+    github_sync.add_argument(
+        "--event", default=None, help="GitHub event payload (default: GITHUB_EVENT_PATH)"
+    )
+    github_sync.add_argument("--repo", default=None, help="owner/name (default: GITHUB_REPOSITORY)")
+    github_sync.add_argument("--token", default=None, help="default: GITHUB_TOKEN or GH_TOKEN")
+    github_sync.add_argument(
+        "--record-reviews",
+        action="store_true",
+        help="record approved / changes_requested PR reviews on the board",
+    )
+    github_sync.add_argument(
+        "--reviewer-agent",
+        default=None,
+        help="board identity for recorded reviews (default: this agent)",
+    )
+    github_sync.add_argument(
+        "--allow-association",
+        default="OWNER,MEMBER,COLLABORATOR",
+        help="trusted GitHub author associations (comma separated)",
+    )
+    github_sync.add_argument(
+        "--allow-fork-reviews",
+        action="store_true",
+        help="record reviews from fork PRs (unsafe by default)",
+    )
+    github_sync.add_argument("--comment", action=argparse.BooleanOptionalAction, default=True)
+    github_sync.add_argument("--check", action=argparse.BooleanOptionalAction, default=True)
+    github_sync.add_argument("--details-url", default=None)
+    github_sync.add_argument("--dry-run", action="store_true", help="print, do not call GitHub")
+    github_sync.add_argument("--json", action="store_true")
+    github.set_defaults(func=cmd_github)
 
     heartbeat = sub.add_parser("heartbeat", help="refresh this agent's lease")
     heartbeat.set_defaults(func=cmd_heartbeat)
