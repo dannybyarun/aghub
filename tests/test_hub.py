@@ -315,6 +315,134 @@ class HubHttpTests(unittest.TestCase):
         self.assertIn('id="replay"', body)
         self.assertIn("/api/overview", body)
         self.assertIn("Reviews", body)
+        # Web review workspace: queue, inline diff, and intent submission.
+        self.assertIn('id="review-queue"', body)
+        self.assertIn('id="review-open"', body)
+        self.assertIn('id="review"', body)
+        self.assertIn("/api/review/packet", body)
+        self.assertIn("/api/review/requests", body)
+        self.assertIn("data-decision", body)
+        self.assertIn("diffBlock", body)
+
+    def test_review_packet_and_intent_flow(self):
+        snapshot = {
+            "project": {"name": "reviews", "ttl_seconds": 60},
+            "tasks": [
+                {
+                    "id": "T-1",
+                    "title": "Ship API",
+                    "status": "claimed",
+                    "owner": "be-1",
+                    "branch": "agent/be-1/T-1",
+                    "requires_approval": True,
+                },
+                {"id": "T-2", "title": "Docs", "status": "ready"},
+            ],
+        }
+        hubclient.publish(self.base, "reviews", snapshot, token="secret")
+        packet = {
+            "task": {"id": "T-1", "title": "Ship API"},
+            "approval": {"head": "a" * 40, "decision": "pending"},
+            "changes": {"branch": "agent/be-1/T-1", "head": "a" * 40, "patch": "@@ -1 +1 @@\n-x\n+y"},
+        }
+        published = hubclient.publish_review_packet(
+            self.base, "reviews", "T-1", packet, token="secret"
+        )
+        self.assertEqual(published["head"], "a" * 40)
+        stored = hubclient.review_packet(self.base, "reviews", "T-1", token="secret")
+        self.assertEqual(stored["packet"]["changes"]["patch"], "@@ -1 +1 @@\n-x\n+y")
+        heads = hubclient.review_packets(self.base, "reviews", token="secret")["packets"]
+        self.assertEqual(heads[0]["task"], "T-1")
+        self.assertEqual(heads[0]["head"], "a" * 40)
+        with self.assertRaises(hubclient.HubError) as missing:
+            hubclient.review_packet(self.base, "reviews", "T-2", token="secret")
+        self.assertIn("404", str(missing.exception))
+
+        created = hubclient.request_review(
+            self.base,
+            "reviews",
+            "T-1",
+            "approved",
+            note="looks good",
+            head="a" * 40,
+            token="secret",
+        )["request"]
+        self.assertEqual(created["status"], "pending")
+        self.assertEqual(created["actor"], "admin")
+        pending = hubclient.review_requests(
+            self.base, "reviews", status="pending", token="secret"
+        )["requests"]
+        self.assertEqual([item["id"] for item in pending], [created["id"]])
+
+        claimed = hubclient.claim_review_request(
+            self.base, created["id"], token="secret"
+        )
+        self.assertTrue(claimed["claimed"])
+        applied = hubclient.resolve_review_request(
+            self.base, created["id"], "applied", record_id="RV-1", token="secret"
+        )["request"]
+        self.assertEqual(applied["status"], "applied")
+        self.assertEqual(applied["record_id"], "RV-1")
+        all_requests = hubclient.review_requests(
+            self.base, "reviews", status="all", token="secret"
+        )["requests"]
+        self.assertEqual(all_requests[0]["status"], "applied")
+
+        # Non-gated tasks and self-review are rejected at the edge.
+        with self.assertRaises(hubclient.HubError) as ungated:
+            hubclient.request_review(
+                self.base, "reviews", "T-2", "approved", token="secret"
+            )
+        self.assertIn("400", str(ungated.exception))
+        hubclient.publish(
+            self.base,
+            "self",
+            {
+                "project": {"name": "self"},
+                "tasks": [
+                    {
+                        "id": "T-9",
+                        "owner": "admin",
+                        "requires_approval": True,
+                    }
+                ],
+            },
+            token="secret",
+        )
+        with self.assertRaises(hubclient.HubError) as self_review:
+            hubclient.request_review(
+                self.base, "self", "T-9", "approved", token="secret"
+            )
+        self.assertIn("400", str(self_review.exception))
+
+    def test_review_request_is_scoped_to_its_project(self):
+        server, store, base = self._local_server(
+            tokens={
+                "writer": {"role": "writer", "projects": ["alpha"], "name": "alice"},
+                "other": {"role": "writer", "projects": ["beta"], "name": "bob"},
+            }
+        )
+        hubclient.publish(
+            base,
+            "alpha",
+            {
+                "project": {"name": "alpha"},
+                "tasks": [
+                    {"id": "T-1", "owner": "be-1", "requires_approval": True}
+                ],
+            },
+            token="writer",
+        )
+        created = hubclient.request_review(
+            base, "alpha", "T-1", "changes_requested", token="writer"
+        )["request"]
+        self.assertEqual(created["reviewer"], "alice")
+        with self.assertRaises(hubclient.HubError) as foreign:
+            hubclient.claim_review_request(base, created["id"], token="other")
+        self.assertIn("403", str(foreign.exception))
+        with self.assertRaises(hubclient.HubError) as leak:
+            hubclient.review_requests(base, "alpha", token="other")
+        self.assertIn("403", str(leak.exception))
 
     def test_audit_and_overview_apis(self):
         hubclient.publish(

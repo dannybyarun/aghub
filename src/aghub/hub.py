@@ -22,9 +22,23 @@ from urllib.parse import parse_qs, urlparse
 from . import __version__
 from .errors import AghubError
 from .paths import overlaps
+from .ulid import new_ulid
 from .util import ago_iso, in_iso, now_iso
 
 MAX_BODY_BYTES = 16 * 1024 * 1024
+MAX_PACKET_BYTES = 4 * 1024 * 1024
+MAX_REVIEW_NOTE = 4000
+REVIEW_DECISIONS = ("approved", "changes_requested")
+REVIEW_STATUSES = ("pending", "applying", "applied", "rejected", "cancelled")
+
+
+def _packet_head(packet):
+    """Best-effort head lookup for stored review packets."""
+    for key in ("approval", "changes"):
+        value = packet.get(key)
+        if isinstance(value, dict) and value.get("head"):
+            return str(value["head"])
+    return packet.get("head") or None
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS snapshots (
@@ -84,6 +98,33 @@ CREATE TABLE IF NOT EXISTS board_events (
 );
 CREATE INDEX IF NOT EXISTS board_events_project
   ON board_events(project, seq);
+CREATE TABLE IF NOT EXISTS review_packets (
+  project TEXT NOT NULL,
+  task TEXT NOT NULL,
+  head TEXT,
+  packet TEXT NOT NULL,
+  published_at TEXT NOT NULL,
+  actor TEXT,
+  PRIMARY KEY (project, task)
+);
+CREATE TABLE IF NOT EXISTS review_requests (
+  id TEXT PRIMARY KEY,
+  project TEXT NOT NULL,
+  task TEXT NOT NULL,
+  decision TEXT NOT NULL,
+  note TEXT NOT NULL DEFAULT '',
+  head TEXT,
+  actor TEXT,
+  reviewer TEXT,
+  status TEXT NOT NULL DEFAULT 'pending',
+  worker TEXT,
+  record_id TEXT,
+  error TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS review_requests_board
+  ON review_requests(project, status, created_at);
 """
 
 
@@ -344,6 +385,338 @@ class HubStore:
                 }
                 for row in rows
             ]
+
+    # -- reviews ---------------------------------------------------------
+
+    def publish_review_packet(self, project, task, packet, actor=None):
+        """Store the review packet (metadata + diff) for a task.
+
+        The hub stays read-only with respect to git; the packet is produced by
+        the CLI on a machine that has the task branch, then mirrored here so the
+        browser can render an inline diff without repo access.
+        """
+        if not isinstance(packet, dict):
+            raise AghubError("review packet must be an object")
+        blob = json.dumps(packet)
+        if len(blob.encode("utf-8")) > MAX_PACKET_BYTES:
+            raise AghubError(
+                f"review packet exceeds {MAX_PACKET_BYTES // (1024 * 1024)} MiB"
+            )
+        head = _packet_head(packet)
+        stamp = now_iso()
+        with self.lock:
+            self.conn.execute(
+                """
+                INSERT INTO review_packets(project, task, head, packet, published_at, actor)
+                VALUES(?,?,?,?,?,?)
+                ON CONFLICT(project, task) DO UPDATE SET
+                  head=excluded.head,
+                  packet=excluded.packet,
+                  published_at=excluded.published_at,
+                  actor=excluded.actor
+                """,
+                (project, task, head, blob, stamp, actor),
+            )
+            self._event(
+                project, "review.packet", {"task": task, "head": head}, actor=actor
+            )
+            self.conn.commit()
+        return {
+            "ok": True,
+            "project": project,
+            "task": task,
+            "head": head,
+            "published_at": stamp,
+        }
+
+    def review_packet(self, project, task):
+        with self.lock:
+            row = self.conn.execute(
+                "SELECT * FROM review_packets WHERE project=? AND task=?",
+                (project, task),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "project": row["project"],
+            "task": row["task"],
+            "head": row["head"],
+            "published_at": row["published_at"],
+            "actor": row["actor"],
+            "packet": json.loads(row["packet"]),
+        }
+
+    def review_packet_heads(self, project):
+        with self.lock:
+            rows = self.conn.execute(
+                """
+                SELECT task, head, published_at, actor FROM review_packets
+                WHERE project=? ORDER BY task
+                """,
+                (project,),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def review_requests(self, project=None, status=None, limit=100):
+        limit = max(1, min(int(limit or 100), 500))
+        if status == "all":
+            status = None
+        with self.lock:
+            clauses = []
+            params = []
+            if project:
+                clauses.append("project=?")
+                params.append(project)
+            if status:
+                if status not in REVIEW_STATUSES:
+                    raise AghubError(f"unknown review status '{status}'")
+                clauses.append("status=?")
+                params.append(status)
+            params.append(limit)
+            where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+            rows = self.conn.execute(
+                "SELECT * FROM review_requests"
+                + where
+                + " ORDER BY created_at, id LIMIT ?",
+                params,
+            ).fetchall()
+            return [self._review_request(row) for row in rows]
+
+    def review_request(self, request_id):
+        with self.lock:
+            row = self.conn.execute(
+                "SELECT * FROM review_requests WHERE id=?", (request_id,)
+            ).fetchone()
+            return self._review_request(row) if row else None
+
+    def create_review_request(
+        self, project, task, decision, note="", head=None, reviewer=None, actor=None
+    ):
+        """Record an intent to review; a trusted worker later signs it.
+
+        The hub never holds a private key. This row is the browser's proposal:
+        the signed record is written to ``aghub/board`` by `aghub review --watch`
+        on a machine that has both the key and the task branch.
+        """
+        if decision not in REVIEW_DECISIONS:
+            raise AghubError(
+                "decision must be 'approved' or 'changes_requested'"
+            )
+        note = str(note or "").strip()
+        if len(note) > MAX_REVIEW_NOTE:
+            raise AghubError(f"review note exceeds {MAX_REVIEW_NOTE} characters")
+        if head is not None:
+            head = str(head).strip()
+            if head and not all(ch in "0123456789abcdef" for ch in head.lower()):
+                raise AghubError("head must be a commit id")
+        with self.lock:
+            snapshot = self.board(project)
+            if snapshot is None:
+                raise AghubError(f"no board published for {project}")
+            tasks = snapshot["snapshot"].get("tasks") or []
+            task_row = next((item for item in tasks if item.get("id") == task), None)
+            if task_row is None:
+                raise AghubError(f"unknown task {task}")
+            if not task_row.get("requires_approval"):
+                raise AghubError(f"{task} does not require approval")
+            owner = task_row.get("owner")
+            if reviewer and owner and str(owner) == str(reviewer):
+                raise AghubError(
+                    f"{reviewer} owns {task}; review with a separate identity"
+                )
+            stamp = now_iso()
+            request_id = "RR-" + new_ulid()
+            if actor is None:
+                superseded = self.conn.execute(
+                    """
+                    UPDATE review_requests SET status='cancelled', updated_at=?,
+                      error='superseded by a newer review request'
+                    WHERE project=? AND task=? AND actor IS NULL AND status='pending'
+                    """,
+                    (stamp, project, task),
+                ).rowcount
+            else:
+                superseded = self.conn.execute(
+                    """
+                    UPDATE review_requests SET status='cancelled', updated_at=?,
+                      error='superseded by a newer review request'
+                    WHERE project=? AND task=? AND actor=? AND status='pending'
+                    """,
+                    (stamp, project, task, actor),
+                ).rowcount
+            self.conn.execute(
+                """
+                INSERT INTO review_requests(
+                  id, project, task, decision, note, head, actor, reviewer,
+                  status, created_at, updated_at
+                ) VALUES(?,?,?,?,?,?,?,?,'pending',?,?)
+                """,
+                (
+                    request_id,
+                    project,
+                    task,
+                    decision,
+                    note,
+                    head or None,
+                    actor,
+                    reviewer,
+                    stamp,
+                    stamp,
+                ),
+            )
+            if superseded:
+                self._event(
+                    project,
+                    "review.supersede",
+                    {"task": task, "count": superseded},
+                    actor=actor,
+                )
+            self._event(
+                project,
+                "review.request",
+                {
+                    "id": request_id,
+                    "task": task,
+                    "decision": decision,
+                    "head": head or None,
+                },
+                actor=actor,
+            )
+            self.conn.commit()
+            return self.review_request(request_id)
+
+    def claim_review_request(self, request_id, worker=None):
+        """Atomically hand one pending request to a worker.
+
+        A worker that dies while applying leaves a 5-minute claim that another
+        worker can take over.
+        """
+        stamp = now_iso()
+        with self.lock:
+            row = self.conn.execute(
+                "SELECT * FROM review_requests WHERE id=?", (request_id,)
+            ).fetchone()
+            if row is None:
+                raise AghubError(f"unknown review request {request_id}")
+            current = self._review_request(row)
+            if current["status"] == "applying":
+                if current.get("updated_at", "") >= ago_iso(300):
+                    return {"ok": True, "claimed": False, "request": current}
+            elif current["status"] != "pending":
+                return {"ok": True, "claimed": False, "request": current}
+            changed = self.conn.execute(
+                """
+                UPDATE review_requests SET status='applying', worker=?, updated_at=?
+                WHERE id=? AND status=?
+                """,
+                (worker, stamp, request_id, current["status"]),
+            ).rowcount
+            if changed:
+                self._event(
+                    current["project"],
+                    "review.claim",
+                    {"id": request_id, "task": current["task"]},
+                    actor=worker,
+                )
+                self.conn.commit()
+            return {
+                "ok": True,
+                "claimed": bool(changed),
+                "request": self.review_request(request_id),
+            }
+
+    def resolve_review_request(
+        self, request_id, status, record_id=None, error=None, worker=None
+    ):
+        if status not in ("applied", "rejected"):
+            raise AghubError("resolution must be 'applied' or 'rejected'")
+        with self.lock:
+            row = self.conn.execute(
+                "SELECT * FROM review_requests WHERE id=?", (request_id,)
+            ).fetchone()
+            if row is None:
+                raise AghubError(f"unknown review request {request_id}")
+            current = self._review_request(row)
+            if current["status"] in ("applied", "rejected"):
+                return current
+            if current["status"] == "cancelled":
+                raise AghubError(f"review request {request_id} was cancelled")
+            stamp = now_iso()
+            self.conn.execute(
+                """
+                UPDATE review_requests SET status=?, record_id=?, error=?,
+                  worker=COALESCE(?, worker), updated_at=?
+                WHERE id=?
+                """,
+                (
+                    status,
+                    record_id,
+                    (str(error) if error else None),
+                    worker,
+                    stamp,
+                    request_id,
+                ),
+            )
+            self._event(
+                current["project"],
+                "review." + status,
+                {
+                    "id": request_id,
+                    "task": current["task"],
+                    "record_id": record_id,
+                    "error": str(error) if error else None,
+                },
+                actor=worker,
+            )
+            self.conn.commit()
+            return self.review_request(request_id)
+
+    def cancel_review_request(self, request_id, actor=None, admin=False):
+        with self.lock:
+            row = self.conn.execute(
+                "SELECT * FROM review_requests WHERE id=?", (request_id,)
+            ).fetchone()
+            if row is None:
+                raise AghubError(f"unknown review request {request_id}")
+            current = self._review_request(row)
+            if not admin and current.get("actor") != actor:
+                raise AghubError("only the requester can cancel this review")
+            if current["status"] != "pending":
+                raise AghubError(
+                    f"review request is already {current['status']}"
+                )
+            stamp = now_iso()
+            self.conn.execute(
+                "UPDATE review_requests SET status='cancelled', updated_at=?, error=? WHERE id=?",
+                (stamp, "cancelled by the requester", request_id),
+            )
+            self._event(
+                current["project"],
+                "review.cancelled",
+                {"id": request_id, "task": current["task"]},
+                actor=actor,
+            )
+            self.conn.commit()
+            return self.review_request(request_id)
+
+    @staticmethod
+    def _review_request(row):
+        return {
+            "id": row["id"],
+            "project": row["project"],
+            "task": row["task"],
+            "decision": row["decision"],
+            "note": row["note"] or "",
+            "head": row["head"],
+            "actor": row["actor"],
+            "reviewer": row["reviewer"],
+            "status": row["status"],
+            "worker": row["worker"],
+            "record_id": row["record_id"],
+            "error": row["error"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
 
     # -- presence --------------------------------------------------------
 
@@ -663,6 +1036,12 @@ class Handler(BaseHTTPRequestHandler):
             )
         if path == "/api/history":
             return self._history(project, query)
+        if path == "/api/review/requests":
+            return self._review_requests(query, identity)
+        if path == "/api/review/packets":
+            return self._review_packets(query, identity)
+        if path == "/api/review/packet":
+            return self._review_packet(query, identity)
         if path == "/api/board":
             data = self.server.store.board(project)
             if data is None:
@@ -818,6 +1197,61 @@ class Handler(BaseHTTPRequestHandler):
             {"events": self.server.store.history(project, after, limit)},
         )
 
+    # -- review workspace ------------------------------------------------
+
+    def _review_requests(self, query, identity):
+        project = query.get("project", [None])[0]
+        allowed = identity.get("projects")
+        if project and allowed is not None and project not in allowed:
+            return self._json(403, {"error": f"token cannot read project {project}"})
+        status = (query.get("status", ["pending"])[0] or "pending").lower()
+        if status == "all":
+            status = None
+        elif status not in REVIEW_STATUSES:
+            return self._json(
+                400, {"error": f"status must be one of {', '.join(REVIEW_STATUSES)}, all"}
+            )
+        try:
+            limit = int(query.get("limit", ["100"])[0] or 100)
+        except (TypeError, ValueError):
+            return self._json(400, {"error": "limit must be an integer"})
+        requests = self.server.store.review_requests(project, status, limit)
+        if allowed is not None:
+            requests = [item for item in requests if item["project"] in allowed]
+        return self._json(200, {"requests": requests})
+
+    def _review_packet(self, query, identity):
+        project = query.get("project", [None])[0]
+        task = query.get("task", [None])[0]
+        if not project or not task:
+            return self._json(400, {"error": "project and task are required"})
+        allowed = identity.get("projects")
+        if allowed is not None and project not in allowed:
+            return self._json(403, {"error": f"token cannot read project {project}"})
+        packet = self.server.store.review_packet(project, task)
+        if packet is None:
+            return self._json(
+                404,
+                {
+                    "error": (
+                        f"no review packet for {task}; run `aghub review {task} --publish` "
+                        "on a clone that has the branch"
+                    )
+                },
+            )
+        return self._json(200, packet)
+
+    def _review_packets(self, query, identity):
+        project = query.get("project", [None])[0]
+        allowed = identity.get("projects")
+        if not project:
+            return self._json(400, {"error": "project is required"})
+        if allowed is not None and project not in allowed:
+            return self._json(403, {"error": f"token cannot read project {project}"})
+        return self._json(
+            200, {"packets": self.server.store.review_packet_heads(project)}
+        )
+
     def _post(self, path, identity):
         body = self._body(identity)
         store = self.server.store
@@ -836,6 +1270,91 @@ class Handler(BaseHTTPRequestHandler):
                 raise AghubError("project is required")
             stamp = store.publish(project, snapshot, actor=identity.get("actor"))
             return self._json(200, {"ok": True, "project": project, "updated_at": stamp})
+
+        if path == "/api/review/packet":
+            project, task, packet = self._require(body, "project", "task", "packet")
+            if not isinstance(packet, dict):
+                raise AghubError("packet must be an object")
+            return self._json(
+                200,
+                store.publish_review_packet(
+                    project, task, packet, actor=identity.get("actor")
+                ),
+            )
+
+        if path == "/api/review/requests":
+            project, task, decision = self._require(body, "project", "task", "decision")
+            actor = identity.get("actor")
+            reviewer = actor or body.get("reviewer") or "human"
+            return self._json(
+                200,
+                {
+                    "request": store.create_review_request(
+                        project,
+                        task,
+                        decision,
+                        note=body.get("note") or "",
+                        head=body.get("head"),
+                        reviewer=reviewer,
+                        actor=actor,
+                    )
+                },
+            )
+
+        if path in (
+            "/api/review/claim",
+            "/api/review/resolve",
+            "/api/review/cancel",
+        ):
+            request_id = body.get("id")
+            if not request_id:
+                raise AghubError("id is required")
+            current = store.review_request(request_id)
+            if current is None:
+                return self._json(404, {"error": f"unknown review request {request_id}"})
+            allowed = identity.get("projects")
+            if allowed is not None and current["project"] not in allowed:
+                return self._json(
+                    403,
+                    {"error": f"token cannot write project {current['project']}"},
+                )
+            actor = identity.get("actor")
+            if path == "/api/review/claim":
+                result = store.claim_review_request(request_id, worker=actor)
+                if not result["claimed"]:
+                    return self._json(
+                        409,
+                        {
+                            "error": "review request is already being applied",
+                            "request": result["request"],
+                        },
+                    )
+                return self._json(200, result)
+            if path == "/api/review/resolve":
+                status = body.get("status")
+                if status not in ("applied", "rejected"):
+                    raise AghubError("status must be 'applied' or 'rejected'")
+                return self._json(
+                    200,
+                    {
+                        "request": store.resolve_review_request(
+                            request_id,
+                            status,
+                            record_id=body.get("record_id"),
+                            error=body.get("error"),
+                            worker=actor,
+                        )
+                    },
+                )
+            try:
+                result = store.cancel_review_request(
+                    request_id,
+                    actor=actor,
+                    admin=identity.get("role") == "admin",
+                )
+            except AghubError as exc:
+                return self._json(403, {"error": str(exc)})
+            return self._json(200, {"request": result})
 
         if path == "/api/heartbeat":
             project, agent = self._require(body, "project", "agent")
@@ -1253,11 +1772,52 @@ PAGE = r"""<!doctype html>
     text-transform: uppercase; color: var(--dim); }
   .modal pre { margin: 0; padding: 10px; background: #010409; border: 1px solid var(--line);
     border-radius: 6px; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 11px; max-height: 260px; }
+  button { background: var(--panel2); color: var(--text); border: 1px solid var(--line);
+    border-radius: 6px; padding: 5px 10px; font: inherit; cursor: pointer; }
+  button:hover { border-color: var(--blue); }
+  button.primary { background: #238636; border-color: #2ea043; color: #fff; }
+  button.danger { background: #8e1519; border-color: #da3633; color: #fff; }
+  button:disabled { opacity: .45; cursor: default; }
+  .review-open { margin-left: 6px; }
+  .review-open .n { color: var(--yellow); margin-left: 4px; }
+  .review-card { width: min(1080px, 96vw); }
+  .rev-row { display: flex; gap: 12px; align-items: flex-start; padding: 10px 0;
+    border-bottom: 1px dotted #21262d; }
+  .rev-row:last-child { border-bottom: 0; }
+  .rev-row .grow { flex: 1; min-width: 0; }
+  .rev-row .sub { overflow-wrap: anywhere; }
+  .rev-head { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin: 4px 0 10px; }
+  .rev-split { display: grid; grid-template-columns: minmax(0, 1fr) 300px; gap: 18px; }
+  @media (max-width: 860px) { .rev-split { grid-template-columns: 1fr; } }
+  .rev-main { min-width: 0; }
+  .callout { background: #161b22; border: 1px solid var(--line); border-left: 3px solid var(--yellow);
+    border-radius: 6px; padding: 9px 12px; font-size: 12px; color: var(--dim); }
+  .callout code { color: var(--text); }
+  .diff { margin: 0; background: #010409; border: 1px solid var(--line); border-radius: 6px;
+    font-size: 11px; line-height: 1.5; overflow: auto; max-height: 56vh; }
+  .diff .dline { display: block; padding: 0 8px; white-space: pre; min-width: max-content; }
+  .diff .add { background: rgba(46,160,67,.16); color: #7ee787; }
+  .diff .del { background: rgba(248,81,73,.14); color: #ffa198; }
+  .diff .hunk { color: var(--blue); background: rgba(56,139,253,.10); }
+  .diff .meta { color: var(--dim); }
+  .file-list { display: flex; flex-wrap: wrap; gap: 6px; margin: 6px 0 10px; }
+  .file-list .tag { color: var(--text); }
+  .file-list .tag.added { color: var(--green); border-color: #238636; }
+  .file-list .tag.deleted { color: var(--red); border-color: #da3633; }
+  .file-list .tag.renamed { color: var(--yellow); border-color: #9e6a03; }
+  .rev-form textarea { width: 100%; min-height: 74px; resize: vertical; background: var(--panel2);
+    color: var(--text); border: 1px solid var(--line); border-radius: 6px; padding: 7px 9px;
+    font: inherit; font-size: 12px; }
+  .rev-actions { display: flex; gap: 8px; margin-top: 8px; flex-wrap: wrap; }
+  .rev-note { color: var(--dim); font-size: 11px; margin-top: 8px; }
+  .rev-error { color: var(--red); font-size: 12px; margin-top: 8px; }
+  .back { margin-right: 6px; }
 </style>
 </head>
 <body>
 <header>
   <div class="brand">aghub <span>hub</span></div>
+  <button id="review-open" class="review-open" type="button">Review queue <span class="n" id="n-review">0</span></button>
   <div class="meta">
     <select id="project"></select>
     <span id="dot" class="dot offline"></span>
@@ -1272,6 +1832,7 @@ PAGE = r"""<!doctype html>
     <div class="col"><h2>Blocked <span class="n" id="n-blocked">0</span></h2><div id="blocked"></div></div>
   </section>
   <aside>
+    <div class="panel"><h2>Review queue</h2><div id="review-queue"></div></div>
     <div class="panel"><h2>Agents</h2><div id="agents"></div></div>
     <div class="panel"><h2>Leases</h2><div id="leases"></div></div>
     <div class="panel"><h2>Evals</h2><div id="evals"></div></div>
@@ -1299,6 +1860,18 @@ PAGE = r"""<!doctype html>
     <div id="modal-body"></div>
   </div>
 </div>
+<div id="review" class="modal hidden">
+  <div class="modal-card review-card">
+    <div class="modal-head">
+      <div>
+        <h2 id="review-title">Review queue</h2>
+        <div id="review-sub" class="sub"></div>
+      </div>
+      <button id="review-close" type="button">close</button>
+    </div>
+    <div id="review-body"></div>
+  </div>
+</div>
 <footer>git is the durable log · the hub is the live lease authority · live stream (SSE) with polling fallback</footer>
 <script>
 const params = new URLSearchParams(location.search);
@@ -1306,6 +1879,10 @@ let token = params.get("token") || "";
 let project = params.get("project") || "";
 let current = null;
 let openTaskId = null;
+let reviewTaskId = null;
+let reviewPacket = null;
+let reviewRequests = [];
+let reviewPackets = {};
 
 const esc = (value) => String(value ?? "").replace(/[&<>"']/g, (ch) => ({
   "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
@@ -1371,15 +1948,414 @@ function reviewOf(taskId, snap) {
   return records.length ? records[records.length - 1] : null;
 }
 
+function reviewStateOf(task) {
+  return (task && task.review_state) || null;
+}
+
 function isApproved(taskId, snap) {
+  const task = (snap.tasks || []).find((item) => item.id === taskId);
+  const state = reviewStateOf(task);
+  if (state) return !!state.satisfied;
   const record = reviewOf(taskId, snap);
   return !!record && (record.decision || "approved") === "approved";
 }
 
 function approvalLabel(taskId, snap) {
+  const task = (snap.tasks || []).find((item) => item.id === taskId);
+  const state = reviewStateOf(task);
   const record = reviewOf(taskId, snap);
   if (record && record.decision === "changes_requested") return "changes requested";
-  return isApproved(taskId, snap) ? "approved" : "needs approval";
+  if (state) {
+    if (state.satisfied) return "approved";
+    if (state.missing_groups && state.missing_groups.length) {
+      return (state.approved_count || 0) + "/" + (state.required_approvals || 1)
+        + " · group missing";
+    }
+    if (state.expired_count && !state.approved_count) return "approval expired";
+    if (state.stale_count && !state.approved_count) return "stale approval";
+    if (state.ineligible_count && !state.approved_count) return "ineligible reviewer";
+    if (state.required_approvals > 1) {
+      return (state.approved_count || 0) + "/" + state.required_approvals + " approvals";
+    }
+    return "needs approval";
+  }
+  return !!record && (record.decision || "approved") === "approved"
+    ? "approved" : "needs approval";
+}
+
+const sameCommit = (left, right) => {
+  left = String(left || "");
+  right = String(right || "");
+  if (!left || !right) return false;
+  if (left === right) return true;
+  return left.length >= 7 && right.length >= 7
+    && (left.startsWith(right) || right.startsWith(left));
+};
+
+function pendingReview(taskId) {
+  return reviewRequests.find((item) =>
+    item.task === taskId && (item.status === "pending" || item.status === "applying"));
+}
+
+function reviewItems(snap) {
+  const items = [];
+  for (const task of snap.tasks || []) {
+    if (!task.requires_approval || task.status === "done") continue;
+    const record = reviewOf(task.id, snap);
+    const decision = record ? (record.decision || "approved") : null;
+    const pending = pendingReview(task.id);
+    const packetHead = reviewPackets[task.id];
+    const state = reviewStateOf(task);
+    const stale = !!((record && record.commit && packetHead
+      && !sameCommit(record.commit, packetHead))
+      || (state && state.stale_count > 0 && !state.approved_count
+        && decision !== "changes_requested"));
+    const expired = !!(state && state.expired_count > 0
+      && !state.approved_count && !stale && decision !== "changes_requested");
+    const kind = decision === "changes_requested" ? "changes"
+      : state && state.satisfied ? "approved"
+      : stale ? "stale"
+      : expired ? "expired"
+      : "pending";
+    items.push({ task, record, decision, pending, kind, packetHead, stale, state });
+  }
+  const rank = { changes: 0, stale: 1, expired: 2, pending: 3, approved: 4 };
+  items.sort((a, b) =>
+    (rank[a.kind] - rank[b.kind]) || a.task.id.localeCompare(b.task.id));
+  return items;
+}
+
+function queueBadge(item) {
+  if (item.pending) {
+    return '<span class="badge yellow">'
+      + (item.pending.status === "applying" ? "signing" : "queued") + "</span>";
+  }
+  if (item.kind === "stale") return '<span class="badge red">stale approval</span>';
+  if (item.kind === "expired") return '<span class="badge red">approval expired</span>';
+  if (item.kind === "changes") return '<span class="badge red">changes requested</span>';
+  if (item.kind === "approved") return '<span class="badge green">approved</span>';
+  if (item.state) {
+    const approved = item.state.approved_count || 0;
+    const required = item.state.required_approvals || 1;
+    const missing = (item.state.missing_groups || []).length;
+    return '<span class="badge yellow">' + esc(
+      approved + "/" + required + (missing ? " · group missing" : "")
+    ) + "</span>";
+  }
+  return '<span class="badge yellow">needs approval</span>';
+}
+
+function renderReviewQueue(snap) {
+  const items = reviewItems(snap || {});
+  const waiting = items.filter((item) => item.kind !== "approved").length;
+  document.getElementById("n-review").textContent = String(waiting);
+  document.getElementById("review-queue").innerHTML = items.length
+    ? items.map((item) => {
+        const task = item.task;
+        const owner = task.owner ? " · " + esc(task.owner) : "";
+        const branch = task.branch ? " · " + esc(task.branch) : "";
+        return '<div class="rev-row"><div class="grow">'
+          + '<div><strong>' + esc(task.id) + "</strong> " + esc(task.title) + "</div>"
+          + '<div class="sub">' + esc(task.status || "ready") + owner + branch
+          + (item.record && item.record.commit ? " · reviewed " + esc(String(item.record.commit).slice(0, 7)) : "")
+          + (item.state && item.state.required_approvals > 1
+            ? " · " + esc((item.state.approved_count || 0) + "/"
+              + item.state.required_approvals + " approvals") : "")
+          + "</div></div>"
+          + queueBadge(item)
+          + '<button type="button" data-review="' + esc(task.id) + '">open</button></div>';
+      }).join("")
+    : '<div class="empty">nothing waiting for review</div>';
+}
+
+function diffBlock(patch) {
+  if (!patch) return '<div class="empty">no textual diff</div>';
+  let lines = String(patch).split("\n");
+  let truncated = false;
+  if (lines.length > 4000) {
+    lines = lines.slice(0, 4000);
+    truncated = true;
+  }
+  const rows = lines.map((line) => {
+    let tone = "";
+    if (line.startsWith("diff --git")) tone = "meta";
+    else if (line.startsWith("@@")) tone = "hunk";
+    else if (line.startsWith("+++") || line.startsWith("---")) tone = "meta";
+    else if (line.startsWith("+")) tone = "add";
+    else if (line.startsWith("-")) tone = "del";
+    return '<span class="dline ' + tone + '">' + esc(line || " ") + "</span>";
+  }).join("");
+  return '<pre class="diff">' + rows + "</pre>"
+    + (truncated ? '<div class="rev-note">diff truncated to 4,000 lines</div>' : "");
+}
+
+function fileTags(changes) {
+  const files = changes.files || [];
+  if (!files.length) return '<div class="empty">no changed files</div>';
+  return '<div class="file-list">' + files.map((file) => {
+    const code = String(file.status || "?").charAt(0);
+    const tone = code === "A" ? "added" : code === "D" ? "deleted"
+      : code === "R" ? "renamed" : "";
+    return '<span class="tag ' + tone + '">' + esc(code + " " + file.path) + "</span>";
+  }).join("") + "</div>";
+}
+
+function renderReviewTask() {
+  if (!current || !reviewTaskId) return;
+  const draftNote = (document.getElementById("review-note") || {}).value || "";
+  const snap = current.snapshot || {};
+  const task = (snap.tasks || []).find((item) => item.id === reviewTaskId);
+  if (!task) return closeReview();
+  const record = reviewOf(task.id, snap);
+  const decision = record ? (record.decision || "approved") : null;
+  const pending = pendingReview(task.id);
+  const packet = reviewPacket && reviewPacket.packet ? reviewPacket.packet : null;
+  const head = packet && packet.approval ? packet.approval.head : null;
+  const state = reviewStateOf(task);
+  const reviewState = packet && packet.approval ? packet.approval : state;
+  const stale = !!((record && record.commit && head && !sameCommit(record.commit, head))
+    || (state && state.stale_count > 0 && !state.approved_count
+      && decision !== "changes_requested"));
+  const expired = !!(state && state.expired_count > 0
+    && !state.approved_count && !stale && decision !== "changes_requested");
+  const label = pending
+    ? (pending.status === "applying" ? "signing" : "queued for signing")
+    : decision === "changes_requested" ? "changes requested"
+    : state && state.satisfied ? "approved"
+    : stale ? "approval is stale"
+    : expired ? "approval expired"
+    : state && state.required_approvals > 1
+      ? (state.approved_count || 0) + "/" + state.required_approvals + " approvals"
+    : "needs approval";
+  const tone = pending ? "yellow"
+    : stale || expired || decision === "changes_requested" ? "red"
+    : (state ? state.satisfied : decision === "approved") ? "green" : "yellow";
+  document.getElementById("review-title").textContent = task.id + " · " + task.title;
+  document.getElementById("review-sub").innerHTML =
+    '<span class="badge ' + tone + '">' + esc(label) + "</span>"
+    + (task.owner ? " · owner " + esc(task.owner) : "")
+    + (task.branch ? " · branch " + esc(task.branch) : "")
+    + (head ? " · head " + esc(String(head).slice(0, 7)) : "");
+
+  let body = '<div class="rev-split"><div class="rev-main">';
+  body += "<h3>Diff</h3>";
+  if (!reviewPacket) {
+    body += '<div class="empty">loading review packet…</div>';
+  } else if (reviewPacket.missing) {
+    body += '<div class="callout">No diff has been published for this task yet. '
+      + "On a clone that has the branch, run <code>aghub review " + esc(task.id)
+      + " --publish</code> (or <code>aghub submit " + esc(task.id)
+      + "</code> after pushing). The hub never runs git itself.</div>";
+  } else if (!packet || !packet.changes || packet.changes.error) {
+    body += '<div class="callout">'
+      + esc((packet && packet.changes && packet.changes.error) || "no changes available")
+      + "</div>";
+  } else {
+    const changes = packet.changes;
+    if (stale) {
+      body += '<div class="callout">The branch moved after this approval: reviewed '
+        + '<code>' + esc(String(record.commit).slice(0, 7)) + "</code>, current head "
+        + '<code>' + esc(String(head).slice(0, 7)) + "</code>. Re-approve the current head.</div>";
+    }
+    body += '<div class="sub">' + esc(changes.base || "?") + " → " + esc(changes.branch || "?")
+      + " · " + (changes.files || []).length + " file(s)</div>";
+    body += fileTags(changes);
+    if (changes.stat) body += "<pre>" + esc(changes.stat) + "</pre>";
+    body += diffBlock(changes.patch);
+    if (changes.truncated) body += '<div class="rev-note">patch truncated by the publisher</div>';
+  }
+  body += "</div><div class=\"rev-side\">";
+
+  if (reviewState) {
+    const requiredCount = reviewState.required_approvals || 1;
+    const approvedCount = reviewState.approved_count || 0;
+    const policyBits = [approvedCount + "/" + requiredCount + " approvals"];
+    if (reviewState.ttl_seconds) policyBits.push("ttl " + reviewState.ttl_seconds + "s");
+    if (reviewState.required_groups && reviewState.required_groups.length) {
+      const missingGroups = reviewState.missing_groups || [];
+      policyBits.push("groups " + reviewState.required_groups.map((name) =>
+        name + (missingGroups.indexOf(name) >= 0 ? " (missing)" : "")).join(", "));
+    }
+    body += "<h3>Policy</h3><div class=\"sub\">" + esc(policyBits.join(" · ")) + "</div>";
+    if (reviewState.reason && reviewState.satisfied === false) {
+      body += '<div class="callout">' + esc(reviewState.reason) + "</div>";
+    }
+  }
+
+  body += "<h3>Decision</h3>";
+  if (pending) {
+    body += '<div class="callout">' + esc(label) + " by "
+      + esc(pending.reviewer || pending.actor || "a reviewer")
+      + '.<br>Run <code>aghub review --watch</code> on the reviewer machine to sign it.</div>';
+    body += '<div class="rev-actions"><button type="button" data-cancel="'
+      + esc(pending.id) + '">cancel request</button></div>';
+  } else if (task.status === "done") {
+    body += '<div class="empty">this task is already merged</div>';
+  } else {
+    body += '<div class="rev-form"><textarea id="review-note" placeholder="What did you verify? What must change?"></textarea>';
+    body += '<div class="rev-actions">'
+      + '<button class="primary" type="button" data-decision="approved">Approve head</button>'
+      + '<button class="danger" type="button" data-decision="changes_requested">Request changes</button>'
+      + "</div>";
+    body += '<div class="rev-note">The browser queues a request; a trusted local worker signs it and writes to the board.</div>';
+    body += '<div id="review-error" class="rev-error"></div></div>';
+  }
+  body += '<div class="rev-actions"><button class="back" type="button" data-queue="1">← queue</button></div>';
+
+  body += "<h3>Reviews</h3>";
+  const reviews = (snap.approvals || []).filter((item) => item.task === task.id).reverse();
+  body += reviews.length ? reviews.map((item) => {
+    const reviewLabel = (item.decision || "approved") === "changes_requested"
+      ? "changes requested" : "approved";
+    const reviewTone = (item.decision || "approved") === "changes_requested" ? "red" : "green";
+    return '<div class="line"><span>' + esc(item.reviewer || item.agent)
+      + (item.github_login ? ' <span class="sub">github:' + esc(item.github_login) + "</span>" : "")
+      + (item.note ? ' <span class="sub">' + esc(item.note) + "</span>" : "")
+      + "</span>" + '<span class="badge ' + reviewTone + '">' + esc(reviewLabel)
+      + "</span></div>"
+      + (item.commit ? '<div class="sub">head ' + esc(String(item.commit).slice(0, 7)) + "</div>" : "");
+  }).join("") : '<div class="empty">no reviews yet</div>';
+
+  body += "</div></div>";
+  document.getElementById("review-body").innerHTML = body;
+  const noteBox = document.getElementById("review-note");
+  if (noteBox && draftNote) noteBox.value = draftNote;
+}
+
+function openReviewQueue() {
+  reviewTaskId = null;
+  reviewPacket = null;
+  const snap = (current && current.snapshot) || {};
+  const items = reviewItems(snap);
+  document.getElementById("review-title").textContent = "Review queue";
+  document.getElementById("review-sub").textContent =
+    items.filter((item) => item.kind !== "approved").length + " waiting for a decision";
+  document.getElementById("review-body").innerHTML = items.length
+    ? items.map((item) => {
+        const task = item.task;
+        const owner = task.owner ? " · " + esc(task.owner) : "";
+        return '<div class="rev-row"><div class="grow"><div><strong>' + esc(task.id)
+          + "</strong> " + esc(task.title) + "</div>"
+          + '<div class="sub">' + esc(task.status || "ready") + owner
+          + (task.paths && task.paths.length ? " · " + esc(task.paths.join(" ")) : "")
+          + "</div></div>" + queueBadge(item)
+          + '<button type="button" data-review="' + esc(task.id) + '">open review</button></div>';
+      }).join("")
+    : '<div class="empty">nothing waiting for review</div>';
+  document.getElementById("review").classList.remove("hidden");
+}
+
+async function loadReviewPacket(taskId) {
+  const query = new URLSearchParams({ project, task: taskId });
+  try {
+    const response = await api("/api/review/packet?" + query.toString());
+    if (response.status === 404) {
+      reviewPacket = { missing: true };
+    } else if (!response.ok) {
+      reviewPacket = { missing: true, error: "HTTP " + response.status };
+    } else {
+      reviewPacket = await response.json();
+    }
+  } catch (error) {
+    reviewPacket = { missing: true, error: "hub unreachable" };
+  }
+  if (reviewTaskId === taskId) renderReviewTask();
+}
+
+function openReview(taskId) {
+  reviewTaskId = taskId;
+  reviewPacket = null;
+  document.getElementById("review").classList.remove("hidden");
+  document.getElementById("modal").classList.add("hidden");
+  renderReviewTask();
+  loadReviewPacket(taskId);
+}
+
+function closeReview() {
+  reviewTaskId = null;
+  reviewPacket = null;
+  document.getElementById("review").classList.add("hidden");
+}
+
+function api(path, options) {
+  const opts = Object.assign({}, options || {});
+  opts.headers = Object.assign({}, opts.headers || {});
+  if (token) opts.headers.Authorization = "Bearer " + token;
+  return fetch(path, opts);
+}
+
+async function loadReviewRequests() {
+  if (!project) return;
+  try {
+    const query = new URLSearchParams({ project, status: "all", limit: "100" });
+    const response = await api("/api/review/requests?" + query.toString());
+    if (!response.ok) return;
+    const data = await response.json();
+    reviewRequests = data.requests || [];
+    if (current) renderReviewQueue(current.snapshot || {});
+    if (reviewTaskId) renderReviewTask();
+  } catch (error) { /* keep the last known queue */ }
+}
+
+async function loadReviewPackets() {
+  if (!project) return;
+  try {
+    const query = new URLSearchParams({ project });
+    const response = await api("/api/review/packets?" + query.toString());
+    if (!response.ok) return;
+    const data = await response.json();
+    reviewPackets = {};
+    for (const item of data.packets || []) {
+      if (item.head) reviewPackets[item.task] = item.head;
+    }
+    if (current) renderReviewQueue(current.snapshot || {});
+  } catch (error) { /* the queue still works without packet heads */ }
+}
+
+async function submitReview(decision) {
+  if (!reviewTaskId) return;
+  const note = (document.getElementById("review-note") || {}).value || "";
+  const packet = reviewPacket && reviewPacket.packet ? reviewPacket.packet : null;
+  const head = packet && packet.approval ? packet.approval.head : null;
+  document.querySelectorAll("[data-decision]").forEach((button) => { button.disabled = true; });
+  const errorBox = document.getElementById("review-error");
+  if (errorBox) errorBox.textContent = "";
+  try {
+    const response = await api("/api/review/requests", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        project, task: reviewTaskId, decision, note, head,
+      }),
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(data.error || ("HTTP " + response.status));
+    reviewRequests = reviewRequests.filter((item) => item.id !== data.request.id);
+    reviewRequests.push(data.request);
+    renderReviewQueue((current && current.snapshot) || {});
+    renderReviewTask();
+  } catch (error) {
+    if (errorBox) errorBox.textContent = String(error.message || error);
+    document.querySelectorAll("[data-decision]").forEach((button) => { button.disabled = false; });
+  }
+}
+
+async function cancelReview(requestId) {
+  try {
+    const response = await api("/api/review/cancel", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id: requestId }),
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(data.error || ("HTTP " + response.status));
+    reviewRequests = reviewRequests.filter((item) => item.id !== requestId);
+    renderReviewQueue((current && current.snapshot) || {});
+    renderReviewTask();
+  } catch (error) {
+    const box = document.getElementById("review-error");
+    if (box) box.textContent = String(error.message || error);
+  }
 }
 
 function card(task, snap, agents) {
@@ -1583,6 +2559,7 @@ function render(data) {
     + (done ? " · " + done + " done" : "");
 
   if (openTaskId) showTask(openTaskId);
+  renderReviewQueue(snap);
 }
 
 function closeTask() {
@@ -1628,6 +2605,10 @@ function showTask(taskId) {
   if (task.acceptance) kv("acceptance", esc(task.acceptance));
 
   let body = '<dl class="kv">' + rows.join("") + "</dl>";
+  if (task.requires_approval) {
+    body += '<div class="rev-actions"><button type="button" data-review="'
+      + esc(task.id) + '">Open review workspace</button></div>';
+  }
 
   if (task.source && task.source.task) {
     body += "<h3>Fix source</h3><dl class=\"kv\">"
@@ -1689,6 +2670,26 @@ function showTask(taskId) {
 }
 
 document.addEventListener("click", (event) => {
+  const reviewButton = event.target.closest("[data-review]");
+  if (reviewButton) {
+    openReview(reviewButton.dataset.review);
+    return;
+  }
+  const decisionButton = event.target.closest("[data-decision]");
+  if (decisionButton) {
+    submitReview(decisionButton.dataset.decision);
+    return;
+  }
+  const cancelButton = event.target.closest("[data-cancel]");
+  if (cancelButton) {
+    cancelReview(cancelButton.dataset.cancel);
+    return;
+  }
+  const queueButton = event.target.closest("[data-queue]");
+  if (queueButton) {
+    openReviewQueue();
+    return;
+  }
   const cardElement = event.target.closest("[data-task]");
   if (cardElement) showTask(cardElement.dataset.task);
   const projectRow = event.target.closest("[data-project]");
@@ -1702,8 +2703,16 @@ document.getElementById("modal-close").addEventListener("click", closeTask);
 document.getElementById("modal").addEventListener("click", (event) => {
   if (event.target.id === "modal") closeTask();
 });
+document.getElementById("review-open").addEventListener("click", openReviewQueue);
+document.getElementById("review-close").addEventListener("click", closeReview);
+document.getElementById("review").addEventListener("click", (event) => {
+  if (event.target.id === "review") closeReview();
+});
 document.addEventListener("keydown", (event) => {
-  if (event.key === "Escape") closeTask();
+  if (event.key === "Escape") {
+    closeTask();
+    closeReview();
+  }
 });
 
 function setLive(live, why) {
@@ -1876,6 +2885,12 @@ loadProjects().then(() => {
   startStream();
   loadHistory();
   loadOverview();
+  loadReviewRequests();
+  loadReviewPackets();
+  setInterval(() => {
+    loadReviewRequests();
+    loadReviewPackets();
+  }, 5000);
 });
 </script>
 </body>

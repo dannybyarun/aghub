@@ -512,10 +512,42 @@ def add_task(
     evals=None,
     require_sandbox=False,
     requires_approval=False,
+    required_approvals=None,
+    review_groups=None,
+    reviewers=None,
+    review_ttl=None,
 ):
     if agent != "queue":
         require_role(state, agent, "writer", "add tasks")
     paths = list(paths or [])
+    review_groups = _string_list(review_groups)
+    reviewers = _string_list(reviewers)
+    if required_approvals is not None:
+        required_approvals = int(required_approvals)
+        if required_approvals < 1:
+            raise AghubError("required approvals must be at least 1")
+    if review_ttl is not None:
+        review_ttl = int(review_ttl)
+        if review_ttl < 0:
+            raise AghubError("review TTL must be zero or more seconds")
+    policy = normalize_review_policy(state.project)
+    unknown = [name for name in review_groups if name not in policy["groups"]]
+    if unknown:
+        raise AghubError(
+            "unknown review group(s): "
+            + ", ".join(unknown)
+            + " — define them with `aghub policy set --group NAME=agent1,agent2`"
+        )
+    if reviewers and policy["reviewers"]:
+        outside = [reviewer for reviewer in reviewers if reviewer not in policy["reviewers"]]
+        if outside:
+            raise AghubError(
+                "reviewer(s) outside the board allowlist: "
+                + ", ".join(outside)
+                + " — add them with `aghub policy set --reviewer AGENT`"
+            )
+    if required_approvals is not None or review_groups or reviewers or review_ttl is not None:
+        requires_approval = True
     scope = str((state.project or {}).get("scope") or "").strip("/")
     if scope:
         if not paths:
@@ -553,6 +585,14 @@ def add_task(
         "created_by": agent,
         "updated_at": now_iso(),
     }
+    if required_approvals is not None:
+        task["required_approvals"] = required_approvals
+    if review_groups:
+        task["review_groups"] = review_groups
+    if reviewers:
+        task["reviewers"] = reviewers
+    if review_ttl is not None:
+        task["review_ttl_seconds"] = review_ttl
     state.tasks[task_id] = task
     state.emit("task.add", agent=agent, task=task_id, title=title)
     return task
@@ -776,6 +816,17 @@ def review_decision(state, task_id):
     return record.get("decision") or "approved", record
 
 
+def reviewer_identity(record):
+    """The person a review represents, which may differ from its signer.
+
+    Local reviews sign and review as the same agent. GitHub and hub reviews are
+    signed by the trusted worker that applies them, while `reviewer` records the
+    mapped human or board identity the decision belongs to.
+    """
+    record = record or {}
+    return str(record.get("reviewer") or record.get("agent") or "")
+
+
 def same_commit(left, right):
     """Compare full or abbreviated commit ids without needing a repository."""
     left = str(left or "").strip()
@@ -789,52 +840,480 @@ def same_commit(left, right):
     )
 
 
-def approval_gate(state, task, head=None):
-    """Return a human-readable gap when a task still needs an approval.
+def _string_list(value):
+    if value is None:
+        return []
+    if isinstance(value, str):
+        value = [value]
+    try:
+        items = list(value)
+    except TypeError:
+        return []
+    return [str(item).strip() for item in items if str(item).strip()]
 
-    When a review is commit-bound and a branch head is known, the approval must
-    match that head. Legacy approvals without a binding stay valid so older
-    boards keep working.
-    """
-    if not (task or {}).get("requires_approval"):
+
+def _int_or_none(value):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
         return None
-    decision, record = review_decision(state, task["id"])
-    if decision == "approved":
-        if str((record or {}).get("binding") or "") == "commit" and head is not None:
-            approved = (record or {}).get("commit")
-            if not approved:
-                return (
-                    f"{task['id']} approval is not bound to a commit — re-approve "
-                    f"with `aghub review {task['id']} --approve --note ...`"
-                )
-            if not same_commit(approved, head):
-                return (
-                    f"{task['id']} approval is for {str(approved)[:7]}, but the "
-                    f"current head is {str(head)[:7]} — re-approve the current head "
-                    f"with `aghub review {task['id']} --approve --note ...`"
-                )
-        return None
-    if decision == "changes_requested":
-        reviewer = (record or {}).get("agent") or "a reviewer"
-        return (
-            f"{task['id']} has changes requested by {reviewer} — address them, then "
-            f"run `aghub review {task['id']} --approve --note ...`"
+
+
+def normalize_review_policy(project):
+    """Board review policy with stable defaults for boards that predate it."""
+    raw = (project or {}).get("review")
+    raw = raw if isinstance(raw, dict) else {}
+    approvals = _int_or_none(raw.get("approvals"))
+    approvals = max(1, approvals if approvals is not None else 1)
+    ttl = _int_or_none(raw.get("ttl_seconds"))
+    ttl = max(0, ttl) if ttl is not None else None
+    if ttl == 0:
+        ttl = None
+    groups = {}
+    raw_groups = raw.get("groups")
+    if isinstance(raw_groups, dict):
+        for name, members in raw_groups.items():
+            name = str(name).strip()
+            members = _string_list(members)
+            if name and members:
+                groups[name] = members
+    github = {}
+    raw_github = raw.get("github")
+    if isinstance(raw_github, dict):
+        for login, agent in raw_github.items():
+            login = str(login).strip().lower()
+            agent = str(agent).strip()
+            if login and agent:
+                github[login] = agent
+    return {
+        "approvals": approvals,
+        "ttl_seconds": ttl,
+        "groups": groups,
+        "required_groups": _string_list(raw.get("required_groups")),
+        "reviewers": _string_list(raw.get("reviewers")),
+        "github": github,
+    }
+
+
+def review_policy_for(state, task=None):
+    """Effective policy for one task: board defaults plus tightening overrides."""
+    policy = normalize_review_policy(state.project)
+    task = task or {}
+    task_required = _int_or_none(task.get("required_approvals"))
+    required = policy["approvals"]
+    if task_required is not None:
+        required = max(required, task_required, 1)
+    ttl = policy["ttl_seconds"]
+    task_ttl = _int_or_none(task.get("review_ttl_seconds"))
+    if task_ttl is not None and task_ttl > 0:
+        ttl = task_ttl if ttl is None else min(ttl, task_ttl)
+    board_reviewers = list(policy["reviewers"])
+    task_reviewers = _string_list(task.get("reviewers"))
+    restricted = bool(board_reviewers or task_reviewers)
+    if task_reviewers:
+        reviewers = [
+            reviewer
+            for reviewer in task_reviewers
+            if not board_reviewers or reviewer in board_reviewers
+        ]
+    else:
+        reviewers = board_reviewers
+    required_groups = list(policy["required_groups"])
+    for name in _string_list(task.get("review_groups")):
+        if name not in required_groups:
+            required_groups.append(name)
+    return {
+        "required": bool(task.get("requires_approval")),
+        "approvals": required,
+        "ttl_seconds": ttl,
+        "reviewers": reviewers,
+        "allowlist": restricted,
+        "groups": dict(policy["groups"]),
+        "required_groups": required_groups,
+        "github": dict(policy["github"]),
+    }
+
+
+def describe_review_policy(state):
+    policy = normalize_review_policy(state.project)
+    bits = [
+        f"{policy['approvals']} approval" + ("" if policy["approvals"] == 1 else "s")
+    ]
+    if policy["ttl_seconds"]:
+        bits.append(f"expires after {human_age(policy['ttl_seconds'])}")
+    if policy["required_groups"]:
+        bits.append("groups " + ", ".join(policy["required_groups"]))
+    if policy["reviewers"]:
+        bits.append(f"reviewers {', '.join(policy['reviewers'])}")
+    if policy["github"]:
+        bits.append(f"github maps {len(policy['github'])} login(s)")
+    return " · ".join(bits)
+
+
+def github_reviewer(state, login, fallback=None):
+    """Resolve a GitHub login to the board identity it reviews as."""
+    if login:
+        mapped = normalize_review_policy(state.project)["github"].get(
+            str(login).strip().lower()
         )
-    return (
-        f"{task['id']} requires a human approval — run "
-        f"`aghub review {task['id']} --approve --note ...`"
+        if mapped:
+            return mapped
+    return fallback
+
+
+def describe_task_review_policy(state, task):
+    policy = review_policy_for(state, task)
+    bits = [
+        f"{policy['approvals']} approval" + ("" if policy["approvals"] == 1 else "s")
+    ]
+    if policy["ttl_seconds"]:
+        bits.append(f"expires after {human_age(policy['ttl_seconds'])}")
+    if policy["required_groups"]:
+        bits.append("groups " + ", ".join(policy["required_groups"]))
+    if policy["reviewers"]:
+        bits.append(f"reviewers {', '.join(policy['reviewers'])}")
+    return " · ".join(bits)
+
+
+def _review_summary(record, eligible=True):
+    record = record or {}
+    return {
+        "id": record.get("id"),
+        "at": record.get("at"),
+        "agent": record.get("agent"),
+        "reviewer": reviewer_identity(record),
+        "github_login": record.get("github_login"),
+        "decision": record.get("decision") or "approved",
+        "note": record.get("note") or "",
+        "commit": record.get("commit"),
+        "binding": record.get("binding"),
+        "source": record.get("source"),
+        "external_id": record.get("external_id"),
+        "eligible": bool(eligible),
+        "stale": False,
+        "expired": False,
+    }
+
+
+def approval_summary(state, task, head=None):
+    """Evaluate every review against the task's effective review policy.
+
+    Returns a serializable summary used by the gate, packets, CI, and the web
+    board. An approval only counts when it is for the current head, inside the
+    reviewer allowlist, and younger than the configured TTL. Reviews are counted
+    once per reviewer identity, newest first.
+    """
+    task = task or {}
+    policy = review_policy_for(state, task)
+    summary = {
+        "required": bool(task.get("requires_approval")),
+        "satisfied": True,
+        "decision": "pending",
+        "reason": None,
+        "required_approvals": policy["approvals"],
+        "approved_count": 0,
+        "missing_approvals": policy["approvals"],
+        "required_groups": list(policy["required_groups"]),
+        "missing_groups": [],
+        "groups": {},
+        "reviewers": list(policy["reviewers"]),
+        "allowlist": policy["allowlist"],
+        "ttl_seconds": policy["ttl_seconds"],
+        "approvals": [],
+        "expired": [],
+        "stale": [],
+        "ineligible": [],
+        "latest_id": None,
+        "latest_stale": False,
+        "latest_expired": False,
+        "latest_ineligible": False,
+    }
+    if not summary["required"]:
+        return summary
+
+    records = review_records(state, task["id"])
+    latest = records[-1] if records else None
+    summary["decision"] = (
+        (latest.get("decision") or "approved") if latest else "pending"
+    )
+    summary["latest_id"] = (latest or {}).get("id") if latest else None
+
+    valid = {}
+    reasons = {}
+    for record in records:
+        if (record.get("decision") or "approved") != "approved":
+            continue
+        identity = reviewer_identity(record)
+        eligible = not policy["allowlist"] or identity in policy["reviewers"]
+        entry = _review_summary(record, eligible=eligible)
+        if head and str(record.get("binding") or "") == "commit":
+            if not record.get("commit"):
+                entry["stale"] = True
+                reasons[entry["id"]] = (
+                    f"{task['id']} approval by {identity or 'a reviewer'} is not "
+                    "bound to a commit — re-approve the current head "
+                    f"with `aghub review {task['id']} --approve --note ...`"
+                )
+                summary["stale"].append(entry)
+                continue
+            if not same_commit(record.get("commit"), head):
+                entry["stale"] = True
+                reasons[entry["id"]] = (
+                    f"{task['id']} approval is for "
+                    f"{str(record.get('commit'))[:7]}, but the current head is "
+                    f"{str(head)[:7]} — re-approve the current head "
+                    f"with `aghub review {task['id']} --approve --note ...`"
+                )
+                summary["stale"].append(entry)
+                continue
+        if policy["ttl_seconds"]:
+            age = age_seconds(record.get("at"))
+            if age is None or age > policy["ttl_seconds"]:
+                entry["expired"] = True
+                reasons[entry["id"]] = (
+                    f"{task['id']} approval by {identity or 'a reviewer'} expired "
+                    f"after {human_age(policy['ttl_seconds'])} — re-approve the "
+                    "current head "
+                    f"with `aghub review {task['id']} --approve --note ...`"
+                )
+                summary["expired"].append(entry)
+                continue
+        if not eligible:
+            entry["eligible"] = False
+            reasons[entry["id"]] = (
+                f"{task['id']} approval by {identity} is not from an eligible "
+                f"reviewer (allowed: "
+                f"{', '.join(policy['reviewers']) or 'none — check the board and task allowlists'})"
+            )
+            summary["ineligible"].append(entry)
+            continue
+        valid[identity] = entry
+
+    approvals = sorted(
+        valid.values(),
+        key=lambda item: (str(item.get("at") or ""), str(item.get("id") or "")),
+    )
+    summary["approvals"] = approvals
+    summary["approved_count"] = len(approvals)
+    summary["missing_approvals"] = max(
+        0, policy["approvals"] - summary["approved_count"]
     )
 
+    for name in policy["required_groups"]:
+        members = policy["groups"].get(name)
+        if members is None:
+            summary["groups"][name] = {
+                "defined": False,
+                "members": [],
+                "satisfied": False,
+            }
+            summary["missing_groups"].append(name)
+            continue
+        satisfied = any(item["reviewer"] in members for item in approvals)
+        summary["groups"][name] = {
+            "defined": True,
+            "members": list(members),
+            "satisfied": satisfied,
+        }
+        if not satisfied:
+            summary["missing_groups"].append(name)
 
-def _review_gate(state, task_id, agent, force):
+    if latest and (latest.get("decision") or "approved") == "changes_requested":
+        reviewer = reviewer_identity(latest) or "a reviewer"
+        summary["reason"] = (
+            f"{task['id']} has changes requested by {reviewer} — address them, "
+            f"then run `aghub review {task['id']} --approve --note ...`"
+        )
+    elif latest and (latest.get("decision") or "approved") == "approved":
+        summary["latest_stale"] = any(
+            item["id"] == latest.get("id") for item in summary["stale"]
+        )
+        summary["latest_expired"] = any(
+            item["id"] == latest.get("id") for item in summary["expired"]
+        )
+        summary["latest_ineligible"] = any(
+            item["id"] == latest.get("id") for item in summary["ineligible"]
+        )
+
+    if summary["reason"] is None and summary["approved_count"] < policy["approvals"]:
+        if not records:
+            summary["reason"] = (
+                f"{task['id']} requires a human approval — run "
+                f"`aghub review {task['id']} --approve --note ...`"
+            )
+        elif summary["approved_count"] == 0 and reasons.get((latest or {}).get("id")):
+            summary["reason"] = reasons[latest.get("id")]
+        else:
+            extra = ""
+            if summary["ineligible"]:
+                extra = (
+                    f"; {len(summary['ineligible'])} review(s) not from an "
+                    "eligible reviewer"
+                )
+            elif summary["expired"]:
+                extra = f"; {len(summary['expired'])} review(s) expired"
+            elif summary["stale"]:
+                extra = f"; {len(summary['stale'])} review(s) target another head"
+            summary["reason"] = (
+                f"{task['id']} requires {policy['approvals']} approvals — "
+                f"{summary['approved_count']} valid for the current head"
+                f"{extra}; still need "
+                f"{summary['missing_approvals']} more"
+            )
+    if summary["reason"] is None and summary["missing_groups"]:
+        missing = []
+        for name in summary["missing_groups"]:
+            group = summary["groups"][name]
+            if group["defined"]:
+                missing.append(
+                    f"'{name}' (members: {', '.join(group['members'])})"
+                )
+            else:
+                missing.append(
+                    f"'{name}' (undefined — add it with "
+                    f"`aghub policy set --group {name}=agent1,agent2`)"
+                )
+        summary["reason"] = (
+            f"{task['id']} needs an approval from review group "
+            + ", ".join(missing)
+        )
+    summary["satisfied"] = summary["reason"] is None
+    return summary
+
+
+def approval_gate(state, task, head=None):
+    """Return a human-readable gap when a task still needs an approval."""
+    return approval_summary(state, task, head=head)["reason"]
+
+
+def set_review_policy(state, updates, agent):
+    """Merge a review-policy update into the board project and return it."""
+    require_role(state, agent, "admin", "change review policy")
+    updates = updates or {}
+    if updates.get("clear"):
+        raw = {}
+    else:
+        raw = (state.project or {}).get("review")
+        raw = dict(raw) if isinstance(raw, dict) else {}
+
+    if updates.get("approvals") is not None:
+        raw["approvals"] = max(1, int(updates["approvals"]))
+    if updates.get("clear_ttl"):
+        raw.pop("ttl_seconds", None)
+    elif updates.get("ttl_seconds") is not None:
+        ttl = max(0, int(updates["ttl_seconds"]))
+        if ttl:
+            raw["ttl_seconds"] = ttl
+        else:
+            raw.pop("ttl_seconds", None)
+
+    if updates.get("clear_reviewers"):
+        raw.pop("reviewers", None)
+    if updates.get("reviewers"):
+        reviewers = _string_list(raw.get("reviewers"))
+        for reviewer in updates["reviewers"]:
+            reviewer = str(reviewer).strip()
+            if reviewer and reviewer not in reviewers:
+                reviewers.append(reviewer)
+        if reviewers:
+            raw["reviewers"] = reviewers
+
+    groups = raw.get("groups")
+    groups = dict(groups) if isinstance(groups, dict) else {}
+    required = _string_list(raw.get("required_groups"))
+    if updates.get("clear_groups"):
+        groups = {}
+        required = []
+    for name, members in (updates.get("groups") or {}).items():
+        name = str(name).strip()
+        if not name:
+            continue
+        members = [str(member).strip() for member in members if str(member).strip()]
+        if members:
+            groups[name] = members
+        else:
+            groups.pop(name, None)
+            required = [item for item in required if item != name]
+    if updates.get("clear_required_groups"):
+        required = []
+    for name in updates.get("required_groups") or []:
+        name = str(name).strip()
+        if name and name not in required:
+            required.append(name)
+
+    if updates.get("clear_github"):
+        raw.pop("github", None)
+    if updates.get("github"):
+        github = raw.get("github")
+        github = dict(github) if isinstance(github, dict) else {}
+        for login, target in updates["github"].items():
+            login = str(login).strip().lower()
+            target = str(target).strip()
+            if login and target:
+                github[login] = target
+        if github:
+            raw["github"] = github
+
+    missing = [name for name in required if name not in groups]
+    if missing:
+        raise AghubError(
+            "required review group(s) are not defined: "
+            + ", ".join(missing)
+            + " — add them with `aghub policy set --group NAME=agent1,agent2`"
+        )
+    reviewers = _string_list(raw.get("reviewers"))
+    if reviewers:
+        outside = sorted(
+            {
+                member
+                for name, members in groups.items()
+                for member in members
+                if member not in reviewers
+            }
+        )
+        if outside:
+            raise AghubError(
+                "review group members are not in the reviewer allowlist: "
+                + ", ".join(outside)
+                + " — add them with `aghub policy set --reviewer AGENT`"
+            )
+    if groups:
+        raw["groups"] = groups
+    else:
+        raw.pop("groups", None)
+    if required:
+        raw["required_groups"] = required
+    else:
+        raw.pop("required_groups", None)
+    raw["updated_at"] = now_iso()
+    raw["updated_by"] = agent
+    if raw:
+        state.project["review"] = raw
+    else:
+        state.project.pop("review", None)
+    state.emit(
+        "project.review_policy",
+        agent=agent,
+        approvals=raw.get("approvals", 1),
+        ttl_seconds=raw.get("ttl_seconds"),
+        groups=sorted(groups),
+        required_groups=required,
+        reviewers=reviewers,
+        github=dict(raw.get("github") or {}),
+    )
+    return normalize_review_policy(state.project)
+
+
+def _review_gate(state, task_id, agent, force, reviewer=None):
     task = state.tasks.get(task_id)
     if task is None:
         raise AghubError(f"unknown task {task_id}")
     if role_map(state) is not None:
         require_role(state, agent, "admin", "review tasks")
-    if task.get("owner") == agent and not force:
+    identity = str(reviewer or agent)
+    if task.get("owner") in (agent, identity) and not force:
         raise AghubError(
-            f"{agent} owns {task_id}; review with a separate human identity "
+            f"{identity} owns {task_id}; review with a separate human identity "
             "(or pass --force)"
         )
     return task
@@ -852,8 +1331,19 @@ def _review_record(
     force=False,
     source=None,
     external_id=None,
+    reviewer=None,
+    github_login=None,
 ):
-    task = _review_gate(state, task_id, agent, force)
+    task = _review_gate(state, task_id, agent, force, reviewer=reviewer)
+    identity = str(reviewer or agent)
+    if (decision or "approved") == "approved":
+        policy = review_policy_for(state, task)
+        if policy["allowlist"] and identity not in policy["reviewers"]:
+            allowed = ", ".join(policy["reviewers"]) or "none"
+            raise AghubError(
+                f"{identity} is not an eligible reviewer for {task_id} "
+                f"(allowed: {allowed})"
+            )
     record = {
         "id": new_ulid(),
         "at": now_iso(),
@@ -863,6 +1353,10 @@ def _review_record(
         "note": note or "",
         "commit": commit,
     }
+    if reviewer and str(reviewer) != str(agent):
+        record["reviewer"] = str(reviewer)
+    if github_login:
+        record["github_login"] = str(github_login)
     if commit:
         record["binding"] = "commit"
     if source:
@@ -875,7 +1369,14 @@ def _review_record(
     state.new_approvals.append(record)
     state.approvals.append(record)
     kind = "task.approved" if decision == "approved" else "task.changes_requested"
-    state.emit(kind, agent=agent, task=task_id, review=record["id"], note=record["note"])
+    state.emit(
+        kind,
+        agent=agent,
+        reviewer=identity,
+        task=task_id,
+        review=record["id"],
+        note=record["note"],
+    )
     return record
 
 
@@ -890,6 +1391,8 @@ def approve(
     force=False,
     source=None,
     external_id=None,
+    reviewer=None,
+    github_login=None,
 ):
     return _review_record(
         state,
@@ -903,6 +1406,8 @@ def approve(
         force,
         source,
         external_id,
+        reviewer=reviewer,
+        github_login=github_login,
     )
 
 
@@ -917,6 +1422,8 @@ def request_changes(
     force=False,
     source=None,
     external_id=None,
+    reviewer=None,
+    github_login=None,
 ):
     return _review_record(
         state,
@@ -930,6 +1437,8 @@ def request_changes(
         force,
         source,
         external_id,
+        reviewer=reviewer,
+        github_login=github_login,
     )
 
 

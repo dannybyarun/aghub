@@ -64,6 +64,10 @@ TOOLS = [
                 "evals": {"type": "array", "items": {"type": "string"}},
                 "acceptance": {"type": "string"},
                 "requires_approval": {"type": "boolean"},
+                "required_approvals": {"type": "integer"},
+                "review_groups": {"type": "array", "items": {"type": "string"}},
+                "reviewers": {"type": "array", "items": {"type": "string"}},
+                "review_ttl_seconds": {"type": "integer"},
                 "requires_sandbox": {"type": "boolean"},
             },
             "required": ["title"],
@@ -230,6 +234,14 @@ def build_argv(name, arguments, agent):
             args.extend(["--acceptance", arguments["acceptance"]])
         if arguments.get("requires_approval"):
             args.append("--requires-approval")
+        if arguments.get("required_approvals") is not None:
+            args.extend(["--required-approvals", str(arguments["required_approvals"])])
+        for group in _string_list(arguments.get("review_groups")):
+            args.extend(["--reviewer-group", group])
+        for reviewer in _string_list(arguments.get("reviewers")):
+            args.extend(["--reviewer", reviewer])
+        if arguments.get("review_ttl_seconds") is not None:
+            args.extend(["--review-ttl", str(arguments["review_ttl_seconds"])])
         if arguments.get("requires_sandbox"):
             args.append("--requires-sandbox")
     elif name == "aghub_claim":

@@ -4,7 +4,7 @@
 
 Two agents, two clones, one project. One takes the backend, one takes the frontend. Neither sends a message. They read a board, claim a lane, build against a frozen contract, and hand off in writing.
 
-This is a working vertical slice of that protocol: the board, claims, contracts, handoffs, codegen from frozen contracts, a serial merge queue that turns failures into trace-carrying tasks, locally signed and sandboxed evals, hash-chained board history, project ACLs, human review inboxes and approval gates, a GitHub pull-request bridge, an MCP server and Python SDK, and a hub that arbitrates live leases and serves a web board.
+This is a working vertical slice of that protocol: the board, claims, contracts, handoffs, codegen from frozen contracts, a serial merge queue that turns failures into trace-carrying tasks, locally signed and sandboxed evals, hash-chained board history, project ACLs, human review inboxes and approval gates with board-wide reviewer policy, a web review workspace, a GitHub pull-request bridge, an MCP server and Python SDK, and a hub that arbitrates live leases and serves a web board.
 
 ```
 $ aghub status
@@ -83,7 +83,7 @@ Creates a bare origin, three clones (`fe`, `be`, `ci`), and walks through:
 4. Parallel work with signed handoffs instead of messages.
 5. Serial merge queue, a reproducibility check (`eval rerun` / `eval diff`), and the CI bridge.
 6. A local eval gate, a simulated dead agent, lease expiry, and `--steal`.
-7. An approval-gated task where the owner cannot self-approve: request changes, see the review inbox, approve, preview the GitHub review comment and check, then watch a new commit invalidate the approval until it is re-reviewed.
+7. An approval-gated task where the owner cannot self-approve: request changes, see the review inbox, then satisfy a two-reviewer board policy and a required reviewer group before the queue will merge. Preview the GitHub review comment and check, then watch a new commit invalidate both approvals until each reviewer re-approves the current head.
 8. A cross-lane edit rejected by the queue; a fix task is opened with the changed files attached.
 9. A semantic drift (`/health` not in the contract) rejected by the check; the fix task carries the failing command and output.
 10. Signed board verification, then ACLs locking writes to known roles.
@@ -163,7 +163,7 @@ aghub hub status
 
 - **Leases are authoritative at write time.** `claim` asks the hub first. A 409 aborts the claim; a grant carries a fencing token that increases on every lease. Heartbeats extend the lease.
 - **Presence is live.** Every board transaction publishes a snapshot and a heartbeat. `status` overlays hub presence and prints `· hub live` or `· hub offline`.
-- **The web board never touches git.** `GET /` is a self-contained page: ready / in-flight / blocked lanes, agents, live leases, evals, dependency/fix graph, contracts and their latest diff, merge queue, reviews, handoffs, a replay scrubber, and a multi-project overview. It consumes `/api/events` over server-sent events, resumes with `Last-Event-ID`, and falls back to polling `/api/board` every 3s if the stream drops.
+- **The web board never touches git.** `GET /` is a self-contained page: ready / in-flight / blocked lanes, agents, live leases, evals, dependency/fix graph, contracts and their latest diff, merge queue, a review workspace with inline diffs and queued approve / request-changes intents, handoffs, a replay scrubber, and a multi-project overview. It consumes `/api/events` over server-sent events, resumes with `Last-Event-ID`, and falls back to polling `/api/board` every 3s if the stream drops.
 - **An outage degrades, it does not block.** The first unreachable hub produces one warning, then claims continue git-only. A reachable hub that returns 409 is always obeyed.
 - **Failover is conservative.** Clients try the configured URLs in order on connection failures and `502`/`503`/`504`. Any other HTTP response — especially a lease `409` or a quota `429` — is authoritative and is never replayed against another hub.
 - **Tenant quotas are shared.** A token can set `requests_per_minute` and `max_request_bytes`. Counters live in the hub store, so several hubs sharing one SQLite file or Postgres database enforce one budget per tenant.
@@ -227,6 +227,10 @@ Non-admin tokens can export only their own actor; asking for another actor retur
 | `POST /api/heartbeat` | presence + lease extension |
 | `POST /api/claim` | acquire a lease (409 on conflict) |
 | `POST /api/release` | release a lease |
+| `GET /api/review/packet?project=NAME&task=TASK` / `GET /api/review/packets?project=NAME` | published review packet and known packet heads |
+| `POST /api/review/packet` | publish a packet (metadata + inline diff) from a clone that owns the branch |
+| `GET /api/review/requests?project=NAME&status=pending` / `POST /api/review/requests` | queue and submit browser review intents |
+| `POST /api/review/claim\|resolve\|cancel` | worker claim / signed result / cancellation |
 | `POST /api/debug/expire` | simulate a dead agent |
 
 ### ACLs and reviews
@@ -256,21 +260,61 @@ aghub review T-007 --request-changes --note "add a rollback check"
 aghub review T-007 --approve --note "reviewed migration and rollout plan"
 ```
 
-`submit` and `queue run` refuse a gated task until the **latest valid review**
-is an approval **for the current branch head**. A new commit invalidates the
-approval; re-approve the current head with another `aghub review --approve`.
-A request for changes also blocks submission until a later approval. A reviewer
-can inspect the whole packet first with `aghub review T-007 --diff`. The task
-owner cannot review their own work unless `--force` is passed, and with ACLs
-enabled only an admin can review. Reviews are signed records on the board,
-shown in the web task detail, and the legacy `aghub approve` command still
-records an approval for compatibility.
+`submit` and `queue run` refuse a gated task until the **review policy is
+satisfied by approvals for the current branch head**. A new commit invalidates
+every approval for the old head; re-approve the current head with another
+`aghub review --approve`. A request for changes also blocks submission until a
+later approval. A reviewer can inspect the whole packet first with `aghub review
+T-007 --diff`. The task owner cannot review their own work unless `--force` is
+passed, and with ACLs enabled only an admin can review. Reviews are signed
+records on the board, shown in the web task detail, and the legacy `aghub
+approve` command still records an approval for compatibility.
+
+#### Reviewer policy
+
+One approval is the default. A board can require distinct reviewers, a reviewer
+group, a reviewer allowlist, and an approval lifetime:
+
+```bash
+aghub policy show
+aghub policy set --approvals 2 --ttl 3600 \
+  --group backend=be-1,ci --require-group backend \
+  --reviewer fe-1 --reviewer be-1 --reviewer ci
+```
+
+- `review.approvals` is the number of distinct reviewer identities required.
+  Several approvals from the same identity count once.
+- `review.ttl_seconds` expires approvals. `0` or `--no-ttl` means they do not
+  expire. Expiry is evaluated at `submit`, `queue run`, and when packets are
+  rendered.
+- `review.groups` names reviewer sets. `review.required_groups` makes at least
+  one counted approval come from each named group.
+- `review.reviewers` is an optional allowlist. A reviewer outside it cannot
+  satisfy the gate, and group members must be in it when one exists.
+- `review.github` maps a GitHub login to a board identity, e.g. `alice=fe-1`.
+  GitHub and web reviews are signed by the trusted worker, while `reviewer`
+  records the human or board identity the decision belongs to.
+
+Per-task fields can tighten the board policy but cannot loosen it:
+
+```bash
+aghub task add "Deploy billing" --paths 'src/billing/**' \
+  --required-approvals 3 --reviewer-group security \
+  --reviewer alice --review-ttl 900
+```
+
+Task required counts use `max(board, task)`, TTLs use `min(board, task)`, task
+groups add to board groups, and task reviewers narrow the board allowlist.
+Supplying any of these flags implies `--requires-approval`. A policy change
+needs an admin only when ACLs are enabled.
 
 Commit binding is recorded as `commit` plus `binding: commit`. Reviews require a
 pushed branch (or an explicit `--commit SHA`); if the branch cannot be resolved,
 the review command asks you to push it. Approvals recorded by older aghub
 versions have no binding and remain accepted, so upgrading a board does not
-silently invalidate its history.
+silently invalidate its history. Expired, stale, and ineligible reviews are
+reported in the inbox, the review packet, `ci status`, the web board, and the
+GitHub comment and check.
 
 `aghub inbox` is the human queue: pending approvals, requested changes, rejected
 queue entries, and stale leases, each with the next command to run. Use
@@ -477,12 +521,16 @@ runner generates a fresh local key as usual. The template assumes `bin/aghub`
 is present in the repository (as it is here); replace that path if your project
 installs or vendors the CLI differently.
 
-### Review inbox and the GitHub bridge
+### Review inbox, web workspace, and the GitHub bridge
 
-The review layer has two entry points. `aghub inbox` is local and read-only;
-`aghub github sync` publishes the same review packet onto a pull request.
+The review layer has three entry points over one policy. `aghub inbox` is local
+and read-only; the hub serves a browser review queue with the published diff and
+queues decisions as signed intents; `aghub github sync` publishes the same
+review packet onto a pull request.
 
 ```bash
+aghub review T-007 --publish   # mirror the packet and diff to the hub
+aghub review --watch           # sign queued browser reviews on a trusted clone
 aghub ci workflow --github-review --out .github/workflows/aghub-review.yml
 ```
 
@@ -498,10 +546,13 @@ The generated workflow:
 
 Set `AGHUB_AGENT_KEY` to a stable 32-byte hex Ed25519 seed for the workflow
 identity (default `github-review`); the board review is signed by that identity
-and the note records the actual GitHub login. If ACLs are enabled, give that
-identity an admin role so it can record reviews. `AGHUB_HUB_TOKEN` is optional
-and only mirrors board changes to a hub. The workflow needs `contents: write`,
-`pull-requests: write`, and `checks: write`.
+and the note records the actual GitHub login. Map that login to a board identity
+with `aghub policy set --github alice=fe-1` when reviewer counts or groups
+should apply to the person rather than the workflow. Unmapped logins fall back
+to `--reviewer-agent` or the workflow agent. If ACLs are enabled, give the
+signing identity an admin role so it can record reviews. `AGHUB_HUB_TOKEN` is
+optional and only mirrors board changes to a hub. The workflow needs
+`contents: write`, `pull-requests: write`, and `checks: write`.
 
 Task resolution is intentionally boring: the PR branch must equal the task
 branch, or the title/body must contain `aghub-task: T-003` (or a plain `T-003`).
@@ -518,15 +569,16 @@ aghub github sync --record-reviews           # use GITHUB_EVENT_PATH + GITHUB_TO
 aghub github sync --task T-007 --no-comment --check
 ```
 
-The check is `success` when merged or ready for the queue, `failure` when the
-queue rejected the branch, `action_required` for a pending approval or requested
-changes, and `neutral` while work is in progress. If a GitHub approval was
-recorded for an earlier head SHA, the comment and check mark it as stale and ask
-for a fresh approval; `submit` and `queue run` now reject that stale approval as
-well. The board verifies the branch head again immediately before merging, so a
-push that lands between queue selection and integration is rejected instead of
-merged against an old approval. The comment marker
-`<!-- aghub:review -->` is what makes it sticky across updates.
+The check is `success` when merged or the policy is satisfied and the task is
+ready for the queue, `failure` when the queue rejected the branch,
+`action_required` for a pending approval, requested changes, an expired or stale
+approval, or an unmet reviewer count/group, and `neutral` while work is in
+progress. If a GitHub approval was recorded for an earlier head SHA, the comment
+and check mark it as stale and ask for fresh approvals; `submit` and `queue run`
+reject that stale approval as well. The board verifies the branch head again
+immediately before merging, so a push that lands between queue selection and
+integration is rejected instead of merged against an old approval. The comment
+marker `<!-- aghub:review -->` is what makes it sticky across updates.
 
 ### MCP and the Python SDK
 
@@ -576,11 +628,12 @@ reimplemented or bypassed.
 | `aghub next` | first ready task, or the exact blockers |
 | `aghub agent [ID] [--key] [--rotate-key] [--revoke-key] [--key-id ID]` | set identity and manage this clone's eval key |
 | `aghub acl init\|list\|set\|remove\|revoke-key` | manage roles and key revocation |
-| `aghub task add TITLE --paths GLOB [--contract api@1] [--eval smoke] [--depends T-001] [--requires-approval] [--requires-sandbox]` | define work |
+| `aghub policy show [--json]` / `policy set [--approvals N] [--ttl S] [--reviewer A] [--group NAME=A,B] [--require-group NAME] [--github LOGIN=AGENT] [--clear]` | board-wide reviewer policy |
+| `aghub task add TITLE --paths GLOB [--contract api@1] [--eval smoke] [--depends T-001] [--requires-approval] [--required-approvals N] [--reviewer-group NAME] [--reviewer A] [--review-ttl S] [--requires-sandbox]` | define work |
 | `aghub task show TASK` | full task YAML, including any failure trace |
 | `aghub approve TASK [--note TEXT] [--commit SHA] [--force]` | legacy alias for `review --approve` |
 | `aghub inbox [--json] [--check]` | pending approvals, requested changes, failed queue entries, stale leases |
-| `aghub review TASK [--diff] [--json] [--approve\|--request-changes] [--note TEXT] [--commit SHA] [--force]` | inspect one task and record a signed, commit-bound human review |
+| `aghub review TASK [--diff] [--json] [--approve\|--request-changes] [--note TEXT] [--commit SHA] [--publish] [--watch] [--force]` | inspect one task, record a signed commit-bound review, or apply web review intents |
 | `aghub verify [--strict] [--json]` / `board verify` | verify the event chain and signed records |
 | `aghub registry profile [--model M] [--skills a,b] [--note TEXT]` | publish this agent's profile |
 | `aghub registry show [AGENT]` / `registry list` | inspect the registry |
@@ -645,8 +698,8 @@ and delete their own rows; still, point them at a scratch database.
 - **Integration needs a shared remote.** `submit`/`queue run` require `origin`; local-only mode supports the board but not merging.
 - **Board authorization is guardrails, not a git firewall.** ACLs stop accidental reader writes through the CLI, but anyone who can force-push `aghub/board` can rewrite it. Event hashes and signatures make tampering visible; they do not make the branch immutable. Hub tokens protect the HTTP API, not git.
 - **Signatures bind records to published keys, not to people.** Private keys live outside the board, so a board writer cannot read them or mint a valid record for another agent without replacing that agent's published key. Old records stay valid until their key is revoked. The Ed25519 helper is pure Python, not constant-time, and is intended for local trusted-repo use rather than hostile co-tenants.
-- **Latest review wins by board time.** Review order is the signed record's `at` timestamp, with its ULID as the tie-breaker; clock skew between reviewers can therefore reorder reviews. New reviews are commit-bound: a new branch head invalidates an approval, and `submit` plus `queue run` reject the mismatch. There are still no required-reviewer counts, review expiry, or diff-conditioned approvals. Legacy reviews without a binding remain accepted for compatibility.
-- **The GitHub bridge is a workflow, not an App.** It runs only on the events in the generated workflow, needs a same-repository PR by default, publishes one sticky comment and one `aghub/review` check, and records only GitHub `APPROVED` / `CHANGES_REQUESTED` reviews. Fork PRs are skipped (read-only token, no secrets) and fork approvals are refused unless explicitly allowed. Dismissed or commented reviews are not treated as decisions, and the workflow identity must be an admin when ACLs are enabled.
+- **Reviews are ordered by board time and evaluated as a policy.** Review order is the signed record's `at` timestamp, with its ULID as the tie-breaker; clock skew between reviewers can therefore reorder reviews. Approvals are counted once per reviewer identity, must match the current head, must be younger than the configured TTL, and must satisfy required groups plus the optional allowlist. The latest request-changes still blocks. Counts and expiry are policy, not diff conditions: there are no per-path approvals or approvals that only apply to a matching patch. Legacy reviews without a binding remain accepted for compatibility.
+- **The GitHub bridge is a workflow, not an App.** It runs only on the events in the generated workflow, needs a same-repository PR by default, publishes one sticky comment and one `aghub/review` check, and records only GitHub `APPROVED` / `CHANGES_REQUESTED` reviews. Fork PRs are skipped (read-only token, no secrets) and fork approvals are refused unless explicitly allowed. Dismissed or commented reviews are not treated as decisions, and the workflow identity must be an admin when ACLs are enabled. Reviewer groups and counts see the mapped board identity (`review.github`), not the GitHub login itself.
 - **A review packet needs the task branch locally.** `aghub review --diff` fetches the branch from the board's remote when possible; if the owner has not pushed it yet, the packet shows the task and gate state but not a patch.
 - **Legacy and pre-key events may be unsigned.** Records created before a key exists are reported as unsigned; `verify --strict` fails on unsigned records, while chain errors and invalid signatures always fail.
 - **Live updates send full snapshots.** SSE pushes the whole board on change and keeps the last 100 per project for `Last-Event-ID` replay; there are no per-task deltas or websocket fan-out yet. A reconnect older than the window gets the oldest retained snapshot and then the current board.
@@ -664,7 +717,7 @@ and delete their own rows; still, point them at a scratch database.
 
 ## Next
 
-1. Web review workspace: a real reviewer queue with inline diff review and signed approve / request-changes actions.
-2. Policy: required reviewers, expiring approvals, and approval conditions tied to diffs.
-3. GitHub App path: OAuth/webhooks, fork-safe review recording, richer check annotations, and multi-repository boards.
-4. Deeper codegen: parameter validation, auth schemes, and dialect-aware migrations.
+1. Diff-conditioned approvals and reviewer SLAs: require a reviewer when a patch touches a protected path, or when a review has been pending too long.
+2. GitHub App path: OAuth/webhooks, fork-safe review recording, dismissed-review handling, richer check annotations, and multi-repository boards.
+3. Deeper codegen: parameter validation, auth schemes, and dialect-aware migrations.
+4. Hosted hub hardening: per-tenant isolation beyond token scopes, storage retention, and backup/restore workflows.

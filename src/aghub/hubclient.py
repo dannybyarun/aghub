@@ -149,6 +149,81 @@ def publish(base, project, snapshot, token=None):
     return request(base, "POST", "/api/snapshot", {"project": project, "snapshot": snapshot}, token=token)
 
 
+def publish_review_packet(base, project, task, packet, token=None):
+    return request(
+        base,
+        "POST",
+        "/api/review/packet",
+        {"project": project, "task": task, "packet": packet},
+        token=token,
+    )
+
+
+def review_packet(base, project, task, token=None):
+    query = "?project=" + quote(project) + "&task=" + quote(task)
+    return request(base, "GET", "/api/review/packet" + query, token=token)
+
+
+def review_packets(base, project, token=None):
+    query = "?project=" + quote(project)
+    return request(base, "GET", "/api/review/packets" + query, token=token)
+
+
+def review_requests(base, project=None, status="pending", limit=100, token=None):
+    query = f"?status={quote(status)}&limit={int(limit)}"
+    if project:
+        query += "&project=" + quote(project)
+    return request(base, "GET", "/api/review/requests" + query, token=token)
+
+
+def request_review(
+    base, project, task, decision, note="", head=None, reviewer=None, token=None
+):
+    return request(
+        base,
+        "POST",
+        "/api/review/requests",
+        {
+            "project": project,
+            "task": task,
+            "decision": decision,
+            "note": note,
+            "head": head,
+            "reviewer": reviewer,
+        },
+        token=token,
+    )
+
+
+def claim_review_request(base, request_id, token=None):
+    return request(
+        base, "POST", "/api/review/claim", {"id": request_id}, token=token
+    )
+
+
+def resolve_review_request(
+    base, request_id, status, record_id=None, error=None, token=None
+):
+    return request(
+        base,
+        "POST",
+        "/api/review/resolve",
+        {
+            "id": request_id,
+            "status": status,
+            "record_id": record_id,
+            "error": error,
+        },
+        token=token,
+    )
+
+
+def cancel_review_request(base, request_id, token=None):
+    return request(
+        base, "POST", "/api/review/cancel", {"id": request_id}, token=token
+    )
+
+
 def heartbeat(base, project, agent, task=None, branch=None, ttl=600, token=None, machine=None):
     return request(
         base,

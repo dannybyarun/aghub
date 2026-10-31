@@ -96,7 +96,19 @@ class Agent:
     def heartbeat(self):
         return self.call("heartbeat")
 
-    def add_task(self, title, paths=None, contracts=None, evals=None, acceptance="", requires_approval=False):
+    def add_task(
+        self,
+        title,
+        paths=None,
+        contracts=None,
+        evals=None,
+        acceptance="",
+        requires_approval=False,
+        required_approvals=None,
+        review_groups=None,
+        reviewers=None,
+        review_ttl=None,
+    ):
         argv = ["task", "add", title]
         for path in paths or []:
             argv.extend(["--paths", path])
@@ -108,6 +120,14 @@ class Agent:
             argv.extend(["--acceptance", acceptance])
         if requires_approval:
             argv.append("--requires-approval")
+        if required_approvals is not None:
+            argv.extend(["--required-approvals", str(required_approvals)])
+        for group in review_groups or []:
+            argv.extend(["--reviewer-group", group])
+        for reviewer in reviewers or []:
+            argv.extend(["--reviewer", reviewer])
+        if review_ttl is not None:
+            argv.extend(["--review-ttl", str(review_ttl)])
         return self.call(*argv)
 
     def approve(self, task, note="", commit=None):

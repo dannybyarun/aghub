@@ -46,7 +46,16 @@ SKIP_REASON = (
     else "optional psycopg package is not installed"
 )
 
-TABLES = ("leases", "agents", "snapshots", "counters", "events", "board_events")
+TABLES = (
+    "leases",
+    "agents",
+    "snapshots",
+    "counters",
+    "events",
+    "board_events",
+    "review_packets",
+    "review_requests",
+)
 
 
 def snapshot(name, tasks=None):
@@ -105,6 +114,70 @@ class PostgresStoreTests(unittest.TestCase):
         self.assertEqual(self.store.board(self.project)["snapshot"]["tasks"][0]["id"], "T-2")
         refreshed = self.store.overview([self.project])["projects"][0]
         self.assertGreater(refreshed["seq"], overview["projects"][0]["seq"])
+
+    def test_review_packet_and_request_lifecycle(self):
+        self.store.publish(
+            self.project,
+            snapshot(
+                self.project,
+                [
+                    {
+                        "id": "T-1",
+                        "status": "claimed",
+                        "owner": "be-1",
+                        "branch": "agent/be-1/T-1",
+                        "requires_approval": True,
+                    }
+                ],
+            ),
+        )
+        packet = {
+            "task": {"id": "T-1"},
+            "approval": {"head": "a" * 40},
+            "changes": {"patch": "@@ -1 +1 @@\n-x\n+y"},
+        }
+        published = self.store.publish_review_packet(
+            self.project, "T-1", packet, actor="admin"
+        )
+        self.assertEqual(published["head"], "a" * 40)
+        stored = self.store.review_packet(self.project, "T-1")
+        self.assertEqual(stored["packet"]["changes"]["patch"], packet["changes"]["patch"])
+        self.assertEqual(
+            self.store.review_packet_heads(self.project)[0]["head"], "a" * 40
+        )
+
+        created = self.store.create_review_request(
+            self.project,
+            "T-1",
+            "approved",
+            note="looks good",
+            head="a" * 40,
+            reviewer="fe-1",
+            actor="reviewer",
+        )
+        self.assertEqual(created["status"], "pending")
+        self.assertEqual(
+            [item["id"] for item in self.store.review_requests(self.project, "pending")],
+            [created["id"]],
+        )
+        claimed = self.store.claim_review_request(created["id"], worker="worker")
+        self.assertTrue(claimed["claimed"])
+        self.assertFalse(
+            self.store.claim_review_request(created["id"], worker="other")["claimed"]
+        )
+        applied = self.store.resolve_review_request(
+            created["id"], "applied", record_id="RV-1", worker="worker"
+        )
+        self.assertEqual(applied["status"], "applied")
+        self.assertEqual(applied["record_id"], "RV-1")
+
+        second = self.store.create_review_request(
+            self.project, "T-1", "changes_requested", actor="reviewer"
+        )
+        cancelled = self.store.cancel_review_request(
+            second["id"], actor="reviewer"
+        )
+        self.assertEqual(cancelled["status"], "cancelled")
 
     def test_claims_path_conflicts_and_fencing(self):
         first = self.store.claim(self.project, "T-1", "a", ["src/api/**"], 60)

@@ -2,15 +2,18 @@ import json
 
 from . import gitops
 from .service import (
+    approval_summary,
     blockers,
     contract_diff,
     contract_meta,
+    describe_review_policy,
     effective_status,
     eval_issue,
     eval_short_status,
     eval_ttl,
     latest_contract,
     latest_eval,
+    normalize_review_policy,
     owner_age,
 )
 from .util import age_seconds, human_age, now_iso
@@ -92,6 +95,7 @@ def status_text(state, board, for_agent=None, hub_mode=None):
         f"trunk {trunk_name} {trunk_sha} · ttl {ttl}s{suffix}"
     )
     lines.append(f"contracts  {_contract_summary(state)}")
+    lines.append(f"review     {describe_review_policy(state)}")
 
     if for_agent:
         lines.append("")
@@ -318,13 +322,34 @@ def snapshot(state, board):
                         entry["diff"] = diff
                 previous = version
             contracts.append(entry)
+    tasks = []
+    for key in sorted(state.tasks):
+        task = dict(state.tasks[key])
+        if task.get("requires_approval"):
+            summary = approval_summary(state, task)
+            task["review_state"] = {
+                "satisfied": summary["satisfied"],
+                "decision": summary["decision"],
+                "required_approvals": summary["required_approvals"],
+                "approved_count": summary["approved_count"],
+                "required_groups": summary["required_groups"],
+                "missing_groups": summary["missing_groups"],
+                "groups": summary["groups"],
+                "ttl_seconds": summary["ttl_seconds"],
+                "expired_count": len(summary["expired"]),
+                "stale_count": len(summary["stale"]),
+                "ineligible_count": len(summary["ineligible"]),
+                "reason": summary["reason"],
+            }
+        tasks.append(task)
     return {
         "project": _public_project(state),
         "board": board.head,
         "trunk": {"name": trunk_name, "sha": trunk_sha},
         "generated_at": now_iso(),
+        "review_policy": normalize_review_policy(state.project),
         "agents": [state.agents[key] for key in sorted(state.agents)],
-        "tasks": [state.tasks[key] for key in sorted(state.tasks)],
+        "tasks": tasks,
         "contracts": contracts,
         "queue": state.queue[-20:],
         "handoffs": state.handoffs[-20:],

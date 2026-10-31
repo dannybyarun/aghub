@@ -388,6 +388,66 @@ class GitHubTests(unittest.TestCase):
         )
         self.assertTrue(github.mark_stale_approval(already, "a" * 40)["stale"])
 
+    def test_policy_counts_groups_and_expiry_are_rendered(self):
+        approval = {
+            "required": True,
+            "decision": "approved",
+            "reviewer": "fe-1",
+            "note": "one down",
+            "required_approvals": 2,
+            "approved_count": 1,
+            "missing_approvals": 1,
+            "required_groups": ["backend"],
+            "missing_groups": ["backend"],
+            "groups": {
+                "backend": {
+                    "defined": True,
+                    "members": ["be-1"],
+                    "satisfied": False,
+                }
+            },
+            "ttl_seconds": 3600,
+            "expired": [],
+            "ineligible": [],
+            "satisfied": False,
+            "reason": (
+                "T-003 requires 2 approvals — 1 valid for the current head; "
+                "still need 1 more"
+            ),
+            "reviews": [],
+        }
+        payload = packet(approval=approval)
+        text = github.comment_body(payload)
+        self.assertIn("(1/2)", text)
+        self.assertIn("waiting on", text)
+        self.assertIn("requires 2 approvals", text)
+        check = github.check_payload(payload)
+        self.assertEqual(check["conclusion"], "action_required")
+        self.assertIn("review policy not satisfied", check["output"]["summary"])
+        self.assertIn("1/2", check["output"]["summary"])
+
+        satisfied = {
+            **approval,
+            "approved_count": 2,
+            "missing_approvals": 0,
+            "missing_groups": [],
+            "satisfied": True,
+            "reason": None,
+        }
+        payload = packet(approval=satisfied)
+        self.assertEqual(github.check_payload(payload)["conclusion"], "neutral")
+        self.assertNotIn("requires 2 approvals", github.comment_body(payload))
+
+        expired = {
+            **approval,
+            "approved_count": 0,
+            "expired": [{"id": "R-1", "reviewer": "fe-1"}],
+            "reason": "T-003 approval by fe-1 expired after 1h",
+        }
+        payload = packet(approval=expired)
+        self.assertIn("1 expired", github.comment_body(payload))
+        self.assertIn("expired", github.check_payload(payload)["output"]["summary"])
+
     def test_upsert_comment_creates_then_updates_marker(self):
         fake = FakeGitHub()
         server = ThreadingHTTPServer(("127.0.0.1", 0), fake.handler())

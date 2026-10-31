@@ -13,7 +13,21 @@ from contextlib import contextmanager
 
 from .errors import AghubError
 from .paths import overlaps
+from .ulid import new_ulid
 from .util import ago_iso, in_iso, now_iso
+
+MAX_PACKET_BYTES = 4 * 1024 * 1024
+MAX_REVIEW_NOTE = 4000
+REVIEW_DECISIONS = ("approved", "changes_requested")
+REVIEW_STATUSES = ("pending", "applying", "applied", "rejected", "cancelled")
+
+
+def _packet_head(packet):
+    for key in ("approval", "changes"):
+        value = packet.get(key)
+        if isinstance(value, dict) and value.get("head"):
+            return str(value["head"])
+    return packet.get("head") or None
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS snapshots (
@@ -78,6 +92,33 @@ CREATE INDEX IF NOT EXISTS events_project
   ON events(project, seq);
 CREATE INDEX IF NOT EXISTS events_actor
   ON events(project, actor, seq);
+CREATE TABLE IF NOT EXISTS review_packets (
+  project TEXT NOT NULL,
+  task TEXT NOT NULL,
+  head TEXT,
+  packet TEXT NOT NULL,
+  published_at TEXT NOT NULL,
+  actor TEXT,
+  PRIMARY KEY (project, task)
+);
+CREATE TABLE IF NOT EXISTS review_requests (
+  id TEXT PRIMARY KEY,
+  project TEXT NOT NULL,
+  task TEXT NOT NULL,
+  decision TEXT NOT NULL,
+  note TEXT NOT NULL DEFAULT '',
+  head TEXT,
+  actor TEXT,
+  reviewer TEXT,
+  status TEXT NOT NULL DEFAULT 'pending',
+  worker TEXT,
+  record_id TEXT,
+  error TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS review_requests_board
+  ON review_requests(project, status, created_at);
 """
 
 
@@ -288,6 +329,317 @@ class PostgresStore:
                 {"seq": row["seq"], "at": row["at"], "board": json.loads(row["payload"])}
                 for row in rows
             ]
+
+    # -- review workspace ------------------------------------------------
+
+    def publish_review_packet(self, project, task, packet, actor=None):
+        if not isinstance(packet, dict):
+            raise AghubError("review packet must be an object")
+        blob = json.dumps(packet)
+        if len(blob.encode("utf-8")) > MAX_PACKET_BYTES:
+            raise AghubError(
+                f"review packet exceeds {MAX_PACKET_BYTES // (1024 * 1024)} MiB"
+            )
+        head = _packet_head(packet)
+        stamp = now_iso()
+        with self.lock:
+            self._write(
+                """
+                INSERT INTO review_packets(project, task, head, packet, published_at, actor)
+                VALUES(%s,%s,%s,%s,%s,%s)
+                ON CONFLICT(project, task) DO UPDATE SET
+                  head=excluded.head,
+                  packet=excluded.packet,
+                  published_at=excluded.published_at,
+                  actor=excluded.actor
+                """,
+                (project, task, head, blob, stamp, actor),
+            )
+            self._event(
+                project, "review.packet", {"task": task, "head": head}, actor=actor
+            )
+            self.conn.commit()
+        return {
+            "ok": True,
+            "project": project,
+            "task": task,
+            "head": head,
+            "published_at": stamp,
+        }
+
+    def review_packet(self, project, task):
+        with self.lock:
+            row = self._fetchone(
+                "SELECT * FROM review_packets WHERE project=%s AND task=%s",
+                (project, task),
+            )
+        if row is None:
+            return None
+        return {
+            "project": row["project"],
+            "task": row["task"],
+            "head": row["head"],
+            "published_at": row["published_at"],
+            "actor": row["actor"],
+            "packet": json.loads(row["packet"]),
+        }
+
+    def review_packet_heads(self, project):
+        with self.lock:
+            rows = self._fetchall(
+                """
+                SELECT task, head, published_at, actor FROM review_packets
+                WHERE project=%s ORDER BY task
+                """,
+                (project,),
+            )
+            return [dict(row) for row in rows]
+
+    def review_requests(self, project=None, status=None, limit=100):
+        limit = max(1, min(int(limit or 100), 500))
+        if status == "all":
+            status = None
+        with self.lock:
+            clauses = []
+            params = []
+            if project:
+                clauses.append("project=%s")
+                params.append(project)
+            if status:
+                if status not in REVIEW_STATUSES:
+                    raise AghubError(f"unknown review status '{status}'")
+                clauses.append("status=%s")
+                params.append(status)
+            params.append(limit)
+            where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+            rows = self._fetchall(
+                "SELECT * FROM review_requests"
+                + where
+                + " ORDER BY created_at, id LIMIT %s",
+                tuple(params),
+            )
+            return [self._review_request(row) for row in rows]
+
+    def review_request(self, request_id):
+        with self.lock:
+            row = self._fetchone(
+                "SELECT * FROM review_requests WHERE id=%s", (request_id,)
+            )
+            return self._review_request(row) if row else None
+
+    def create_review_request(
+        self, project, task, decision, note="", head=None, reviewer=None, actor=None
+    ):
+        if decision not in REVIEW_DECISIONS:
+            raise AghubError("decision must be 'approved' or 'changes_requested'")
+        note = str(note or "").strip()
+        if len(note) > MAX_REVIEW_NOTE:
+            raise AghubError(f"review note exceeds {MAX_REVIEW_NOTE} characters")
+        if head is not None:
+            head = str(head).strip()
+            if head and not all(ch in "0123456789abcdef" for ch in head.lower()):
+                raise AghubError("head must be a commit id")
+        with self.lock:
+            snapshot = self.board(project)
+            if snapshot is None:
+                raise AghubError(f"no board published for {project}")
+            tasks = snapshot["snapshot"].get("tasks") or []
+            task_row = next((item for item in tasks if item.get("id") == task), None)
+            if task_row is None:
+                raise AghubError(f"unknown task {task}")
+            if not task_row.get("requires_approval"):
+                raise AghubError(f"{task} does not require approval")
+            owner = task_row.get("owner")
+            if reviewer and owner and str(owner) == str(reviewer):
+                raise AghubError(
+                    f"{reviewer} owns {task}; review with a separate identity"
+                )
+            stamp = now_iso()
+            request_id = "RR-" + new_ulid()
+            if actor is None:
+                superseded = self._write(
+                    """
+                    UPDATE review_requests SET status='cancelled', updated_at=%s,
+                      error='superseded by a newer review request'
+                    WHERE project=%s AND task=%s AND actor IS NULL AND status='pending'
+                    """,
+                    (stamp, project, task),
+                )
+            else:
+                superseded = self._write(
+                    """
+                    UPDATE review_requests SET status='cancelled', updated_at=%s,
+                      error='superseded by a newer review request'
+                    WHERE project=%s AND task=%s AND actor=%s AND status='pending'
+                    """,
+                    (stamp, project, task, actor),
+                )
+            self._write(
+                """
+                INSERT INTO review_requests(
+                  id, project, task, decision, note, head, actor, reviewer,
+                  status, created_at, updated_at
+                ) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,'pending',%s,%s)
+                """,
+                (
+                    request_id,
+                    project,
+                    task,
+                    decision,
+                    note,
+                    head or None,
+                    actor,
+                    reviewer,
+                    stamp,
+                    stamp,
+                ),
+            )
+            if superseded:
+                self._event(
+                    project,
+                    "review.supersede",
+                    {"task": task, "count": superseded},
+                    actor=actor,
+                )
+            self._event(
+                project,
+                "review.request",
+                {
+                    "id": request_id,
+                    "task": task,
+                    "decision": decision,
+                    "head": head or None,
+                },
+                actor=actor,
+            )
+            self.conn.commit()
+            return self.review_request(request_id)
+
+    def claim_review_request(self, request_id, worker=None):
+        stamp = now_iso()
+        with self.lock:
+            row = self._fetchone(
+                "SELECT * FROM review_requests WHERE id=%s", (request_id,)
+            )
+            if row is None:
+                raise AghubError(f"unknown review request {request_id}")
+            current = self._review_request(row)
+            if current["status"] == "applying":
+                if current.get("updated_at", "") >= ago_iso(300):
+                    return {"ok": True, "claimed": False, "request": current}
+            elif current["status"] != "pending":
+                return {"ok": True, "claimed": False, "request": current}
+            changed = self._write(
+                """
+                UPDATE review_requests SET status='applying', worker=%s, updated_at=%s
+                WHERE id=%s AND status=%s
+                """,
+                (worker, stamp, request_id, current["status"]),
+            )
+            if changed:
+                self._event(
+                    current["project"],
+                    "review.claim",
+                    {"id": request_id, "task": current["task"]},
+                    actor=worker,
+                )
+                self.conn.commit()
+            return {
+                "ok": True,
+                "claimed": bool(changed),
+                "request": self.review_request(request_id),
+            }
+
+    def resolve_review_request(
+        self, request_id, status, record_id=None, error=None, worker=None
+    ):
+        if status not in ("applied", "rejected"):
+            raise AghubError("resolution must be 'applied' or 'rejected'")
+        with self.lock:
+            row = self._fetchone(
+                "SELECT * FROM review_requests WHERE id=%s", (request_id,)
+            )
+            if row is None:
+                raise AghubError(f"unknown review request {request_id}")
+            current = self._review_request(row)
+            if current["status"] in ("applied", "rejected"):
+                return current
+            if current["status"] == "cancelled":
+                raise AghubError(f"review request {request_id} was cancelled")
+            stamp = now_iso()
+            self._write(
+                """
+                UPDATE review_requests SET status=%s, record_id=%s, error=%s,
+                  worker=COALESCE(%s, worker), updated_at=%s
+                WHERE id=%s
+                """,
+                (
+                    status,
+                    record_id,
+                    (str(error) if error else None),
+                    worker,
+                    stamp,
+                    request_id,
+                ),
+            )
+            self._event(
+                current["project"],
+                "review." + status,
+                {
+                    "id": request_id,
+                    "task": current["task"],
+                    "record_id": record_id,
+                    "error": str(error) if error else None,
+                },
+                actor=worker,
+            )
+            self.conn.commit()
+            return self.review_request(request_id)
+
+    def cancel_review_request(self, request_id, actor=None, admin=False):
+        with self.lock:
+            row = self._fetchone(
+                "SELECT * FROM review_requests WHERE id=%s", (request_id,)
+            )
+            if row is None:
+                raise AghubError(f"unknown review request {request_id}")
+            current = self._review_request(row)
+            if not admin and current.get("actor") != actor:
+                raise AghubError("only the requester can cancel this review")
+            if current["status"] != "pending":
+                raise AghubError(f"review request is already {current['status']}")
+            stamp = now_iso()
+            self._write(
+                "UPDATE review_requests SET status='cancelled', updated_at=%s, error=%s WHERE id=%s",
+                (stamp, "cancelled by the requester", request_id),
+            )
+            self._event(
+                current["project"],
+                "review.cancelled",
+                {"id": request_id, "task": current["task"]},
+                actor=actor,
+            )
+            self.conn.commit()
+            return self.review_request(request_id)
+
+    @staticmethod
+    def _review_request(row):
+        return {
+            "id": row["id"],
+            "project": row["project"],
+            "task": row["task"],
+            "decision": row["decision"],
+            "note": row["note"] or "",
+            "head": row["head"],
+            "actor": row["actor"],
+            "reviewer": row["reviewer"],
+            "status": row["status"],
+            "worker": row["worker"],
+            "record_id": row["record_id"],
+            "error": row["error"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
 
     def heartbeat(self, project, agent, task=None, branch=None, machine=None, ttl=None):
         stamp = now_iso()

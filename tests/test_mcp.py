@@ -110,6 +110,25 @@ class McpTests(unittest.TestCase):
         listing = self.call("aghub_task_list")
         self.assertIn("T-001", listing["content"][0]["text"])
 
+    def test_task_add_accepts_review_policy_overrides(self):
+        created = self.call(
+            "aghub_task_add",
+            {
+                "title": "policy task",
+                "paths": ["src/policy/**"],
+                "required_approvals": 2,
+                "reviewers": ["reviewer"],
+                "review_ttl_seconds": 60,
+            },
+        )
+        self.assertFalse(created["isError"], created)
+        status = self.call("aghub_status", {"json": True})
+        task = status["structuredContent"]["tasks"][0]
+        self.assertTrue(task["requires_approval"])
+        self.assertEqual(task["required_approvals"], 2)
+        self.assertEqual(task["reviewers"], ["reviewer"])
+        self.assertEqual(task["review_ttl_seconds"], 60)
+
     def test_resource_reads_board_status(self):
         resource = self.rpc(
             "resources/read", {"uri": "aghub://board/status"}

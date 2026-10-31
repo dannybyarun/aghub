@@ -225,6 +225,62 @@ def _code(value):
     return "`" + str(value).replace("`", "'") + "`"
 
 
+def _approval_line(approval):
+    line = f"**approval** {approval['decision']}"
+    required = int(approval.get("required_approvals") or 1)
+    approved = int(approval.get("approved_count") or 0)
+    if approval.get("required") and (required > 1 or approved > 1):
+        line += f" ({approved}/{required})"
+    if approval.get("reviewer"):
+        line += f" by {_code(approval['reviewer'])}"
+    if approval.get("stale"):
+        line += " (for an older commit)"
+    if approval.get("expired"):
+        line += f" ({len(approval['expired'])} expired)"
+    if approval.get("ineligible"):
+        line += f" ({len(approval['ineligible'])} ineligible)"
+    return line
+
+
+def _policy_lines(task, approval):
+    lines = []
+    required = int(approval.get("required_approvals") or 1)
+    approved = int(approval.get("approved_count") or 0)
+    bits = []
+    if required > 1:
+        bits.append(f"{approved}/{required} approvals")
+    if approval.get("ttl_seconds"):
+        bits.append(f"approval ttl {approval['ttl_seconds']}s")
+    groups = approval.get("required_groups") or []
+    if groups:
+        missing = set(approval.get("missing_groups") or [])
+        bits.append(
+            "groups "
+            + ", ".join(
+                _code(name) + (" (missing)" if name in missing else "")
+                for name in groups
+            )
+        )
+    if approval.get("reviewers"):
+        bits.append(
+            "reviewers " + ", ".join(_code(name) for name in approval["reviewers"])
+        )
+    if bits:
+        lines.append("**review policy** " + " · ".join(bits))
+    missing = approval.get("missing_groups") or []
+    if missing:
+        hints = []
+        for name in missing:
+            group = (approval.get("groups") or {}).get(name) or {}
+            members = group.get("members") or []
+            if members:
+                hints.append(f"{_code(name)} (member: {', '.join(_code(item) for item in members)})")
+            else:
+                hints.append(f"{_code(name)} (undefined)")
+        lines.append("**waiting on** " + " · ".join(hints))
+    return lines
+
+
 def comment_body(packet):
     """Markdown for the single sticky review comment on a PR."""
     task = packet["task"]
@@ -237,10 +293,9 @@ def comment_body(packet):
         f"{_code(task.get('owner') or '—')} · **branch** "
         f"{_code(task.get('branch') or '—')}",
         "",
-        f"**approval** {approval['decision']}"
-        + (f" by {_code(approval['reviewer'])}" if approval.get("reviewer") else "")
-        + (" (for an older commit)" if approval.get("stale") else ""),
+        _approval_line(approval),
     ]
+    lines.extend(_policy_lines(task, approval))
     if approval.get("note"):
         lines.append(f"> {approval['note']}")
     if task.get("paths"):
@@ -296,6 +351,13 @@ def comment_body(packet):
                 "current head before merging.",
             ]
         )
+    elif approval.get("satisfied") is False and approval.get("reason"):
+        lines.extend(
+            [
+                "",
+                f"> {approval['reason']}",
+            ]
+        )
     elif approval["required"] and approval["decision"] == "changes_requested":
         lines.extend(
             [
@@ -335,6 +397,9 @@ def check_payload(packet, details_url=None):
     elif approval.get("stale"):
         conclusion = "action_required"
         label = "approval is for an older commit"
+    elif approval.get("satisfied") is False:
+        conclusion = "action_required"
+        label = "review policy not satisfied"
     elif approval["decision"] == "changes_requested":
         conclusion = "action_required"
         label = "changes requested"
@@ -357,6 +422,27 @@ def check_payload(packet, details_url=None):
         f"- approval: {approval['decision']}"
         + (" (stale; re-approve this head)" if approval.get("stale") else ""),
     ]
+    required = int(approval.get("required_approvals") or 1)
+    approved = int(approval.get("approved_count") or 0)
+    if approval.get("required") and (required > 1 or approved > 1):
+        details.append(f"- approvals: {approved}/{required}")
+    if approval.get("required_groups"):
+        missing = set(approval.get("missing_groups") or [])
+        details.append(
+            "- review groups: "
+            + ", ".join(
+                name + (" (missing)" if name in missing else "")
+                for name in approval["required_groups"]
+            )
+        )
+    if approval.get("ttl_seconds"):
+        details.append(f"- approval ttl: {approval['ttl_seconds']}s")
+    if approval.get("expired"):
+        details.append(f"- expired reviews: {len(approval['expired'])}")
+    if approval.get("ineligible"):
+        details.append(f"- ineligible reviews: {len(approval['ineligible'])}")
+    if approval.get("reason"):
+        details.append(f"- policy: {approval['reason']}")
     if approval.get("note"):
         details.append(f"- review note: {approval['note']}")
     if latest:

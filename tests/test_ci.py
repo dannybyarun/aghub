@@ -8,9 +8,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from aghub import ci  # noqa: E402
 
 
-def make_state(queue=None, tasks=None, approvals=None):
+def make_state(queue=None, tasks=None, approvals=None, project=None):
     return SimpleNamespace(
-        project={"name": "demo", "trunk": "main", "scope": "packages/web"},
+        project=project or {"name": "demo", "trunk": "main", "scope": "packages/web"},
         tasks=tasks or {},
         queue=queue or [],
         approvals=approvals or [],
@@ -90,6 +90,61 @@ class CiTests(unittest.TestCase):
         )
         self.assertEqual(stale["approvals"]["approved"], 0)
         self.assertEqual(stale["approvals"]["gated"], 1)
+
+    def test_status_applies_counts_and_groups_to_the_approval_gate(self):
+        task = {
+            "id": "T-001",
+            "title": "gated",
+            "status": "ready",
+            "requires_approval": True,
+            "paths": ["packages/web/**"],
+        }
+        state = make_state(
+            project={
+                "name": "demo",
+                "trunk": "main",
+                "review": {
+                    "approvals": 2,
+                    "groups": {"backend": ["be-1", "ci"]},
+                    "required_groups": ["backend"],
+                    "reviewers": ["fe-1", "be-1", "ci"],
+                },
+            },
+            tasks={"T-001": task},
+            approvals=[
+                {
+                    "id": "R-1",
+                    "at": "2026-01-01T00:00:00Z",
+                    "task": "T-001",
+                    "agent": "fe-1",
+                    "decision": "approved",
+                    "binding": "commit",
+                    "commit": "a" * 40,
+                }
+            ],
+        )
+        one = ci.status(
+            state, SimpleNamespace(head="abc1234"), heads={"T-001": "a" * 40}
+        )
+        self.assertEqual(one["approvals"]["approved"], 0)
+        self.assertEqual(one["approvals"]["gated"], 1)
+
+        state.approvals.append(
+            {
+                "id": "R-2",
+                "at": "2026-01-01T00:00:01Z",
+                "task": "T-001",
+                "agent": "ci",
+                "decision": "approved",
+                "binding": "commit",
+                "commit": "a" * 40,
+            }
+        )
+        two = ci.status(
+            state, SimpleNamespace(head="abc1234"), heads={"T-001": "a" * 40}
+        )
+        self.assertEqual(two["approvals"]["approved"], 1)
+        self.assertEqual(two["approvals"]["gated"], 0)
 
     def test_github_review_workflow_is_safe_and_records_reviews(self):
         text = ci.github_workflow(project="demo", trunk="main")

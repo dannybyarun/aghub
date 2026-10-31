@@ -226,6 +226,11 @@ note "T-007 carries the failing case: command, exit code, output, changed files"
 ci task show T-007
 
 bold "10 · A human review is a signed gate, not a message"
+fe policy set --approvals 2 --ttl 3600 \
+  --group reviewers=fe-1,ci --require-group reviewers \
+  --github alice=fe-1
+fe policy show
+note "two distinct approvals are required, one from the reviewers group"
 be task add "Billing deploy" --paths 'src/api/**' --requires-approval
 be claim T-008
 git_at be checkout -q agent/be-1/T-008
@@ -243,6 +248,9 @@ fe inbox
 expect_fail "requested changes still block submit" be submit T-008
 fe review T-008 --approve --note "reviewed the billing rollout and rollback"
 fe review T-008 --json
+expect_fail "one approval is not enough under the board policy" be submit T-008
+ci review T-008 --approve --note "second pair of eyes on the rollback"
+fe review T-008 --json
 fe github sync --task T-008 --repo acme/store --dry-run
 cat > "$DEMO/be/src/api/billing.py" <<'PY'
 # Gated change: the update after approval must be re-reviewed.
@@ -253,6 +261,8 @@ git_at be commit -qm "api: adjust billing rollout after review"
 git_at be push -qu origin agent/be-1/T-008
 expect_fail "an approval for the old head is stale" be submit T-008
 fe review T-008 --approve --note "re-reviewed the current head"
+expect_fail "a second reviewer must re-approve the new head" be submit T-008
+ci review T-008 --approve --note "confirmed the current head"
 be submit T-008
 ci queue run
 ci verify

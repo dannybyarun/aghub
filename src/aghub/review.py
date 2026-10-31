@@ -2,12 +2,19 @@
 
 The board is machine-readable first. These helpers turn it into the two views a
 human needs: what needs me now, and everything I need to decide one task without
-opening five other commands.
+opening five other commands. The web review workspace reuses the same packet:
+the hub mirrors it for the browser, and a trusted local worker signs the
+resulting decision onto the board.
 """
 
-from . import gitops, service
+import time
+
+from . import gitops, hubclient, service
+from .board import ensure_local_agent_key
 from .errors import AghubError
 from .util import human_age, now_iso
+
+MAX_PUBLISHED_PATCH = 1024 * 1024
 
 
 def _queue_for(state, task_id):
@@ -59,13 +66,15 @@ def inbox(state, board=None):
                     "kind": "changes",
                     "priority": 0,
                     "detail": (
-                        f"{record.get('agent') or 'a reviewer'} requested changes: "
+                        f"{service.reviewer_identity(record) or 'a reviewer'} "
+                        f"requested changes: "
                         f"{record.get('note') or '(no note)'}"
                     ),
                     "action": f"aghub review {task_id} --diff",
                 }
             )
         elif gap and (task.get("owner") or entries):
+            summary = service.approval_summary(state, task, head=head)
             items.append(
                 {
                     **base,
@@ -73,6 +82,12 @@ def inbox(state, board=None):
                     "priority": 0,
                     "detail": gap,
                     "action": f"aghub review {task_id} --approve --note ...",
+                    "policy": {
+                        "required_approvals": summary["required_approvals"],
+                        "approved_count": summary["approved_count"],
+                        "required_groups": summary["required_groups"],
+                        "missing_groups": summary["missing_groups"],
+                    },
                 }
             )
 
@@ -223,9 +238,13 @@ def branch_changes(board, state, task, include_diff=False):
     stat = gitops.git(
         ["diff", "--stat", base_sha, branch_ref], cwd=board.repo, check=False
     ).stdout.strip()
+    resolved_head = gitops.git(
+        ["rev-parse", branch_ref], cwd=board.repo, check=False
+    ).stdout.strip()
     payload = {
         "trunk": trunk,
         "base": gitops.short(board.repo, base_sha),
+        "head": resolved_head or None,
         "branch": branch,
         "files": files,
         "stat": stat,
@@ -280,21 +299,29 @@ def _evals(state, task):
     return entries
 
 
-def _reviews(state, task_id):
+def _reviews(state, task_id, analysis=None):
+    analysis = analysis or {}
     entries = []
     for record in state.approvals:
         if record.get("task") != task_id:
             continue
+        view = analysis.get(record.get("id")) or {}
         entries.append(
             {
                 "id": record.get("id"),
                 "at": record.get("at"),
                 "agent": record.get("agent"),
+                "reviewer": service.reviewer_identity(record),
+                "github_login": record.get("github_login"),
                 "decision": record.get("decision") or "approved",
                 "note": record.get("note") or "",
                 "commit": record.get("commit"),
+                "binding": record.get("binding"),
                 "source": record.get("source"),
                 "external_id": record.get("external_id"),
+                "eligible": bool(view.get("eligible", True)),
+                "stale": bool(view.get("stale")),
+                "expired": bool(view.get("expired")),
                 "verified": service.verify_attestation(state, record) is True,
             }
         )
@@ -309,12 +336,16 @@ def review_packet(board, state, task_id, include_diff=False):
     entries = _queue_for(state, task_id)
     decision, record = service.review_decision(state, task_id)
     head = branch_head(board, task, update=True)
-    stale = bool(
-        decision == "approved"
-        and (record or {}).get("binding") == "commit"
-        and head
-        and not service.same_commit((record or {}).get("commit"), head)
-    )
+    summary = service.approval_summary(state, task, head=head)
+    stale = summary["latest_stale"]
+    analysis = {}
+    for item in (
+        summary["approvals"]
+        + summary["expired"]
+        + summary["stale"]
+        + summary["ineligible"]
+    ):
+        analysis[item.get("id")] = item
     latest_handoff = next(
         (item for item in reversed(state.handoffs) if item.get("task") == task_id),
         None,
@@ -329,7 +360,7 @@ def review_packet(board, state, task_id, include_diff=False):
         "approval": {
             "required": bool(task.get("requires_approval")),
             "decision": decision or "pending",
-            "reviewer": (record or {}).get("agent"),
+            "reviewer": service.reviewer_identity(record) if record else None,
             "note": (record or {}).get("note") or "",
             "commit": (record or {}).get("commit"),
             "binding": (record or {}).get("binding"),
@@ -337,7 +368,21 @@ def review_packet(board, state, task_id, include_diff=False):
             "stale": stale,
             "source": (record or {}).get("source"),
             "external_id": (record or {}).get("external_id"),
-            "reviews": _reviews(state, task_id),
+            "satisfied": summary["satisfied"],
+            "reason": summary["reason"],
+            "required_approvals": summary["required_approvals"],
+            "approved_count": summary["approved_count"],
+            "missing_approvals": summary["missing_approvals"],
+            "required_groups": summary["required_groups"],
+            "missing_groups": summary["missing_groups"],
+            "groups": summary["groups"],
+            "reviewers": summary["reviewers"],
+            "ttl_seconds": summary["ttl_seconds"],
+            "approvals": summary["approvals"],
+            "expired": summary["expired"],
+            "ineligible": summary["ineligible"],
+            "stale_reviews": summary["stale"],
+            "reviews": _reviews(state, task_id, analysis=analysis),
         },
         "contracts": _contracts(board, state, task),
         "evals": _evals(state, task),
@@ -347,13 +392,12 @@ def review_packet(board, state, task_id, include_diff=False):
         "changes": branch_changes(board, state, task, include_diff=include_diff),
         "actions": [],
     }
-    if stale:
+    if task.get("requires_approval") and not summary["satisfied"]:
         packet["actions"].append(f"aghub review {task_id} --approve --note ...")
-    if task.get("requires_approval") and decision != "approved":
-        packet["actions"].append(f"aghub review {task_id} --approve --note ...")
-        packet["actions"].append(
-            f"aghub review {task_id} --request-changes --note ..."
-        )
+        if decision != "changes_requested":
+            packet["actions"].append(
+                f"aghub review {task_id} --request-changes --note ..."
+            )
     rejected = [entry for entry in entries if entry.get("status") == "rejected"]
     if rejected:
         latest = rejected[-1]
@@ -386,14 +430,40 @@ def render_review(packet, include_diff=False):
     if task.get("acceptance"):
         lines.append(f"  accept    {task['acceptance']}")
     approval = packet["approval"]
+    required = int(approval.get("required_approvals") or 1)
+    approved = int(approval.get("approved_count") or 0)
     label = approval["decision"]
+    if approval.get("decision") == "approved" and (required > 1 or approved != 1):
+        label += f" {approved}/{required}"
+    elif approval.get("decision") == "pending" and required > 1:
+        label += f" {approved}/{required}"
     if approval.get("reviewer"):
         label += f" by {approval['reviewer']}"
     if approval.get("note"):
         label += f" — {approval['note']}"
     if approval.get("stale"):
         label += " (stale; re-approve the current head)"
+    if approval.get("expired"):
+        label += f" ({len(approval['expired'])} expired)"
+    if approval.get("ineligible"):
+        label += f" ({len(approval['ineligible'])} ineligible)"
+    if approval.get("required") and approval.get("satisfied") is False:
+        label += " (policy not satisfied)"
     lines.append(f"  review    {label}" + (" (required)" if approval["required"] else ""))
+    if approval["required"]:
+        policy = [f"{approved}/{required} approval" + ("" if required == 1 else "s")]
+        if approval.get("ttl_seconds"):
+            policy.append(f"ttl {human_age(approval['ttl_seconds'])}")
+        if approval.get("required_groups"):
+            missing = set(approval.get("missing_groups") or [])
+            groups = [
+                f"{name}" + (" (missing)" if name in missing else "")
+                for name in approval["required_groups"]
+            ]
+            policy.append("groups " + ", ".join(groups))
+        if approval.get("reviewers"):
+            policy.append("reviewers " + ", ".join(approval["reviewers"]))
+        lines.append(f"  policy    {' · '.join(policy)}")
     if approval.get("head"):
         lines.append(f"  head      {str(approval['head'])[:7]}")
     if approval.get("commit"):
@@ -447,8 +517,19 @@ def render_review(packet, include_diff=False):
         lines.append("reviews")
         for record in packet["approval"]["reviews"]:
             note = f" — {record['note']}" if record["note"] else ""
+            flags = []
+            if record.get("stale"):
+                flags.append("stale")
+            if record.get("expired"):
+                flags.append("expired")
+            if record.get("eligible") is False:
+                flags.append("ineligible")
+            if record.get("github_login"):
+                flags.append("github " + record["github_login"])
+            suffix = f" [{', '.join(flags)}]" if flags else ""
             lines.append(
-                f"  {record['decision']:<18} {record['agent']}{note} "
+                f"  {record['decision']:<18} "
+                f"{record.get('reviewer') or record['agent']}{note}{suffix} "
                 f"({record['at']})"
             )
 
@@ -467,3 +548,179 @@ def render_review(packet, include_diff=False):
         for action in packet["actions"]:
             lines.append(f"  {action}")
     return "\n".join(lines)
+
+
+# -- web review workspace ------------------------------------------------
+
+
+def publish_packet(board, state, task_id, include_diff=True):
+    """Mirror a review packet (with an inline patch) to the connected hub.
+
+    The hub never runs git, so the CLI that owns the branch publishes the diff.
+    `submit`, `aghub review --publish`, and the review worker call this.
+    """
+    if not board.hub:
+        return None
+    if task_id not in state.tasks:
+        raise AghubError(f"unknown task {task_id}")
+    packet = review_packet(board, state, task_id, include_diff=include_diff)
+    changes = packet.get("changes") or {}
+    patch = changes.get("patch")
+    if isinstance(patch, str) and len(patch) > MAX_PUBLISHED_PATCH:
+        changes["patch"] = patch[:MAX_PUBLISHED_PATCH] + "\n... (truncated by the publisher)"
+        changes["truncated"] = True
+    project = (state.project or {}).get("name") or "default"
+    try:
+        return hubclient.publish_review_packet(
+            board.hub_urls, project, task_id, packet, board.hub_token
+        )
+    except hubclient.HubError as exc:
+        hubclient.warn_once(
+            f"hub at {board.hub} is unreachable ({exc}); review packet not published"
+        )
+        return None
+
+
+def _worker_key(board, state, agent):
+    if service.eval_attestation_mode(state) == service.EVAL_ED25519_SCHEME:
+        return ensure_local_agent_key(board.common, agent)
+    return {}
+
+
+def apply_review_request(board, request, agent, force=False):
+    """Sign one web review intent onto the board and push it.
+
+    The branch head is re-resolved before signing. If the browser reviewed a
+    different head, the request is rejected instead of approving new commits by
+    accident. A request that was already applied is idempotent: the existing
+    signed record is returned when `external_id` matches.
+    """
+    state = board.load()
+    existing = next(
+        (
+            record
+            for record in state.approvals
+            if record.get("external_id") == request.get("id")
+        ),
+        None,
+    )
+    if existing is not None:
+        return existing
+    task_id = request.get("task")
+    task = state.tasks.get(task_id)
+    if task is None:
+        raise AghubError(f"unknown task {task_id}")
+    if task.get("status") == "done":
+        raise AghubError(f"{task_id} is already done")
+    decision = request.get("decision")
+    if decision not in ("approved", "changes_requested"):
+        raise AghubError(f"unknown review decision {decision!r}")
+    head = branch_head(board, task, update=True)
+    expected = request.get("head")
+    if expected and head and not service.same_commit(expected, head):
+        raise AghubError(
+            f"branch moved from {str(expected)[:7]} to {str(head)[:7]} after the "
+            "review was opened — refresh the workspace and submit again"
+        )
+    if not head:
+        raise AghubError(
+            f"branch {task.get('branch') or '(none)'} is not available; push it "
+            "before applying the review"
+        )
+    key = _worker_key(board, state, agent)
+    note = request.get("note") or ""
+    reviewer_fn = service.approve if decision == "approved" else service.request_changes
+    reviewer = request.get("reviewer") or agent
+    return board.transaction(
+        f"web review {task_id}",
+        lambda current: reviewer_fn(
+            current,
+            task_id,
+            agent,
+            note,
+            head,
+            private_key=key.get("private_key"),
+            public_key=key.get("public_key"),
+            force=force,
+            source="hub",
+            external_id=request.get("id"),
+            reviewer=reviewer,
+        ),
+        agent=agent,
+    )
+
+
+def apply_pending(board, agent, limit=50, force=False, out=None):
+    """Apply every pending web review request once. Returns result records."""
+    if not board.hub:
+        raise AghubError(
+            "not connected to a hub — run `aghub hub connect <url>` first"
+        )
+    project = (board.load().project or {}).get("name") or "default"
+    try:
+        data = hubclient.review_requests(
+            board.hub_urls, project, status="pending", limit=limit, token=board.hub_token
+        )
+    except hubclient.HubError as exc:
+        raise AghubError(f"cannot read review requests: {exc}")
+    printer = out or (lambda line: None)
+    results = []
+    for request in data.get("requests") or []:
+        try:
+            claimed = hubclient.claim_review_request(
+                board.hub_urls, request["id"], token=board.hub_token
+            )
+        except hubclient.HubError as exc:
+            printer(f"skip {request['task']}: {exc}")
+            continue
+        if not claimed.get("claimed"):
+            continue
+        request = claimed.get("request") or request
+        try:
+            record = apply_review_request(board, request, agent, force=force)
+        except (AghubError, hubclient.HubError) as exc:
+            message = str(exc)
+            try:
+                hubclient.resolve_review_request(
+                    board.hub_urls,
+                    request["id"],
+                    "rejected",
+                    error=message,
+                    token=board.hub_token,
+                )
+            except hubclient.HubError:
+                pass
+            printer(f"rejected {request['task']}: {message}")
+            results.append({**request, "status": "rejected", "error": message})
+            continue
+        try:
+            hubclient.resolve_review_request(
+                board.hub_urls,
+                request["id"],
+                "applied",
+                record_id=record.get("id"),
+                token=board.hub_token,
+            )
+        except hubclient.HubError as exc:
+            printer(
+                f"applied {request['task']} but could not report it to the hub: {exc}"
+            )
+        verb = "approved" if record.get("decision") == "approved" else "requested changes on"
+        printer(
+            f"{verb} {record.get('task')} by {record.get('agent')} "
+            f"({record.get('id')})"
+        )
+        results.append({**request, "status": "applied", "record": record})
+    return results
+
+
+def watch(board, agent, once=False, interval=5, limit=50, force=False, out=None):
+    """Poll the hub for web review requests and sign them locally."""
+    printer = out or (lambda line: None)
+    while True:
+        results = apply_pending(board, agent, limit=limit, force=force, out=printer)
+        if once:
+            return results
+        if not results:
+            printer("waiting for review requests…")
+        time.sleep(max(1, interval))

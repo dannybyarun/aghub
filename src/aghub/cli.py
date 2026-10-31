@@ -195,6 +195,7 @@ def cmd_init(args):
     print(f"  check     {state.project.get('check') or '(none)'}")
     print(f"  eval ttl  {state.project.get('eval_ttl_seconds', service.EVAL_TTL_DEFAULT)}s")
     print(f"  eval sign {state.project.get('eval_attestation') or 'unsigned'}")
+    print(f"  review    {service.describe_review_policy(state)}")
     print(f"  scope     {state.project.get('scope') or '(whole repository)'}")
     print(f"  agent     {agent}")
     if not state.contracts:
@@ -309,6 +310,73 @@ def cmd_acl(args):
     raise AghubError(f"unknown acl command {args.acl_command}")
 
 
+def cmd_policy(args):
+    board = _fresh_board()
+    state = board.load()
+    agent = _resolve_agent(args, read_local_config(board.common))
+
+    if args.policy_command == "show":
+        policy = service.normalize_review_policy(state.project)
+        if args.json:
+            print(json.dumps(policy, indent=2, sort_keys=False))
+        else:
+            print(yaml.safe_dump({"review": policy}, sort_keys=False).rstrip())
+        return 0
+
+    updates = {}
+    if args.clear:
+        updates["clear"] = True
+    if args.approvals is not None:
+        updates["approvals"] = args.approvals
+    if args.no_ttl:
+        updates["clear_ttl"] = True
+    elif args.ttl is not None:
+        updates["ttl_seconds"] = args.ttl
+    if args.clear_reviewers:
+        updates["clear_reviewers"] = True
+    if args.reviewers:
+        updates["reviewers"] = args.reviewers
+    groups = {}
+    for spec in args.groups or []:
+        name, sep, members = spec.partition("=")
+        if not sep or not name.strip():
+            raise AghubError("--group needs NAME=AGENT[,AGENT...]")
+        groups[name.strip()] = [
+            member.strip() for member in members.split(",") if member.strip()
+        ]
+    if groups:
+        updates["groups"] = groups
+    if args.clear_groups:
+        updates["clear_groups"] = True
+    if args.clear_required_groups:
+        updates["clear_required_groups"] = True
+    if args.required_groups:
+        updates["required_groups"] = args.required_groups
+    github = {}
+    for spec in args.github or []:
+        login, sep, target = spec.partition("=")
+        if not sep or not login.strip() or not target.strip():
+            raise AghubError("--github needs LOGIN=AGENT")
+        github[login.strip()] = target.strip()
+    if github:
+        updates["github"] = github
+    if args.clear_github:
+        updates["clear_github"] = True
+    if not updates:
+        raise AghubError("nothing to change — pass --approvals, --ttl, --group, ...")
+
+    policy = board.transaction(
+        "review policy",
+        lambda current: service.set_review_policy(current, updates, agent),
+        agent=agent,
+    )
+    if args.json:
+        print(json.dumps(policy, indent=2, sort_keys=False))
+    else:
+        print(yaml.safe_dump({"review": policy}, sort_keys=False).rstrip())
+    return 0
+
+
 def _review_key(board, state, agent):
     if service.eval_attestation_mode(state) == service.EVAL_ED25519_SCHEME:
         return ensure_local_agent_key(board.common, agent)
@@ -343,15 +411,17 @@ def _record_review(
     force=False,
     source=None,
     external_id=None,
+    reviewer=None,
+    github_login=None,
 ):
     """Record an approval or a changes-requested review under the local key."""
     state = board.load()
     key = _review_key(board, state, agent)
-    reviewer = service.approve if decision == "approved" else service.request_changes
+    reviewer_fn = service.approve if decision == "approved" else service.request_changes
     label = "approve" if decision == "approved" else "request changes"
     return board.transaction(
         f"{label} {task_id}",
-        lambda current: reviewer(
+        lambda current: reviewer_fn(
             current,
             task_id,
             agent,
@@ -362,6 +432,8 @@ def _record_review(
             force=force,
             source=source,
             external_id=external_id,
+            reviewer=reviewer,
+            github_login=github_login,
         ),
         agent=agent,
     )
@@ -408,6 +480,25 @@ def cmd_review(args):
     board = _fresh_board()
     state = board.load()
     agent = _resolve_agent(args, read_local_config(board.common))
+
+    if args.watch:
+        if args.task:
+            raise AghubError("`review --watch` does not take a task id")
+        results = review.watch(
+            board,
+            agent,
+            once=args.once,
+            interval=args.interval,
+            limit=args.limit,
+            force=args.force,
+            out=(None if args.json else (lambda line: print(line, flush=True))),
+        )
+        if args.json:
+            print(json.dumps(results, indent=2, sort_keys=False))
+        return 0
+
+    if not args.task:
+        raise AghubError("review needs a task id (or --watch for web requests)")
     task = state.tasks.get(args.task)
     if task is None:
         raise AghubError(f"unknown task {args.task}")
@@ -426,6 +517,8 @@ def cmd_review(args):
             commit,
             args.force,
         )
+        if args.publish:
+            review.publish_packet(board, board.load(), args.task)
         if args.json:
             print(json.dumps(record, indent=2, sort_keys=False))
         else:
@@ -436,6 +529,15 @@ def cmd_review(args):
         return 0
 
     packet = review.review_packet(board, state, args.task, include_diff=args.diff)
+    if args.publish:
+        result = review.publish_packet(board, state, args.task)
+        if result:
+            print(
+                f"published review packet for {args.task} at "
+                f"{board.hub}/?project={packet['project']}"
+            )
+        elif not board.hub:
+            raise AghubError("not connected to a hub — run `aghub hub connect <url>`")
     if args.json:
         print(json.dumps(packet, indent=2, sort_keys=False))
     else:
@@ -926,6 +1028,10 @@ def cmd_task(args):
                 args.evals,
                 require_sandbox=args.requires_sandbox,
                 requires_approval=args.requires_approval,
+                required_approvals=args.required_approvals,
+                review_groups=args.review_groups,
+                reviewers=args.reviewers,
+                review_ttl=args.review_ttl,
             ),
             agent=agent,
         )
@@ -933,6 +1039,8 @@ def cmd_task(args):
         print(f"  paths  {', '.join(task['paths']) or '(none — submit will reject unclaimed paths)'}")
         if task.get("evals"):
             print(f"  evals  {', '.join(task['evals'])}")
+        if task.get("requires_approval"):
+            print(f"  review {service.describe_task_review_policy(state, task)}")
         return 0
     if args.task_command == "show":
         task = state.tasks.get(args.task)
@@ -1358,6 +1466,10 @@ def cmd_submit(args):
         agent=agent,
     )
     print(f"queued {entry['id']} for {args.task} on {branch} (position {position})")
+    if board.hub:
+        from . import review
+
+        review.publish_packet(board, board.load(), args.task)
     print("next: aghub queue run   # on the integration machine")
     return 0
 
@@ -1543,17 +1655,19 @@ def cmd_github(args):
                 note = f"GitHub review by {review_info.get('login') or '?'}"
                 if review_info.get("body"):
                     note += f": {review_info['body']}"
+                signer = args.reviewer_agent or agent
+                login = review_info.get("login") or ""
+                reviewer = service.github_reviewer(state, login) or signer
                 if args.dry_run:
                     print(
                         f"would record {decision} for {task['id']} from "
-                        f"{review_info.get('login') or '?'}",
+                        f"{login or '?'} as {reviewer}",
                         file=sys.stderr,
                     )
                 else:
-                    reviewer_agent = args.reviewer_agent or agent
                     recorded = _record_review(
                         board,
-                        reviewer_agent,
+                        signer,
                         task["id"],
                         decision,
                         note,
@@ -1561,11 +1675,18 @@ def cmd_github(args):
                         False,
                         source="github",
                         external_id=external_id,
+                        reviewer=reviewer,
+                        github_login=login or None,
                     )
                     state = board.load()
+                    via = (
+                        f" (reviewer {reviewer})"
+                        if reviewer and reviewer != signer
+                        else ""
+                    )
                     log(
                         f"recorded GitHub {review_info['state']} from "
-                        f"{review_info.get('login') or '?'} as {reviewer_agent}"
+                        f"{review_info.get('login') or '?'} as {signer}{via}"
                     )
 
     packet = review.review_packet(board, state, task["id"])
@@ -1934,6 +2055,54 @@ def build_parser():
     acl_revoke.add_argument("--key-id", default=None)
     acl.set_defaults(func=cmd_acl)
 
+    policy = sub.add_parser(
+        "policy", help="review policy: approvals, groups, expiry, GitHub identities"
+    )
+    policy_sub = policy.add_subparsers(dest="policy_command", required=True)
+    policy_show = policy_sub.add_parser("show")
+    policy_show.add_argument("--json", action="store_true")
+    policy_set = policy_sub.add_parser("set")
+    policy_set.add_argument("--approvals", type=int, help="distinct approvals required (default 1)")
+    policy_set.add_argument(
+        "--ttl", type=int, default=None, help="approval lifetime in seconds (0 clears it)"
+    )
+    policy_set.add_argument("--no-ttl", action="store_true", help="approvals never expire")
+    policy_set.add_argument(
+        "--reviewer",
+        dest="reviewers",
+        action="append",
+        default=[],
+        help="add an agent to the reviewer allowlist (repeatable)",
+    )
+    policy_set.add_argument(
+        "--group",
+        dest="groups",
+        action="append",
+        default=[],
+        help="define NAME=AGENT[,AGENT...]; an empty list deletes the group",
+    )
+    policy_set.add_argument(
+        "--require-group",
+        dest="required_groups",
+        action="append",
+        default=[],
+        help="require at least one approval from this group (repeatable)",
+    )
+    policy_set.add_argument(
+        "--github",
+        dest="github",
+        action="append",
+        default=[],
+        help="map LOGIN=AGENT for GitHub pull-request reviews (repeatable)",
+    )
+    policy_set.add_argument("--clear-reviewers", action="store_true")
+    policy_set.add_argument("--clear-groups", action="store_true")
+    policy_set.add_argument("--clear-required-groups", action="store_true")
+    policy_set.add_argument("--clear-github", action="store_true")
+    policy_set.add_argument("--clear", action="store_true", help="reset the whole review policy")
+    policy_set.add_argument("--json", action="store_true")
+    policy.set_defaults(func=cmd_policy)
+
     evaluation = sub.add_parser(
         "eval", help="run evals locally and publish the scorecard"
     )
@@ -2002,7 +2171,7 @@ def build_parser():
     inbox.set_defaults(func=cmd_inbox)
 
     review = sub.add_parser("review", help="inspect a task and record a human review")
-    review.add_argument("task")
+    review.add_argument("task", nargs="?", help="task id (omit with --watch)")
     review.add_argument("--json", action="store_true")
     review.add_argument("--diff", action="store_true", help="include the full patch")
     verdict = review.add_mutually_exclusive_group()
@@ -2012,6 +2181,25 @@ def build_parser():
     )
     review.add_argument("--note", default="")
     review.add_argument("--commit", default=None)
+    review.add_argument(
+        "--publish",
+        action="store_true",
+        help="mirror the review packet (with diff) to the connected hub",
+    )
+    review.add_argument(
+        "--watch",
+        action="store_true",
+        help="apply web review requests from the hub on this machine",
+    )
+    review.add_argument(
+        "--once", action="store_true", help="with --watch: process pending requests once"
+    )
+    review.add_argument(
+        "--interval", type=float, default=5.0, help="seconds between review polls"
+    )
+    review.add_argument(
+        "--limit", type=int, default=50, help="maximum requests per poll"
+    )
     review.add_argument(
         "--force", action="store_true", help="allow the task owner to review it"
     )
@@ -2032,6 +2220,32 @@ def build_parser():
         "--requires-approval",
         action="store_true",
         help="refuse submit/merge until a human posts an approval",
+    )
+    task_add.add_argument(
+        "--required-approvals",
+        type=int,
+        default=None,
+        help="distinct approvals required for this task (tightens the board policy)",
+    )
+    task_add.add_argument(
+        "--reviewer-group",
+        dest="review_groups",
+        action="append",
+        default=[],
+        help="require an approval from this group (repeatable)",
+    )
+    task_add.add_argument(
+        "--reviewer",
+        dest="reviewers",
+        action="append",
+        default=[],
+        help="restrict this task to an eligible reviewer (repeatable)",
+    )
+    task_add.add_argument(
+        "--review-ttl",
+        type=int,
+        default=None,
+        help="approval lifetime for this task in seconds (tightens the board policy)",
     )
     task_add.add_argument(
         "--requires-sandbox",
