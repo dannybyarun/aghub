@@ -99,6 +99,42 @@ It starts a hub, connects two clones, shows a lease being granted, and proves
 that a hub-only lease can reject a claim the git board knows nothing about.
 Open the printed URL to watch the board.
 
+### Scale and swarms
+
+The two-agent story is the smallest useful example, not a limit. To see the
+contention curve, launch a swarm:
+
+```bash
+./demo/run_swarm.sh                 # 10 agents, 10 disjoint lanes
+SWARM_AGENTS=20 ./demo/run_swarm.sh # 20 agents, same protocol
+```
+
+The demo creates one clone per agent, launches every claim in the same instant,
+then launches every submit, reports the board retries each phase needed, and
+merges all branches through the serial queue. On the development machine used
+for this repository, 10 agents completed 10/10 claims in about 11s, 10/10
+submits in about 24s, and 10/10 merges in about 7s, with 88 retried board writes
+in total. A 20-agent run still completed 20/20 in every phase, but claims took
+about 54s, submits about 110s, and the whole run about 190s with 380 retries:
+roughly 4.5x the wall-clock time for 2x the concurrent writers.
+
+The important bound is not an agent-count setting; there isn't one. Parallelism
+comes from disjoint task paths, and the board ref is the write lock:
+
+- Each agent has its own clone and board worktree, so file appends do not
+  collide, but every transaction still competes to advance `aghub/board`.
+- A rejected push discards the local commit, re-fetches the board, re-runs the
+  mutation, and retries with randomized exponential backoff.
+- `AGHUB_BOARD_ATTEMPTS` sets the retry budget (default 24).
+- `AGHUB_TRACE_BOARD=1` prints each retry to stderr, which is how the demo
+  counts contention.
+
+At 10 agents the retry path is routine. At 20 simultaneous writers retries rise
+sharply and wall-clock time grows superlinearly; this is the current practical
+ceiling of the git-board write model. A larger swarm needs batched board writes
+or a distributed writer lease, not merely a larger agent count. The hub and
+merge queue are not the first bottleneck at this scale.
+
 ## Concepts
 
 ### The board is an orphan branch
@@ -670,7 +706,8 @@ bin/aghub              entrypoint
 src/aghub/             board, service, review, github, codegen, render, sandbox, hub, client, MCP, SDK, CI, CLI
 demo/run_demo.sh       the two-agent story
 demo/run_hub.sh        the live layer: leases, presence, web board
-tests/                 protocol, trust, codegen, hub, MCP, sandbox, and end-to-end tests
+demo/run_swarm.sh      concurrent board writes: 10 agents, disjoint lanes, serial queue
+tests/                 protocol, trust, codegen, hub, MCP, sandbox, swarm, and end-to-end tests
 ```
 
 Run tests:
@@ -696,6 +733,7 @@ and delete their own rows; still, point them at a scratch database.
 
 - **Claims are advisory in git, authoritative in the hub.** Without a hub they stop most races, not all; the queue is the backstop. With a hub, a live lease is a hard 409.
 - **Integration needs a shared remote.** `submit`/`queue run` require `origin`; local-only mode supports the board but not merging.
+- **Board writes are optimistic and bounded.** Every transaction re-fetches, re-applies, and retries a rejected board push with jittered backoff. The default budget is 24 attempts. Ten simultaneous writers are routine; 20 simultaneous writers show sharply higher retry counts and wall-clock time. Pushing beyond that needs batched board writes or a distributed writer lease, not just a bigger retry budget.
 - **Board authorization is guardrails, not a git firewall.** ACLs stop accidental reader writes through the CLI, but anyone who can force-push `aghub/board` can rewrite it. Event hashes and signatures make tampering visible; they do not make the branch immutable. Hub tokens protect the HTTP API, not git.
 - **Signatures bind records to published keys, not to people.** Private keys live outside the board, so a board writer cannot read them or mint a valid record for another agent without replacing that agent's published key. Old records stay valid until their key is revoked. The Ed25519 helper is pure Python, not constant-time, and is intended for local trusted-repo use rather than hostile co-tenants.
 - **Reviews are ordered by board time and evaluated as a policy.** Review order is the signed record's `at` timestamp, with its ULID as the tie-breaker; clock skew between reviewers can therefore reorder reviews. Approvals are counted once per reviewer identity, must match the current head, must be younger than the configured TTL, and must satisfy required groups plus the optional allowlist. The latest request-changes still blocks. Counts and expiry are policy, not diff conditions: there are no per-path approvals or approvals that only apply to a matching patch. Legacy reviews without a binding remain accepted for compatibility.
@@ -717,7 +755,8 @@ and delete their own rows; still, point them at a scratch database.
 
 ## Next
 
-1. Diff-conditioned approvals and reviewer SLAs: require a reviewer when a patch touches a protected path, or when a review has been pending too long.
-2. GitHub App path: OAuth/webhooks, fork-safe review recording, dismissed-review handling, richer check annotations, and multi-repository boards.
-3. Deeper codegen: parameter validation, auth schemes, and dialect-aware migrations.
-4. Hosted hub hardening: per-tenant isolation beyond token scopes, storage retention, and backup/restore workflows.
+1. Board write batching and a distributed writer lease so swarms beyond 20 concurrent agents do not spend most of their time retrying the board ref.
+2. Diff-conditioned approvals and reviewer SLAs: require a reviewer when a patch touches a protected path, or when a review has been pending too long.
+3. GitHub App path: OAuth/webhooks, fork-safe review recording, dismissed-review handling, richer check annotations, and multi-repository boards.
+4. Deeper codegen: parameter validation, auth schemes, and dialect-aware migrations.
+5. Hosted hub hardening: per-tenant isolation beyond token scopes, storage retention, and backup/restore workflows.

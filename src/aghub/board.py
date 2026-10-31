@@ -1,7 +1,10 @@
 import hashlib
 import json
 import os
+import random
 import secrets
+import sys
+import time
 
 import yaml
 
@@ -11,6 +14,9 @@ from .ulid import new_ulid
 from .util import age_seconds, now_iso
 
 BOARD_BRANCH = "aghub/board"
+BOARD_ATTEMPTS = max(
+    1, int(os.environ.get("AGHUB_BOARD_ATTEMPTS", "24") or 24)
+)
 
 
 def read_yaml(path, default=None):
@@ -419,6 +425,7 @@ class Board:
             hub_failover = [hub_failover]
         self.hub_failover = hub_failover or []
         self.branch = BOARD_BRANCH
+        self.retries = 0
 
     @property
     def hub_urls(self):
@@ -485,9 +492,14 @@ class Board:
         On a rejected push we discard the local commit, re-read the remote board
         and run the mutation again. Mutations must therefore be functions of the
         state passed to them, not of earlier reads.
+
+        Concurrent writers collide on the board ref, so retries are staggered
+        with randomized exponential backoff. Without the jitter every agent
+        retries in lockstep and a large swarm can exhaust the attempt budget
+        even though each individual write is valid.
         """
         last_error = None
-        for _ in range(8):
+        for attempt in range(BOARD_ATTEMPTS):
             self.sync()
             state = State(self).load()
             state.touch(agent)
@@ -509,9 +521,19 @@ class Board:
             if push.returncode == 0:
                 self._publish(state, agent)
                 return result
+            self.retries += 1
             last_error = (push.stderr or push.stdout or "").strip()
+            if os.environ.get("AGHUB_TRACE_BOARD"):
+                print(
+                    f"aghub: board retry {attempt + 1}/{BOARD_ATTEMPTS} "
+                    f"for {label}",
+                    file=sys.stderr,
+                )
+            if attempt + 1 < BOARD_ATTEMPTS:
+                delay = min(0.12, 0.005 * (2 ** min(attempt, 5)))
+                time.sleep(delay * (0.5 + random.random()))
         raise AghubError(
-            "could not update the shared board after 8 attempts"
+            f"could not update the shared board after {BOARD_ATTEMPTS} attempts"
             + (f": {last_error}" if last_error else "")
         )
 
