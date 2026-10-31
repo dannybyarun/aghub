@@ -123,6 +123,84 @@ class HubStoreTests(unittest.TestCase):
             ["lease.claim"],
         )
 
+    def test_board_lock_is_exclusive_and_reports_its_holder(self):
+        first = self.store.acquire_board_lock("p", "a", 60)
+        self.assertEqual(first["status"], 200)
+        self.assertTrue(first["acquired"])
+        self.assertFalse(first["renewed"])
+        self.assertGreaterEqual(first["fencing"], 1)
+
+        conflict = self.store.acquire_board_lock("p", "b", 60)
+        self.assertEqual(conflict["status"], 409)
+        self.assertEqual(conflict["holder"]["holder"], "a")
+        self.assertTrue(conflict["holder"]["active"])
+        self.assertIn("locked by a", conflict["error"])
+
+        status = self.store.board_lock("p")
+        self.assertEqual(status["holder"], "a")
+        self.assertEqual(status["fencing"], first["fencing"])
+        self.assertEqual(self.store.board("p")["board_lock"]["holder"], "a")
+
+        kinds = [item["type"] for item in self.store.audit("p")]
+        self.assertIn("board.lock", kinds)
+
+    def test_board_lock_renews_and_fences_stale_releases(self):
+        first = self.store.acquire_board_lock("p", "a", 60)
+        renewed = self.store.acquire_board_lock("p", "a", 60)
+        self.assertEqual(renewed["status"], 200)
+        self.assertTrue(renewed["renewed"])
+        self.assertEqual(renewed["fencing"], first["fencing"])
+
+        foreign = self.store.release_board_lock("p", "b")
+        self.assertEqual(foreign["status"], 409)
+        self.assertEqual(foreign["holder"]["holder"], "a")
+
+        stale = self.store.release_board_lock(
+            "p", "a", fencing=first["fencing"] + 1
+        )
+        self.assertEqual(stale["status"], 409)
+        self.assertIn("stale board fencing", stale["error"])
+
+        released = self.store.release_board_lock(
+            "p", "a", fencing=first["fencing"]
+        )
+        self.assertEqual(released["status"], 200)
+        self.assertTrue(released["released"])
+        self.assertFalse(self.store.board_lock("p")["active"])
+        self.assertFalse(self.store.release_board_lock("p", "a")["released"])
+
+        second = self.store.acquire_board_lock("p", "b", 60)
+        self.assertEqual(second["status"], 200)
+        self.assertGreater(second["fencing"], first["fencing"])
+        kinds = [item["type"] for item in self.store.audit("p")]
+        self.assertIn("board.unlock", kinds)
+
+    def test_expired_board_lock_can_be_taken_over(self):
+        first = self.store.acquire_board_lock("p", "a", 60)
+        self.store.conn.execute(
+            "UPDATE board_locks SET expires_at=? WHERE project=?", (ago_iso(10), "p")
+        )
+        self.store.conn.commit()
+        self.assertFalse(self.store.board_lock("p")["active"])
+
+        second = self.store.acquire_board_lock("p", "b", 60)
+        self.assertEqual(second["status"], 200)
+        self.assertEqual(second["stolen_from"], "a")
+        self.assertGreater(second["fencing"], first["fencing"])
+
+        # The old holder cannot release the new holder's lease.
+        stale = self.store.release_board_lock(
+            "p", "a", fencing=first["fencing"]
+        )
+        self.assertEqual(stale["status"], 409)
+        self.assertEqual(self.store.board_lock("p")["holder"], "b")
+
+        forced = self.store.release_board_lock("p", "a", force=True)
+        self.assertEqual(forced["status"], 200)
+        self.assertTrue(forced["released"])
+        self.assertFalse(forced["expired"])
+        self.assertFalse(self.store.board_lock("p")["active"])
+
 
 class HubHttpTests(unittest.TestCase):
     @classmethod
@@ -172,6 +250,87 @@ class HubHttpTests(unittest.TestCase):
         hubclient.claim(self.base, "p2", "T-1", "a", ["src/api/**"], 60, token="secret")
         with self.assertRaises(hubclient.HubConflict):
             hubclient.claim(self.base, "p2", "T-1", "b", ["src/web/**"], 60, token="secret")
+
+    def test_http_board_lock_conflict_and_fenced_release(self):
+        acquired = hubclient.board_lock(
+            self.base, "boardlock", "writer-a", ttl=60, token="secret"
+        )
+        self.assertTrue(acquired["acquired"])
+        status = hubclient.board_lock_status(self.base, "boardlock", token="secret")
+        self.assertEqual(status["holder"], "writer-a")
+        self.assertTrue(status["active"])
+
+        with self.assertRaises(hubclient.HubConflict) as caught:
+            hubclient.board_lock(
+                self.base, "boardlock", "writer-b", ttl=60, token="secret"
+            )
+        self.assertEqual(caught.exception.payload["holder"]["holder"], "writer-a")
+
+        with self.assertRaises(hubclient.HubConflict):
+            hubclient.board_unlock(
+                self.base,
+                "boardlock",
+                "writer-a",
+                fencing=acquired["fencing"] + 1,
+                token="secret",
+            )
+        released = hubclient.board_unlock(
+            self.base,
+            "boardlock",
+            "writer-a",
+            fencing=acquired["fencing"],
+            token="secret",
+        )
+        self.assertTrue(released["released"])
+        self.assertFalse(
+            hubclient.board_lock_status(self.base, "boardlock", token="secret")["active"]
+        )
+
+        snapshot = {"project": {"name": "boardlock"}, "tasks": []}
+        hubclient.publish(
+            self.base,
+            "boardlock",
+            snapshot,
+            token="secret",
+            fencing=acquired["fencing"],
+        )
+        second = hubclient.board_lock(
+            self.base, "boardlock", "writer-b", ttl=60, token="secret"
+        )
+        with self.assertRaises(hubclient.HubConflict) as stale:
+            hubclient.publish(
+                self.base,
+                "boardlock",
+                snapshot,
+                token="secret",
+                fencing=acquired["fencing"],
+            )
+        self.assertIn("stale board fencing", str(stale.exception))
+        hubclient.publish(
+            self.base,
+            "boardlock",
+            snapshot,
+            token="secret",
+            fencing=second["fencing"],
+        )
+
+    def test_board_lock_requires_writer_and_project_scope(self):
+        _, _, base = self._local_server(
+            token="root",
+            tokens={
+                "tenant": {"role": "writer", "projects": ["lock-tenant"]},
+                "reader": {"role": "reader", "projects": ["lock-tenant"]},
+            },
+        )
+        hubclient.board_lock(base, "lock-tenant", "a", token="tenant")
+        with self.assertRaises(hubclient.HubError) as denied:
+            hubclient.board_lock(base, "other", "a", token="tenant")
+        self.assertIn("cannot write project", str(denied.exception))
+        with self.assertRaises(hubclient.HubError) as readonly:
+            hubclient.board_lock(base, "lock-tenant", "b", token="reader")
+        self.assertIn("writer token required", str(readonly.exception))
+        status = hubclient.board_lock_status(base, "lock-tenant", token="reader")
+        self.assertEqual(status["holder"], "a")
 
     def _read_event(self, response):
         lines = []

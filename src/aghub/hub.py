@@ -76,6 +76,15 @@ CREATE TABLE IF NOT EXISTS counters (
   value INTEGER NOT NULL,
   PRIMARY KEY (project, name)
 );
+CREATE TABLE IF NOT EXISTS board_locks (
+  project TEXT PRIMARY KEY,
+  holder TEXT,
+  fencing INTEGER NOT NULL DEFAULT 0,
+  acquired_at TEXT,
+  expires_at TEXT,
+  updated_at TEXT NOT NULL,
+  reason TEXT
+);
 CREATE TABLE IF NOT EXISTS events (
   seq INTEGER PRIMARY KEY AUTOINCREMENT,
   project TEXT NOT NULL,
@@ -170,9 +179,16 @@ class HubStore:
 
     # -- snapshots -------------------------------------------------------
 
-    def publish(self, project, snapshot, actor=None):
+    def publish(self, project, snapshot, actor=None, fencing=None):
         stamp = now_iso()
         with self.lock:
+            if fencing is not None:
+                row = self.conn.execute(
+                    "SELECT fencing FROM board_locks WHERE project=?", (project,)
+                ).fetchone()
+                current = int(row["fencing"]) if row else 0
+                if int(fencing) != current:
+                    return None
             seq = self._next_seq()
             self.conn.execute(
                 """
@@ -251,6 +267,12 @@ class HubStore:
                 "updated_at": row["updated_at"],
                 "agents": agents,
                 "leases": [lease for lease in leases if lease["active"]],
+                "board_lock": self._board_lock(
+                    project,
+                    self.conn.execute(
+                        "SELECT * FROM board_locks WHERE project=?", (project,)
+                    ).fetchone(),
+                ),
             }
 
     def projects(self):
@@ -718,6 +740,195 @@ class HubStore:
             "updated_at": row["updated_at"],
         }
 
+    # -- board writer lock ------------------------------------------------
+
+    def acquire_board_lock(self, project, holder, ttl=60, force=False, actor=None):
+        """Take the project-scoped board write lease.
+
+        Git remains the durable log and the ref race remains the final
+        arbiter. This lease merely serializes the read -> mutate -> push ->
+        publish sequence so a swarm does not rebuild the same commit over and
+        over. ``fencing`` increases on every new holder and is echoed on
+        release, so a writer whose TTL expired cannot release a newer lease.
+        """
+        holder = str(holder or "").strip()
+        if not holder:
+            raise AghubError("holder is required")
+        ttl = max(1, min(int(ttl or 60), 3600))
+        stamp = now_iso()
+        with self.lock:
+            row = self.conn.execute(
+                "SELECT * FROM board_locks WHERE project=?", (project,)
+            ).fetchone()
+            active = bool(
+                row and row["holder"] and row["expires_at"] and row["expires_at"] > stamp
+            )
+            if active and row["holder"] != holder and not force:
+                return {
+                    "status": 409,
+                    "error": (
+                        f"board is locked by {row['holder']} until "
+                        f"{row['expires_at']}"
+                    ),
+                    "holder": self._board_lock(project, row),
+                }
+            if active and row["holder"] == holder:
+                expires = in_iso(ttl)
+                self.conn.execute(
+                    "UPDATE board_locks SET expires_at=?, updated_at=? WHERE project=?",
+                    (expires, stamp, project),
+                )
+                self.conn.commit()
+                return {
+                    "status": 200,
+                    "ok": True,
+                    "project": project,
+                    "holder": holder,
+                    "acquired": True,
+                    "renewed": True,
+                    "fencing": row["fencing"],
+                    "acquired_at": row["acquired_at"],
+                    "expires_at": expires,
+                    "ttl": ttl,
+                }
+            stolen_from = (
+                row["holder"] if row and row["holder"] and (not active or force) else None
+            )
+            fencing = self._next_fencing(project, "board_fencing")
+            expires = in_iso(ttl)
+            self.conn.execute(
+                """
+                INSERT INTO board_locks(
+                  project, holder, fencing, acquired_at, expires_at, updated_at, reason
+                ) VALUES(?,?,?,?,?,?,?)
+                ON CONFLICT(project) DO UPDATE SET
+                  holder=excluded.holder,
+                  fencing=excluded.fencing,
+                  acquired_at=excluded.acquired_at,
+                  expires_at=excluded.expires_at,
+                  updated_at=excluded.updated_at,
+                  reason=excluded.reason
+                """,
+                (project, holder, fencing, stamp, expires, stamp, "acquired"),
+            )
+            self._event(
+                project,
+                "board.lock",
+                {
+                    "holder": holder,
+                    "fencing": fencing,
+                    "expires_at": expires,
+                    "stolen_from": stolen_from,
+                },
+                actor=actor,
+            )
+            self.conn.commit()
+            return {
+                "status": 200,
+                "ok": True,
+                "project": project,
+                "holder": holder,
+                "acquired": True,
+                "renewed": False,
+                "fencing": fencing,
+                "acquired_at": stamp,
+                "expires_at": expires,
+                "ttl": ttl,
+                "stolen_from": stolen_from,
+            }
+
+    def release_board_lock(
+        self, project, holder, fencing=None, force=False, actor=None
+    ):
+        holder = str(holder or "").strip()
+        if fencing is not None:
+            try:
+                fencing = int(fencing)
+            except (TypeError, ValueError):
+                raise AghubError("fencing must be an integer")
+        stamp = now_iso()
+        with self.lock:
+            row = self.conn.execute(
+                "SELECT * FROM board_locks WHERE project=?", (project,)
+            ).fetchone()
+            if row is None or not row["holder"]:
+                return {"status": 200, "ok": True, "released": False}
+            if not force:
+                if row["holder"] != holder:
+                    return {
+                        "status": 409,
+                        "error": f"board is locked by {row['holder']}",
+                        "holder": self._board_lock(project, row),
+                    }
+                if fencing is not None and fencing != int(row["fencing"]):
+                    return {
+                        "status": 409,
+                        "error": (
+                            "stale board fencing token; the lease was taken over"
+                        ),
+                        "holder": self._board_lock(project, row),
+                    }
+            expired = not row["expires_at"] or row["expires_at"] <= stamp
+            self.conn.execute(
+                """
+                UPDATE board_locks SET holder=NULL, expires_at=?, updated_at=?,
+                  reason=?
+                WHERE project=?
+                """,
+                (stamp, stamp, "released", project),
+            )
+            self._event(
+                project,
+                "board.unlock",
+                {
+                    "holder": row["holder"],
+                    "fencing": row["fencing"],
+                    "expired": expired,
+                },
+                actor=actor,
+            )
+            self.conn.commit()
+            return {
+                "status": 200,
+                "ok": True,
+                "released": True,
+                "holder": row["holder"],
+                "fencing": row["fencing"],
+                "expired": expired,
+            }
+
+    def board_lock(self, project):
+        with self.lock:
+            row = self.conn.execute(
+                "SELECT * FROM board_locks WHERE project=?", (project,)
+            ).fetchone()
+            return self._board_lock(project, row)
+
+    @staticmethod
+    def _board_lock(project, row):
+        stamp = now_iso()
+        if row is None:
+            return {
+                "project": project,
+                "holder": None,
+                "active": False,
+                "fencing": 0,
+                "acquired_at": None,
+                "expires_at": None,
+                "updated_at": None,
+                "reason": None,
+            }
+        return {
+            "project": project,
+            "holder": row["holder"],
+            "active": bool(row["holder"] and row["expires_at"] and row["expires_at"] > stamp),
+            "fencing": row["fencing"],
+            "acquired_at": row["acquired_at"],
+            "expires_at": row["expires_at"],
+            "updated_at": row["updated_at"],
+            "reason": row["reason"],
+        }
+
     # -- presence --------------------------------------------------------
 
     def heartbeat(self, project, agent, task=None, branch=None, machine=None, ttl=None):
@@ -871,25 +1082,30 @@ class HubStore:
                 "SELECT COUNT(*) FROM leases WHERE expires_at > ?", (stamp,)
             ).fetchone()[0]
             agents = self.conn.execute("SELECT COUNT(*) FROM agents").fetchone()[0]
+            board_locks = self.conn.execute(
+                "SELECT COUNT(*) FROM board_locks WHERE holder IS NOT NULL AND expires_at > ?",
+                (stamp,),
+            ).fetchone()[0]
         return {
             "ok": True,
             "version": __version__,
             "backend": "sqlite",
             "projects": projects,
             "live_leases": leases,
+            "board_locks": board_locks,
             "agents": agents,
         }
 
     # -- internals -------------------------------------------------------
 
-    def _next_fencing(self, project):
+    def _next_fencing(self, project, name="fencing"):
         row = self.conn.execute(
-            "SELECT value FROM counters WHERE project=? AND name='fencing'", (project,)
+            "SELECT value FROM counters WHERE project=? AND name=?", (project, name)
         ).fetchone()
         value = (row["value"] if row else 0) + 1
         self.conn.execute(
-            "INSERT OR REPLACE INTO counters(project, name, value) VALUES(?, 'fencing', ?)",
-            (project, value),
+            "INSERT OR REPLACE INTO counters(project, name, value) VALUES(?, ?, ?)",
+            (project, name, value),
         )
         return value
 
@@ -1042,6 +1258,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._review_packets(query, identity)
         if path == "/api/review/packet":
             return self._review_packet(query, identity)
+        if path == "/api/board/lock":
+            if not project:
+                return self._json(400, {"error": "project is required"})
+            return self._json(200, self.server.store.board_lock(project))
         if path == "/api/board":
             data = self.server.store.board(project)
             if data is None:
@@ -1261,6 +1481,38 @@ class Handler(BaseHTTPRequestHandler):
         allowed = identity.get("projects")
         if project and allowed is not None and project not in allowed:
             return self._json(403, {"error": f"token cannot write project {project}"})
+        if path == "/api/board/lock":
+            project = body.get("project")
+            holder = body.get("holder") or body.get("agent") or identity.get("actor")
+            if not project:
+                raise AghubError("project is required")
+            if not holder:
+                raise AghubError("holder is required")
+            result = store.acquire_board_lock(
+                project,
+                holder,
+                body.get("ttl") or 60,
+                bool(body.get("force")),
+                actor=identity.get("actor"),
+            )
+            return self._json(result.pop("status"), result)
+
+        if path == "/api/board/unlock":
+            project = body.get("project")
+            holder = body.get("holder") or body.get("agent") or identity.get("actor")
+            if not project:
+                raise AghubError("project is required")
+            if not holder:
+                raise AghubError("holder is required")
+            result = store.release_board_lock(
+                project,
+                holder,
+                fencing=body.get("fencing"),
+                force=bool(body.get("force")),
+                actor=identity.get("actor"),
+            )
+            return self._json(result.pop("status"), result)
+
         if path == "/api/snapshot":
             snapshot = body.get("snapshot")
             if not isinstance(snapshot, dict):
@@ -1268,7 +1520,27 @@ class Handler(BaseHTTPRequestHandler):
             project = body.get("project") or (snapshot.get("project") or {}).get("name")
             if not project:
                 raise AghubError("project is required")
-            stamp = store.publish(project, snapshot, actor=identity.get("actor"))
+            fencing = body.get("fencing")
+            if fencing is not None:
+                try:
+                    fencing = int(fencing)
+                except (TypeError, ValueError):
+                    raise AghubError("fencing must be an integer")
+            stamp = store.publish(
+                project,
+                snapshot,
+                actor=identity.get("actor"),
+                fencing=fencing,
+            )
+            if stamp is None:
+                current = store.board_lock(project)
+                return self._json(
+                    409,
+                    {
+                        "error": "stale board fencing token; snapshot rejected",
+                        "holder": current,
+                    },
+                )
             return self._json(200, {"ok": True, "project": project, "updated_at": stamp})
 
         if path == "/api/review/packet":

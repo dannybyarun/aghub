@@ -4,7 +4,7 @@
 
 Two agents, two clones, one project. One takes the backend, one takes the frontend. Neither sends a message. They read a board, claim a lane, build against a frozen contract, and hand off in writing.
 
-This is a working vertical slice of that protocol: the board, claims, contracts, handoffs, codegen from frozen contracts, a serial merge queue that turns failures into trace-carrying tasks, locally signed and sandboxed evals, hash-chained board history, project ACLs, human review inboxes and approval gates with board-wide reviewer policy, a web review workspace, a GitHub pull-request bridge, an MCP server and Python SDK, and a hub that arbitrates live leases and serves a web board.
+This is a working vertical slice of that protocol: the board, claims, contracts, handoffs, codegen from frozen contracts, a serial merge queue that turns failures into trace-carrying tasks, locally signed and sandboxed evals, hash-chained board history, project ACLs, human review inboxes and approval gates with board-wide reviewer policy, a web review workspace, a GitHub pull-request bridge, an MCP server and Python SDK, and a hub that arbitrates live leases, serializes board writes with a TTL-bounded writer lease, and serves a web board.
 
 ```
 $ aghub status
@@ -38,7 +38,7 @@ Chat does not fix this. It is nondeterministic, expensive in context, and leaves
 - **A merge queue** is the single authority that turns parallel branches into a serial trunk.
 - **Signed history + reviews** let humans and other agents verify what happened, request changes, and stop high-risk merges.
 
-Claims are advisory at write time (fast, works offline, catches most races). The queue is authoritative at merge time (path check + contract check + serial merge). That split is deliberate: you cannot make git leases truly authoritative across machines without a leader, so don't pretend — enforce at integration. With a hub, live leases become authoritative at write time too.
+Claims are advisory at write time (fast, works offline, catches most races). The queue is authoritative at merge time (path check + contract check + serial merge). That split is deliberate: you cannot make git leases truly authoritative across machines without a leader, so don't pretend — enforce at integration. With a hub, live leases become authoritative at write time too, and the hub's writer lease serializes board transactions without becoming the durable record.
 
 ## Quick start
 
@@ -101,39 +101,54 @@ Open the printed URL to watch the board.
 
 ### Scale and swarms
 
-The two-agent story is the smallest useful example, not a limit. To see the
-contention curve, launch a swarm:
+The two-agent story is the smallest useful example, not a limit. The swarm
+demo creates one clone per agent, starts a local hub, launches every claim at
+the same instant, then launches every submit, and merges all branches through
+the serial queue:
 
 ```bash
-./demo/run_swarm.sh                 # 10 agents, 10 disjoint lanes
-SWARM_AGENTS=20 ./demo/run_swarm.sh # 20 agents, same protocol
+./demo/run_swarm.sh                  # 10 agents
+SWARM_AGENTS=20 ./demo/run_swarm.sh  # 20 agents
+SWARM_AGENTS=50 ./demo/run_swarm.sh  # 50 agents
+SWARM_HUB=0 ./demo/run_swarm.sh      # optimistic fallback, no hub
 ```
 
-The demo creates one clone per agent, launches every claim in the same instant,
-then launches every submit, reports the board retries each phase needed, and
-merges all branches through the serial queue. On the development machine used
-for this repository, 10 agents completed 10/10 claims in about 11s, 10/10
-submits in about 24s, and 10/10 merges in about 7s, with 88 retried board writes
-in total. A 20-agent run still completed 20/20 in every phase, but claims took
-about 54s, submits about 110s, and the whole run about 190s with 380 retries:
-roughly 4.5x the wall-clock time for 2x the concurrent writers.
+Every board transaction takes a project-scoped writer lease from the hub, so
+concurrent writers queue instead of rebuilding the same board commit. The
+`aghub/board` ref remains the final arbiter, and an unreachable hub falls back
+to the original optimistic retry path.
 
-The important bound is not an agent-count setting; there isn't one. Parallelism
-comes from disjoint task paths, and the board ref is the write lock:
+| agents | claims | submits | queue | total | lease waits | retries |
+|---|---|---|---|---|---|---|
+| 10 | 22.44s | 48.66s | 23.65s | 94.75s | 18 | 0 |
+| 20 | 23.56s | 41.45s | 104.84s | 169.85s | 38 | 0 |
+| 50 | 116.86s | 163.57s | 176.10s | 456.53s | 97 | 0 |
+
+The lease turns contention into queue time: every phase completed, and the
+board needed no retry. Wall-clock time is from a shared development host and
+moves with load, especially the serial merge phase; the wait and retry counts
+are the stable signal. Before the lease, the same 10-agent demo produced 88
+retried board writes and the 20-agent run produced 380. Both lease runs
+produced zero.
+
+The bound is not an agent-count setting; there isn't one. Parallelism comes
+from disjoint task paths, and the writer lease serializes only the board
+transaction:
 
 - Each agent has its own clone and board worktree, so file appends do not
-  collide, but every transaction still competes to advance `aghub/board`.
-- A rejected push discards the local commit, re-fetches the board, re-runs the
-  mutation, and retries with randomized exponential backoff.
+  collide, but every transaction still advances `aghub/board` under one lease.
+- `AGHUB_BOARD_LOCK=0` disables the lease and restores optimistic retries.
+- `AGHUB_BOARD_LOCK_TTL` sets the lease TTL in seconds (default 60). A holder
+  that overruns it can be overtaken; fencing rejects its stale snapshot.
+- `AGHUB_BOARD_LOCK_WAIT` bounds how long a writer waits before falling back
+  to optimistic retries (default 180; the swarm demo uses 300).
 - `AGHUB_BOARD_ATTEMPTS` sets the retry budget (default 24).
-- `AGHUB_TRACE_BOARD=1` prints each retry to stderr, which is how the demo
-  counts contention.
+- `AGHUB_TRACE_BOARD=1` prints each lease wait and retry to stderr.
 
-At 10 agents the retry path is routine. At 20 simultaneous writers retries rise
-sharply and wall-clock time grows superlinearly; this is the current practical
-ceiling of the git-board write model. A larger swarm needs batched board writes
-or a distributed writer lease, not merely a larger agent count. The hub and
-merge queue are not the first bottleneck at this scale.
+At 50 agents the run is still one serialized board writer at a time. The lease
+removes duplicate work and retry storms, but it does not make one git ref
+parallel. Very large swarms still need batched board writes or independent
+boards.
 
 ## Concepts
 
@@ -198,6 +213,7 @@ aghub hub status
 ```
 
 - **Leases are authoritative at write time.** `claim` asks the hub first. A 409 aborts the claim; a grant carries a fencing token that increases on every lease. Heartbeats extend the lease.
+- **Board writes can take a writer lease.** When a hub is configured, every `Board.transaction` acquires a project-scoped, TTL-bounded writer lease before it fetches, mutates, pushes and publishes. The lease carries a fencing token, is released in a `finally` block, and a stale token cannot publish a snapshot. A busy lease is waited on; an unreachable hub falls back to the original optimistic retry loop.
 - **Presence is live.** Every board transaction publishes a snapshot and a heartbeat. `status` overlays hub presence and prints `· hub live` or `· hub offline`.
 - **The web board never touches git.** `GET /` is a self-contained page: ready / in-flight / blocked lanes, agents, live leases, evals, dependency/fix graph, contracts and their latest diff, merge queue, a review workspace with inline diffs and queued approve / request-changes intents, handoffs, a replay scrubber, and a multi-project overview. It consumes `/api/events` over server-sent events, resumes with `Last-Event-ID`, and falls back to polling `/api/board` every 3s if the stream drops.
 - **An outage degrades, it does not block.** The first unreachable hub produces one warning, then claims continue git-only. A reachable hub that returns 409 is always obeyed.
@@ -254,12 +270,15 @@ Non-admin tokens can export only their own actor; asking for another actor retur
 | `GET /api/health` | open liveness/version probe |
 | `GET /api/projects` | published projects, latest first |
 | `GET /api/overview` | aggregate task/queue/eval counts across projects |
-| `GET /api/board?project=NAME` | snapshot + live agents + active leases |
+| `GET /api/board?project=NAME` | snapshot + live agents + active leases + writer lease |
+| `GET /api/board/lock?project=NAME` | board writer lease status and current holder |
+| `POST /api/board/lock` | acquire/renew the project board writer lease (409 if held) |
+| `POST /api/board/unlock` | release the writer lease; stale fencing is rejected |
 | `GET /api/events?project=NAME` | server-sent board updates (SSE; `Last-Event-ID` replays) |
 | `GET /api/history?project=NAME&after=SEQ&limit=N` | bounded board history (max 100) |
 | `GET /api/audit?project=NAME&after=SEQ&limit=N&actor=NAME` | hub operation audit log (admin token) |
 | `GET /api/audit/export?format=jsonl\|csv&actor=NAME&project=NAME&after=SEQ&limit=N` | per-token audit export (JSONL/CSV) |
-| `POST /api/snapshot` | publish a board snapshot |
+| `POST /api/snapshot` | publish a board snapshot (optional `fencing` rejects a stale writer) |
 | `POST /api/heartbeat` | presence + lease extension |
 | `POST /api/claim` | acquire a lease (409 on conflict) |
 | `POST /api/release` | release a lease |
@@ -706,7 +725,7 @@ bin/aghub              entrypoint
 src/aghub/             board, service, review, github, codegen, render, sandbox, hub, client, MCP, SDK, CI, CLI
 demo/run_demo.sh       the two-agent story
 demo/run_hub.sh        the live layer: leases, presence, web board
-demo/run_swarm.sh      concurrent board writes: 10 agents, disjoint lanes, serial queue
+demo/run_swarm.sh      concurrent board writes: hub writer lease, N agents, serial queue
 tests/                 protocol, trust, codegen, hub, MCP, sandbox, swarm, and end-to-end tests
 ```
 
@@ -725,15 +744,16 @@ AGHUB_TEST_POSTGRES_DSN='postgresql://postgres@127.0.0.1:5432/aghub_test' \
   python3 -m unittest tests.test_postgres -v
 ```
 
-They cover store and HTTP behavior, a two-connection claim race, and concurrent
-first startup against an empty schema. The tests use uniquely named projects
-and delete their own rows; still, point them at a scratch database.
+They cover store and HTTP behavior, claim and board-writer-lock races, and
+concurrent first startup against an empty schema. The tests use uniquely named
+projects and delete their own rows; still, point them at a scratch database.
 
 ## Known limits (on purpose)
 
 - **Claims are advisory in git, authoritative in the hub.** Without a hub they stop most races, not all; the queue is the backstop. With a hub, a live lease is a hard 409.
 - **Integration needs a shared remote.** `submit`/`queue run` require `origin`; local-only mode supports the board but not merging.
-- **Board writes are optimistic and bounded.** Every transaction re-fetches, re-applies, and retries a rejected board push with jittered backoff. The default budget is 24 attempts. Ten simultaneous writers are routine; 20 simultaneous writers show sharply higher retry counts and wall-clock time. Pushing beyond that needs batched board writes or a distributed writer lease, not just a bigger retry budget.
+- **Board writes use a hub lease when available, optimistic retries otherwise.** A configured hub grants one short, project-scoped writer lease at a time; the lease has a TTL and a fencing token, and is released in a `finally` block. `AGHUB_BOARD_LOCK=0` disables the lease, `AGHUB_BOARD_LOCK_TTL` sets its TTL in seconds (default 60), and `AGHUB_BOARD_LOCK_WAIT` bounds how long a writer waits before falling back (default 180). If the hub is absent or unreachable, every transaction keeps the original behavior: re-fetch, re-apply, and retry a rejected push with jittered backoff. `AGHUB_BOARD_ATTEMPTS` sets the retry budget (default 24). The lease is coordination, not correctness: the `aghub/board` ref remains the final arbiter, and a writer that overruns its TTL can still race.
+- **A writer lease serializes, it does not parallelize.** Throughput is bounded by the time each holder spends in fetch → mutate → push → publish. Very large swarms still need batched board writes or independent boards, not just a longer TTL.
 - **Board authorization is guardrails, not a git firewall.** ACLs stop accidental reader writes through the CLI, but anyone who can force-push `aghub/board` can rewrite it. Event hashes and signatures make tampering visible; they do not make the branch immutable. Hub tokens protect the HTTP API, not git.
 - **Signatures bind records to published keys, not to people.** Private keys live outside the board, so a board writer cannot read them or mint a valid record for another agent without replacing that agent's published key. Old records stay valid until their key is revoked. The Ed25519 helper is pure Python, not constant-time, and is intended for local trusted-repo use rather than hostile co-tenants.
 - **Reviews are ordered by board time and evaluated as a policy.** Review order is the signed record's `at` timestamp, with its ULID as the tie-breaker; clock skew between reviewers can therefore reorder reviews. Approvals are counted once per reviewer identity, must match the current head, must be younger than the configured TTL, and must satisfy required groups plus the optional allowlist. The latest request-changes still blocks. Counts and expiry are policy, not diff conditions: there are no per-path approvals or approvals that only apply to a matching patch. Legacy reviews without a binding remain accepted for compatibility.
@@ -741,7 +761,7 @@ and delete their own rows; still, point them at a scratch database.
 - **A review packet needs the task branch locally.** `aghub review --diff` fetches the branch from the board's remote when possible; if the owner has not pushed it yet, the packet shows the task and gate state but not a patch.
 - **Legacy and pre-key events may be unsigned.** Records created before a key exists are reported as unsigned; `verify --strict` fails on unsigned records, while chain errors and invalid signatures always fail.
 - **Live updates send full snapshots.** SSE pushes the whole board on change and keeps the last 100 per project for `Last-Event-ID` replay; there are no per-task deltas or websocket fan-out yet. A reconnect older than the window gets the oldest retained snapshot and then the current board.
-- **Postgres is optional.** The default hub is a single SQLite file. `--postgres` requires `psycopg[binary]` in the runtime environment, uses per-project advisory transaction locks for lease decisions, and serializes concurrent first startup with a schema lock; the default suite skips Postgres integration tests unless `AGHUB_TEST_POSTGRES_DSN` is set.
+- **Postgres is optional.** The default hub is a single SQLite file. `--postgres` requires `psycopg[binary]` in the runtime environment, uses per-project advisory transaction locks for claim and board-writer decisions, and serializes concurrent first startup with a schema lock; the default suite skips Postgres integration tests unless `AGHUB_TEST_POSTGRES_DSN` is set.
 - **Failover needs one authority.** A failover set must point at hubs backed by the same store (Postgres, or the same SQLite file with one writer). Two independent databases are two independent worlds: failover provides availability, not consensus.
 - **Quotas are coarse fixed windows.** `requests_per_minute` uses a per-actor counter in the shared store, not a token bucket, so a tenant can burst at a window boundary. `max_request_bytes` is checked from `Content-Length`; chunked request bodies are not accepted. A quota `429` is authoritative and is never retried against another hub.
 - **Audit export is not the signed git history.** `/api/audit/export` records hub requests and lease operations with a token actor label. Tamper evidence for tasks, contracts, handoffs, and merges still comes from `aghub verify` over the hash-chained board.
@@ -755,7 +775,7 @@ and delete their own rows; still, point them at a scratch database.
 
 ## Next
 
-1. Board write batching and a distributed writer lease so swarms beyond 20 concurrent agents do not spend most of their time retrying the board ref.
+1. Batched board writes and independent/sharded boards for swarms well beyond the serial writer-lease ceiling.
 2. Diff-conditioned approvals and reviewer SLAs: require a reviewer when a patch touches a protected path, or when a review has been pending too long.
 3. GitHub App path: OAuth/webhooks, fork-safe review recording, dismissed-review handling, richer check annotations, and multi-repository boards.
 4. Deeper codegen: parameter validation, auth schemes, and dialect-aware migrations.

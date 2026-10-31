@@ -51,6 +51,7 @@ TABLES = (
     "agents",
     "snapshots",
     "counters",
+    "board_locks",
     "events",
     "board_events",
     "review_packets",
@@ -196,6 +197,49 @@ class PostgresStoreTests(unittest.TestCase):
 
         leaves = {(item["task"], item["agent"]) for item in self.store.board(self.project)["leases"]}
         self.assertEqual(leaves, {("T-1", "a"), ("T-3", "b")})
+
+    def test_board_lock_exclusive_renew_takeover_and_fencing(self):
+        first = self.store.acquire_board_lock(self.project, "a", 60)
+        self.assertEqual(first["status"], 200)
+        self.assertFalse(first["renewed"])
+
+        conflict = self.store.acquire_board_lock(self.project, "b", 60)
+        self.assertEqual(conflict["status"], 409)
+        self.assertEqual(conflict["holder"]["holder"], "a")
+        self.assertEqual(
+            self.store.board(self.project)["board_lock"]["holder"], "a"
+        )
+
+        renewed = self.store.acquire_board_lock(self.project, "a", 60)
+        self.assertTrue(renewed["renewed"])
+        self.assertEqual(renewed["fencing"], first["fencing"])
+
+        self.store.conn.execute(
+            "UPDATE board_locks SET expires_at=%s WHERE project=%s",
+            (ago_iso(10), self.project),
+        )
+        self.store.conn.commit()
+        self.assertFalse(self.store.board_lock(self.project)["active"])
+
+        second = self.store.acquire_board_lock(self.project, "b", 60)
+        self.assertEqual(second["status"], 200)
+        self.assertEqual(second["stolen_from"], "a")
+        self.assertGreater(second["fencing"], first["fencing"])
+
+        stale = self.store.release_board_lock(
+            self.project, "a", fencing=first["fencing"]
+        )
+        self.assertEqual(stale["status"], 409)
+        self.assertEqual(self.store.board_lock(self.project)["holder"], "b")
+
+        released = self.store.release_board_lock(
+            self.project, "b", fencing=second["fencing"]
+        )
+        self.assertTrue(released["released"])
+        self.assertFalse(self.store.release_board_lock(self.project, "b")["released"])
+        kinds = {item["type"] for item in self.store.audit(self.project)}
+        self.assertIn("board.lock", kinds)
+        self.assertIn("board.unlock", kinds)
 
     def test_heartbeat_release_and_expire(self):
         self.assertEqual(
@@ -433,6 +477,49 @@ class PostgresHttpTests(unittest.TestCase):
         data = hubclient.board(self.base, self.project, token="secret")
         self.assertEqual(data["leases"], [])
 
+    def test_http_board_lock_conflict_and_release(self):
+        acquired = hubclient.board_lock(
+            self.base, self.project, "http-lock-a", ttl=60, token="secret"
+        )
+        self.assertTrue(acquired["acquired"])
+        self.assertEqual(
+            hubclient.board_lock_status(self.base, self.project, token="secret")[
+                "holder"
+            ],
+            "http-lock-a",
+        )
+        with self.assertRaises(hubclient.HubConflict):
+            hubclient.board_lock(
+                self.base, self.project, "http-lock-b", ttl=60, token="secret"
+            )
+        released = hubclient.board_unlock(
+            self.base,
+            self.project,
+            "http-lock-a",
+            fencing=acquired["fencing"],
+            token="secret",
+        )
+        self.assertTrue(released["released"])
+        second = hubclient.board_lock(
+            self.base, self.project, "http-lock-b", ttl=60, token="secret"
+        )
+        with self.assertRaises(hubclient.HubConflict) as stale:
+            hubclient.publish(
+                self.base,
+                self.project,
+                snapshot(self.project),
+                token="secret",
+                fencing=acquired["fencing"],
+            )
+        self.assertIn("stale board fencing", str(stale.exception))
+        hubclient.publish(
+            self.base,
+            self.project,
+            snapshot(self.project),
+            token="secret",
+            fencing=second["fencing"],
+        )
+
     def test_audit_export_is_pinned_to_token_actor(self):
         hubclient.publish(
             self.base, self.project, snapshot(self.project), token="secret"
@@ -522,6 +609,36 @@ class PostgresRaceTests(unittest.TestCase):
             )
             self.assertEqual(statuses, [200, 409])
             self._clear_leases()
+
+    def test_board_lock_race_grants_one_writer(self):
+        for _ in range(10):
+            barrier = threading.Barrier(2)
+            results = []
+            results_lock = threading.Lock()
+
+            def worker(holder):
+                store = PostgresStore(DSN)
+                try:
+                    barrier.wait()
+                    result = store.acquire_board_lock(self.project, holder, 60)
+                    with results_lock:
+                        results.append(result)
+                finally:
+                    store.close()
+
+            threads = [
+                threading.Thread(target=worker, args=(holder,))
+                for holder in ("a", "b")
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+            self.assertEqual(sorted(item["status"] for item in results), [200, 409])
+            self.store.conn.execute(
+                "DELETE FROM board_locks WHERE project=%s", (self.project,)
+            )
+            self.store.conn.commit()
 
 
 if __name__ == "__main__":

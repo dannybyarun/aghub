@@ -426,6 +426,7 @@ class Board:
         self.hub_failover = hub_failover or []
         self.branch = BOARD_BRANCH
         self.retries = 0
+        self.lock_waits = 0
 
     @property
     def hub_urls(self):
@@ -434,6 +435,10 @@ class Board:
             if url and url not in urls:
                 urls.append(url)
         return urls
+
+    def project_name(self):
+        project = read_yaml(os.path.join(self.dir, "project.yaml"), {}) or {}
+        return project.get("name") or "default"
 
     @classmethod
     def discover(cls, cwd=None):
@@ -486,6 +491,104 @@ class Board:
         gitops.git(["add", "-A"], cwd=self.dir)
         gitops.git(["commit", "-m", f"aghub: {label}"], cwd=self.dir)
 
+    def _board_lock_settings(self):
+        try:
+            ttl = max(5, int(os.environ.get("AGHUB_BOARD_LOCK_TTL", "60") or 60))
+        except (TypeError, ValueError):
+            ttl = 60
+        try:
+            wait = max(0.0, float(os.environ.get("AGHUB_BOARD_LOCK_WAIT", "180") or 0))
+        except (TypeError, ValueError):
+            wait = 180.0
+        return ttl, wait
+
+    def _acquire_board_lock(self, label, agent):
+        """Ask the hub for the project-scoped board write lease.
+
+        The lease is an optimization, not a correctness boundary: git still
+        arbitrates the ref, and an unreachable or absent hub immediately falls
+        back to optimistic retries. A reachable hub that says the lock is held
+        is obeyed until its TTL expires or the wait deadline passes.
+        """
+        if not self.hub_urls or os.environ.get(
+            "AGHUB_BOARD_LOCK", "1"
+        ).strip().lower() in (
+            "0",
+            "false",
+            "off",
+            "no",
+        ):
+            return None
+        from . import hubclient
+
+        project = self.project_name()
+        holder = f"{agent or 'board'}@{os.uname().nodename}:{os.getpid()}"
+        ttl, wait = self._board_lock_settings()
+        deadline = time.monotonic() + wait
+        delay = 0.05
+        warned = False
+        while True:
+            try:
+                result = hubclient.board_lock(
+                    self.hub_urls, project, holder, ttl, token=self.hub_token
+                )
+                return {
+                    "project": project,
+                    "holder": holder,
+                    "fencing": result.get("fencing"),
+                }
+            except hubclient.HubConflict as exc:
+                self.lock_waits += 1
+                if not warned:
+                    warned = True
+                    if os.environ.get("AGHUB_TRACE_BOARD"):
+                        holder_info = (exc.payload or {}).get("holder") or {}
+                        print(
+                            f"aghub: board lock busy for {label} "
+                            f"(holder {holder_info.get('holder')}); waiting",
+                            file=sys.stderr,
+                        )
+                if time.monotonic() >= deadline:
+                    hubclient.warn_once(
+                        "could not acquire the board writer lock before the wait "
+                        "deadline; continuing with optimistic board writes"
+                    )
+                    return None
+                time.sleep(min(0.75, delay) * (0.5 + random.random()))
+                delay = min(1.0, delay * 1.6)
+            except hubclient.HubError as exc:
+                if getattr(exc, "status", None) == 429:
+                    if time.monotonic() >= deadline:
+                        hubclient.warn_once(
+                            "hub is rate limiting board lock requests; continuing "
+                            "with optimistic board writes"
+                        )
+                        return None
+                    time.sleep(min(2.0, delay + 0.5))
+                    delay = min(1.0, delay * 1.6)
+                    continue
+                hubclient.warn_once(
+                    f"hub at {self.hub} is unreachable ({exc}); continuing with "
+                    "optimistic board writes"
+                )
+                return None
+
+    def _release_board_lock(self, lock):
+        if not lock:
+            return
+        from . import hubclient
+
+        try:
+            hubclient.board_unlock(
+                self.hub_urls,
+                lock["project"],
+                lock["holder"],
+                fencing=lock.get("fencing"),
+                token=self.hub_token,
+            )
+        except hubclient.HubError as exc:
+            hubclient.warn_once(f"could not release the board writer lock ({exc})")
+
     def transaction(self, label, mutate, agent=None):
         """Read the freshest board, apply `mutate`, commit and push.
 
@@ -497,45 +600,60 @@ class Board:
         with randomized exponential backoff. Without the jitter every agent
         retries in lockstep and a large swarm can exhaust the attempt budget
         even though each individual write is valid.
+
+        When a hub is configured, the whole read -> mutate -> push -> publish
+        sequence holds a project-scoped writer lease. That turns a swarm of
+        colliding writers into a short queue, while the optimistic retry loop
+        remains the fallback whenever the hub is absent or offline.
         """
-        last_error = None
-        for attempt in range(BOARD_ATTEMPTS):
-            self.sync()
-            state = State(self).load()
-            state.touch(agent)
-            result = mutate(state)
-            self._sign_events(state, agent)
-            state.save()
-            if not self._dirty():
-                self._publish(state, agent)
-                return result
-            self._commit(label)
-            if not self.remote:
-                self._publish(state, agent)
-                return result
-            push = gitops.git(
-                ["push", self.remote, f"HEAD:refs/heads/{self.branch}"],
-                cwd=self.dir,
-                check=False,
-            )
-            if push.returncode == 0:
-                self._publish(state, agent)
-                return result
-            self.retries += 1
-            last_error = (push.stderr or push.stdout or "").strip()
-            if os.environ.get("AGHUB_TRACE_BOARD"):
-                print(
-                    f"aghub: board retry {attempt + 1}/{BOARD_ATTEMPTS} "
-                    f"for {label}",
-                    file=sys.stderr,
+        lock = self._acquire_board_lock(label, agent)
+        try:
+            last_error = None
+            for attempt in range(BOARD_ATTEMPTS):
+                self.sync()
+                state = State(self).load()
+                state.touch(agent)
+                result = mutate(state)
+                self._sign_events(state, agent)
+                state.save()
+                if not self._dirty():
+                    self._publish(
+                        state, agent, lock.get("fencing") if lock else None
+                    )
+                    return result
+                self._commit(label)
+                if not self.remote:
+                    self._publish(
+                        state, agent, lock.get("fencing") if lock else None
+                    )
+                    return result
+                push = gitops.git(
+                    ["push", self.remote, f"HEAD:refs/heads/{self.branch}"],
+                    cwd=self.dir,
+                    check=False,
                 )
-            if attempt + 1 < BOARD_ATTEMPTS:
-                delay = min(0.12, 0.005 * (2 ** min(attempt, 5)))
-                time.sleep(delay * (0.5 + random.random()))
-        raise AghubError(
-            f"could not update the shared board after {BOARD_ATTEMPTS} attempts"
-            + (f": {last_error}" if last_error else "")
-        )
+                if push.returncode == 0:
+                    self._publish(
+                        state, agent, lock.get("fencing") if lock else None
+                    )
+                    return result
+                self.retries += 1
+                last_error = (push.stderr or push.stdout or "").strip()
+                if os.environ.get("AGHUB_TRACE_BOARD"):
+                    print(
+                        f"aghub: board retry {attempt + 1}/{BOARD_ATTEMPTS} "
+                        f"for {label}",
+                        file=sys.stderr,
+                    )
+                if attempt + 1 < BOARD_ATTEMPTS:
+                    delay = min(0.12, 0.005 * (2 ** min(attempt, 5)))
+                    time.sleep(delay * (0.5 + random.random()))
+            raise AghubError(
+                f"could not update the shared board after {BOARD_ATTEMPTS} attempts"
+                + (f": {last_error}" if last_error else "")
+            )
+        finally:
+            self._release_board_lock(lock)
 
     def _sign_events(self, state, agent):
         """Sign new chained events with the acting agent's local key, if any."""
@@ -556,7 +674,7 @@ class Board:
                 "signature": keys.sign(entry["private_key"], bytes.fromhex(event["hash"])),
             }
 
-    def _publish(self, state, agent):
+    def _publish(self, state, agent, fencing=None):
         """Push the live snapshot + heartbeat to the hub, best effort.
 
         The hub is a live mirror and lease authority, never the durable record,
@@ -569,7 +687,11 @@ class Board:
         project = state.project.get("name") or "default"
         try:
             hubclient.publish(
-                self.hub_urls, project, render.snapshot(state, self), self.hub_token
+                self.hub_urls,
+                project,
+                render.snapshot(state, self),
+                self.hub_token,
+                fencing=fencing,
             )
             if agent:
                 record = state.agents.get(agent) or {}
@@ -583,6 +705,10 @@ class Board:
                     self.hub_token,
                     machine=os.uname().nodename,
                 )
+        except hubclient.HubConflict as exc:
+            hubclient.warn_once(
+                f"hub rejected the board snapshot for {project}: {exc}"
+            )
         except hubclient.HubError as exc:
             hubclient.warn_once(
                 f"hub at {self.hub} is unreachable ({exc}); continuing with git-only state"

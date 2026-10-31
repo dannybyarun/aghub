@@ -9,6 +9,11 @@ from urllib.parse import quote
 class HubError(Exception):
     """The hub is unreachable or returned an error."""
 
+    def __init__(self, message, status=None, payload=None):
+        super().__init__(message)
+        self.status = status
+        self.payload = payload or {}
+
 
 class HubConflict(HubError):
     """The hub rejected a lease because someone else holds it."""
@@ -60,10 +65,10 @@ def _request_one(base, method, path, payload=None, token=None, timeout=5, raw=Fa
             detail = {}
         message = detail.get("error") or body or f"HTTP {exc.code}"
         if exc.code == 409:
-            raise HubConflict(message)
+            raise HubConflict(message, status=409, payload=detail)
         if exc.code in (502, 503, 504):
             raise _RetryableHubError(f"{exc.code}: {message}")
-        raise HubError(f"{exc.code}: {message}")
+        raise HubError(f"{exc.code}: {message}", status=exc.code, payload=detail)
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
         raise _RetryableHubError(str(getattr(exc, "reason", exc)))
 
@@ -138,6 +143,43 @@ def board(base, project=None, token=None):
     return request(base, "GET", path, token=token)
 
 
+def board_lock_status(base, project=None, token=None):
+    path = "/api/board/lock"
+    if project:
+        path += "?project=" + quote(project)
+    return request(base, "GET", path, token=token)
+
+
+def board_lock(base, project, holder, ttl=60, force=False, token=None):
+    return request(
+        base,
+        "POST",
+        "/api/board/lock",
+        {
+            "project": project,
+            "holder": holder,
+            "ttl": ttl,
+            "force": force,
+        },
+        token=token,
+    )
+
+
+def board_unlock(base, project, holder, fencing=None, force=False, token=None):
+    return request(
+        base,
+        "POST",
+        "/api/board/unlock",
+        {
+            "project": project,
+            "holder": holder,
+            "fencing": fencing,
+            "force": force,
+        },
+        token=token,
+    )
+
+
 def history(base, project=None, after=0, limit=50, token=None):
     query = f"?after={int(after)}&limit={int(limit)}"
     if project:
@@ -145,8 +187,11 @@ def history(base, project=None, after=0, limit=50, token=None):
     return request(base, "GET", "/api/history" + query, token=token)
 
 
-def publish(base, project, snapshot, token=None):
-    return request(base, "POST", "/api/snapshot", {"project": project, "snapshot": snapshot}, token=token)
+def publish(base, project, snapshot, token=None, fencing=None):
+    payload = {"project": project, "snapshot": snapshot}
+    if fencing is not None:
+        payload["fencing"] = fencing
+    return request(base, "POST", "/api/snapshot", payload, token=token)
 
 
 def publish_review_packet(base, project, task, packet, token=None):

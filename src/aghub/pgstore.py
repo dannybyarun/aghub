@@ -65,6 +65,15 @@ CREATE TABLE IF NOT EXISTS counters (
   value BIGINT NOT NULL,
   PRIMARY KEY (project, name)
 );
+CREATE TABLE IF NOT EXISTS board_locks (
+  project TEXT PRIMARY KEY,
+  holder TEXT,
+  fencing BIGINT NOT NULL DEFAULT 0,
+  acquired_at TEXT,
+  expires_at TEXT,
+  updated_at TEXT NOT NULL,
+  reason TEXT
+);
 CREATE TABLE IF NOT EXISTS events (
   seq BIGSERIAL PRIMARY KEY,
   project TEXT NOT NULL,
@@ -197,9 +206,16 @@ class PostgresStore:
             else:
                 self.conn.commit()
 
-    def publish(self, project, snapshot, actor=None):
+    def publish(self, project, snapshot, actor=None, fencing=None):
         stamp = now_iso()
-        with self.lock:
+        with self._project_transaction(project):
+            if fencing is not None:
+                row = self._fetchone(
+                    "SELECT fencing FROM board_locks WHERE project=%s", (project,)
+                )
+                current = int(row["fencing"]) if row else 0
+                if int(fencing) != current:
+                    return None
             seq = self._next_seq()
             self._write(
                 """
@@ -225,7 +241,6 @@ class PostgresStore:
                 """,
                 (project, project),
             )
-            self.conn.commit()
         return stamp
 
     def _next_seq(self):
@@ -272,6 +287,12 @@ class PostgresStore:
                 "updated_at": row["updated_at"],
                 "agents": agents,
                 "leases": [lease for lease in leases if lease["active"]],
+                "board_lock": self._board_lock(
+                    project,
+                    self._fetchone(
+                        "SELECT * FROM board_locks WHERE project=%s", (project,)
+                    ),
+                ),
             }
 
     def projects(self):
@@ -641,6 +662,184 @@ class PostgresStore:
             "updated_at": row["updated_at"],
         }
 
+    # -- board writer lock ------------------------------------------------
+
+    def acquire_board_lock(self, project, holder, ttl=60, force=False, actor=None):
+        holder = str(holder or "").strip()
+        if not holder:
+            raise AghubError("holder is required")
+        ttl = max(1, min(int(ttl or 60), 3600))
+        stamp = now_iso()
+        with self._project_transaction(project):
+            row = self._fetchone(
+                "SELECT * FROM board_locks WHERE project=%s", (project,)
+            )
+            active = bool(
+                row and row["holder"] and row["expires_at"] and row["expires_at"] > stamp
+            )
+            if active and row["holder"] != holder and not force:
+                return {
+                    "status": 409,
+                    "error": (
+                        f"board is locked by {row['holder']} until "
+                        f"{row['expires_at']}"
+                    ),
+                    "holder": self._board_lock(project, row),
+                }
+            if active and row["holder"] == holder:
+                expires = in_iso(ttl)
+                self._write(
+                    "UPDATE board_locks SET expires_at=%s, updated_at=%s WHERE project=%s",
+                    (expires, stamp, project),
+                )
+                return {
+                    "status": 200,
+                    "ok": True,
+                    "project": project,
+                    "holder": holder,
+                    "acquired": True,
+                    "renewed": True,
+                    "fencing": row["fencing"],
+                    "acquired_at": row["acquired_at"],
+                    "expires_at": expires,
+                    "ttl": ttl,
+                }
+            stolen_from = (
+                row["holder"] if row and row["holder"] and (not active or force) else None
+            )
+            fencing = self._next_fencing(project, "board_fencing")
+            expires = in_iso(ttl)
+            self._write(
+                """
+                INSERT INTO board_locks(
+                  project, holder, fencing, acquired_at, expires_at, updated_at, reason
+                ) VALUES(%s,%s,%s,%s,%s,%s,%s)
+                ON CONFLICT(project) DO UPDATE SET
+                  holder=excluded.holder,
+                  fencing=excluded.fencing,
+                  acquired_at=excluded.acquired_at,
+                  expires_at=excluded.expires_at,
+                  updated_at=excluded.updated_at,
+                  reason=excluded.reason
+                """,
+                (project, holder, fencing, stamp, expires, stamp, "acquired"),
+            )
+            self._event(
+                project,
+                "board.lock",
+                {
+                    "holder": holder,
+                    "fencing": fencing,
+                    "expires_at": expires,
+                    "stolen_from": stolen_from,
+                },
+                actor=actor,
+            )
+            return {
+                "status": 200,
+                "ok": True,
+                "project": project,
+                "holder": holder,
+                "acquired": True,
+                "renewed": False,
+                "fencing": fencing,
+                "acquired_at": stamp,
+                "expires_at": expires,
+                "ttl": ttl,
+                "stolen_from": stolen_from,
+            }
+
+    def release_board_lock(
+        self, project, holder, fencing=None, force=False, actor=None
+    ):
+        holder = str(holder or "").strip()
+        if fencing is not None:
+            try:
+                fencing = int(fencing)
+            except (TypeError, ValueError):
+                raise AghubError("fencing must be an integer")
+        stamp = now_iso()
+        with self._project_transaction(project):
+            row = self._fetchone(
+                "SELECT * FROM board_locks WHERE project=%s", (project,)
+            )
+            if row is None or not row["holder"]:
+                return {"status": 200, "ok": True, "released": False}
+            if not force:
+                if row["holder"] != holder:
+                    return {
+                        "status": 409,
+                        "error": f"board is locked by {row['holder']}",
+                        "holder": self._board_lock(project, row),
+                    }
+                if fencing is not None and fencing != int(row["fencing"]):
+                    return {
+                        "status": 409,
+                        "error": (
+                            "stale board fencing token; the lease was taken over"
+                        ),
+                        "holder": self._board_lock(project, row),
+                    }
+            expired = not row["expires_at"] or row["expires_at"] <= stamp
+            self._write(
+                """
+                UPDATE board_locks SET holder=NULL, expires_at=%s, updated_at=%s,
+                  reason=%s
+                WHERE project=%s
+                """,
+                (stamp, stamp, "released", project),
+            )
+            self._event(
+                project,
+                "board.unlock",
+                {
+                    "holder": row["holder"],
+                    "fencing": row["fencing"],
+                    "expired": expired,
+                },
+                actor=actor,
+            )
+            return {
+                "status": 200,
+                "ok": True,
+                "released": True,
+                "holder": row["holder"],
+                "fencing": row["fencing"],
+                "expired": expired,
+            }
+
+    def board_lock(self, project):
+        with self.lock:
+            row = self._fetchone(
+                "SELECT * FROM board_locks WHERE project=%s", (project,)
+            )
+            return self._board_lock(project, row)
+
+    @staticmethod
+    def _board_lock(project, row):
+        stamp = now_iso()
+        if row is None:
+            return {
+                "project": project,
+                "holder": None,
+                "active": False,
+                "fencing": 0,
+                "acquired_at": None,
+                "expires_at": None,
+                "updated_at": None,
+                "reason": None,
+            }
+        return {
+            "project": project,
+            "holder": row["holder"],
+            "active": bool(row["holder"] and row["expires_at"] and row["expires_at"] > stamp),
+            "fencing": row["fencing"],
+            "acquired_at": row["acquired_at"],
+            "expires_at": row["expires_at"],
+            "updated_at": row["updated_at"],
+            "reason": row["reason"],
+        }
+
     def heartbeat(self, project, agent, task=None, branch=None, machine=None, ttl=None):
         stamp = now_iso()
         with self._project_transaction(project):
@@ -819,27 +1018,38 @@ class PostgresStore:
             agents = int(
                 (self._fetchone("SELECT COUNT(*) AS n FROM agents") or {"n": 0})["n"]
             )
+            board_locks = int(
+                (
+                    self._fetchone(
+                        "SELECT COUNT(*) AS n FROM board_locks "
+                        "WHERE holder IS NOT NULL AND expires_at > %s",
+                        (stamp,),
+                    )
+                    or {"n": 0}
+                )["n"]
+            )
         return {
             "ok": True,
             "version": __import__("aghub").__version__,
             "projects": projects,
             "live_leases": leases,
+            "board_locks": board_locks,
             "agents": agents,
             "backend": "postgres",
         }
 
-    def _next_fencing(self, project):
+    def _next_fencing(self, project, name="fencing"):
         row = self._fetchone(
-            "SELECT value FROM counters WHERE project=%s AND name='fencing'",
-            (project,),
+            "SELECT value FROM counters WHERE project=%s AND name=%s",
+            (project, name),
         )
         value = (int(row["value"]) if row else 0) + 1
         self._write(
             """
-            INSERT INTO counters(project, name, value) VALUES(%s, 'fencing', %s)
+            INSERT INTO counters(project, name, value) VALUES(%s, %s, %s)
             ON CONFLICT(project, name) DO UPDATE SET value=excluded.value
             """,
-            (project, value),
+            (project, name, value),
         )
         return value
 
