@@ -148,8 +148,55 @@ transaction:
 
 At 50 agents the run is still one serialized board writer at a time. The lease
 removes duplicate work and retry storms, but it does not make one git ref
-parallel. Very large swarms still need batched board writes or independent
-boards.
+parallel. Two tools push past that ceiling: **batched writes** collapse many
+mutations into one transaction, and **independent board shards** give disjoint
+work its own ref so writers never contend.
+
+#### Batched board writes
+
+`aghub task import` adds many tasks under a single fetch → mutate → push cycle
+(and a single writer-lease acquisition) instead of one transaction each. Seeding
+a plan of fifty tasks becomes one board commit, not fifty.
+
+```bash
+aghub task import plan.yaml      # a YAML/JSON list of task specs
+cat plan.json | aghub task import -
+```
+
+```yaml
+# plan.yaml
+- title: Auth API
+  paths: [src/api/**]
+  contract: [api@1]
+  requires_approval: true
+- title: Web UI
+  paths: [src/web/**]
+```
+
+The same primitive is available programmatically as `Board.batch(label,
+mutations, agent)` and `Agent.add_tasks(specs)` in the SDK. A rejected push
+replays the whole batch, so every mutation must stay a pure function of the
+state it is handed — exactly like a single transaction.
+
+#### Independent board shards
+
+For work that never needs to merge through one trunk-ordering authority, give it
+its own board. A shard is a fully independent board on its own ref
+(`aghub/board-<name>`) and worktree, sharing only the repository's remote and
+hub configuration:
+
+```bash
+aghub --shard web init --project store-web      # create the shard
+aghub --shard web task add "Ship cart" --paths 'web/**'
+aghub --shard web status                        # target it on any command
+AGHUB_SHARD=web aghub next                       # or via the environment
+aghub boards                                    # list the default board + shards
+```
+
+Each shard advances its own ref, so two shards never collide on a write and need
+no shared lease. Writers only queue against others on the *same* shard. Shards
+are independent worlds, not a consensus layer: there is no cross-shard ordering,
+so split work along boundaries that genuinely do not need to integrate together.
 
 ## Concepts
 
@@ -771,6 +818,8 @@ reimplemented or bypassed.
 | `aghub acl init\|list\|set\|remove\|revoke-key` | manage roles and key revocation |
 | `aghub policy show [--json]` / `policy set [--approvals N] [--ttl S] [--sla S] [--reviewer A] [--group NAME=A,B] [--require-group NAME] [--protect 'GLOB[,GLOB]:group=NAME,reviewer=A,approvals=N'] [--github LOGIN=AGENT] [--clear]` | board-wide reviewer policy |
 | `aghub task add TITLE --paths GLOB [--contract api@1] [--eval smoke] [--depends T-001] [--requires-approval] [--required-approvals N] [--reviewer-group NAME] [--reviewer A] [--review-ttl S] [--review-sla S] [--requires-sandbox]` | define work |
+| `aghub task import FILE` | add many tasks in one board write (YAML/JSON list, or `-` for stdin) |
+| `aghub --shard NAME init --project P` / `aghub --shard NAME <command>` / `aghub boards` | create and target independent board shards; list boards |
 | `aghub task show TASK` | full task YAML, including any failure trace |
 | `aghub approve TASK [--note TEXT] [--commit SHA] [--force]` | legacy alias for `review --approve` |
 | `aghub inbox [--json] [--check]` | pending approvals, requested changes, failed queue entries, stale leases |
@@ -840,7 +889,7 @@ projects and delete their own rows; still, point them at a scratch database.
 - **Claims are advisory in git, authoritative in the hub.** Without a hub they stop most races, not all; the queue is the backstop. With a hub, a live lease is a hard 409.
 - **Integration needs a shared remote.** `submit`/`queue run` require `origin`; local-only mode supports the board but not merging.
 - **Board writes use a hub lease when available, optimistic retries otherwise.** A configured hub grants one short, project-scoped writer lease at a time; the lease has a TTL and a fencing token, and is released in a `finally` block. `AGHUB_BOARD_LOCK=0` disables the lease, `AGHUB_BOARD_LOCK_TTL` sets its TTL in seconds (default 60), and `AGHUB_BOARD_LOCK_WAIT` bounds how long a writer waits before falling back (default 180). If the hub is absent or unreachable, every transaction keeps the original behavior: re-fetch, re-apply, and retry a rejected push with jittered backoff. `AGHUB_BOARD_ATTEMPTS` sets the retry budget (default 24). The lease is coordination, not correctness: the `aghub/board` ref remains the final arbiter, and a writer that overruns its TTL can still race.
-- **A writer lease serializes, it does not parallelize.** Throughput is bounded by the time each holder spends in fetch → mutate → push → publish. Very large swarms still need batched board writes or independent boards, not just a longer TTL.
+- **A writer lease serializes, it does not parallelize.** Throughput is bounded by the time each holder spends in fetch → mutate → push → publish. Batch many mutations into one transaction with `aghub task import` / `Board.batch`, or split work onto independent board shards (`aghub --shard <name> init`); a longer TTL alone does not raise the ceiling. Shards are independent worlds with no cross-shard ordering, so only split work that does not need to integrate through one trunk.
 - **Board authorization is guardrails, not a git firewall.** ACLs stop accidental reader writes through the CLI, but anyone who can force-push `aghub/board` can rewrite it. Event hashes and signatures make tampering visible; they do not make the branch immutable. Hub tokens protect the HTTP API, not git.
 - **Signatures bind records to published keys, not to people.** Private keys live outside the board, so a board writer cannot read them or mint a valid record for another agent without replacing that agent's published key. Old records stay valid until their key is revoked. The Ed25519 helper is pure Python, not constant-time, and is intended for local trusted-repo use rather than hostile co-tenants.
 - **Reviews are ordered by board time and evaluated as a policy.** Review order is the signed record's `at` timestamp, with its ULID as the tie-breaker; clock skew between reviewers can therefore reorder reviews. Approvals are counted once per reviewer identity, must match the current head, must be younger than the configured TTL, and must satisfy required groups plus the optional allowlist. The latest request-changes still blocks. Legacy reviews without a binding remain accepted for compatibility.
@@ -863,8 +912,8 @@ projects and delete their own rows; still, point them at a scratch database.
 
 ## Next
 
-1. Batched board writes and independent/sharded boards for swarms well beyond the serial writer-lease ceiling.
-2. GitHub App path: OAuth/webhooks, fork-safe review recording, dismissed-review handling, richer check annotations, and multi-repository boards.
-3. Deeper codegen: parameter validation, auth schemes, and dialect-aware migrations.
-4. Hosted hub hardening: per-tenant isolation beyond token scopes, storage retention, and backup/restore workflows.
+1. GitHub App path: OAuth/webhooks, fork-safe review recording, dismissed-review handling, richer check annotations, and multi-repository boards.
+2. Deeper codegen: parameter validation, auth schemes, and dialect-aware migrations.
+3. Hosted hub hardening: per-tenant isolation beyond token scopes, storage retention, and backup/restore workflows.
+4. Cross-shard views: a read-only aggregate over several board shards for a single pane of glass.
 5. Surface protected-path decisions on the GitHub check and reviewer-SLA escalation (auto-request a backup reviewer when a review goes overdue).

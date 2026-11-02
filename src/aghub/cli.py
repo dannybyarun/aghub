@@ -12,9 +12,11 @@ import yaml
 from . import codegen, gitops, hubclient, keys, render, sandbox, service
 from .board import (
     Board,
+    board_entries,
     ensure_local_agent_key,
     init_board,
     read_local_config,
+    read_yaml,
     write_local_config,
 )
 from .errors import AghubError
@@ -172,6 +174,7 @@ def cmd_init(args):
     if not args.no_remote and remote is None and gitops.has_remote(repo, "origin"):
         remote = "origin"
     agent = _resolve_agent(args, None)
+    shard = getattr(args, "shard", None) or os.environ.get("AGHUB_SHARD") or None
     board = init_board(
         repo,
         args.project,
@@ -185,11 +188,13 @@ def cmd_init(args):
         check_timeout=args.check_timeout,
         require_eval_sandbox=args.require_eval_sandbox,
         scope=args.scope,
+        shard=shard,
     )
     config = read_local_config(board.common)
     config["agent"] = agent
     write_local_config(board.common, config)
-    print(f'board {board.branch} ready for "{args.project}"')
+    label = f'shard "{slug(shard)}"' if shard else "board"
+    print(f'{label} {board.branch} ready for "{args.project}"')
     print(f"  worktree  {board.dir}")
     print(f"  remote    {remote or '(local only)'}")
     state = board.load()
@@ -1067,6 +1072,69 @@ def cmd_next(args):
     return 0
 
 
+def _load_task_specs(path):
+    if path == "-":
+        raw = sys.stdin.read()
+    else:
+        with open(os.path.expanduser(path), "r", encoding="utf-8") as handle:
+            raw = handle.read()
+    data = yaml.safe_load(raw)
+    if isinstance(data, dict) and "tasks" in data:
+        data = data["tasks"]
+    if not isinstance(data, list):
+        raise AghubError(
+            "task import expects a YAML/JSON list of task specs "
+            "(or a mapping with a top-level `tasks:` list)"
+        )
+    return data
+
+
+def _spec_add(spec, agent):
+    if not isinstance(spec, dict) or not spec.get("title"):
+        raise AghubError("each imported task needs at least a `title`")
+    return lambda state: service.add_task(
+        state,
+        spec["title"],
+        spec.get("paths") or [],
+        spec.get("contract") or spec.get("contracts") or [],
+        spec.get("depends") or spec.get("depends_on") or [],
+        spec.get("acceptance") or "",
+        agent,
+        spec.get("evals") or [],
+        require_sandbox=bool(spec.get("requires_sandbox")),
+        requires_approval=bool(spec.get("requires_approval")),
+        required_approvals=spec.get("required_approvals"),
+        review_groups=spec.get("review_groups") or spec.get("reviewer_groups") or [],
+        reviewers=spec.get("reviewers") or [],
+        review_ttl=spec.get("review_ttl"),
+        review_sla=spec.get("review_sla"),
+    )
+
+
+def cmd_boards(args):
+    repo = gitops.repo_root()
+    common = gitops.common_dir(repo)
+    if not read_local_config(common):
+        raise AghubError("aghub is not initialized here — run `aghub init --project <name>`")
+    rows = []
+    for entry in board_entries(common):
+        worktree = os.path.join(common, entry["worktree"])
+        head = gitops.short(worktree, "HEAD") if os.path.isdir(worktree) else None
+        project = (read_yaml(os.path.join(worktree, "project.yaml"), {}) or {}).get("name")
+        rows.append({**entry, "head": head, "project": project})
+    if args.json:
+        print(json.dumps(rows, indent=2))
+        return 0
+    print(f"boards ({len(rows)})")
+    for row in rows:
+        tag = " *" if row["default"] else "  "
+        print(
+            f" {tag} {row['name']:<12} {row['branch']:<22} "
+            f"{row.get('project') or '-':<16} {row.get('head') or '-'}"
+        )
+    return 0
+
+
 def cmd_task(args):
     board = _fresh_board()
     state = board.load()
@@ -1099,6 +1167,18 @@ def cmd_task(args):
             print(f"  evals  {', '.join(task['evals'])}")
         if task.get("requires_approval"):
             print(f"  review {service.describe_task_review_policy(state, task)}")
+        return 0
+    if args.task_command == "import":
+        specs = _load_task_specs(args.file)
+        if not specs:
+            raise AghubError("no tasks to import")
+        mutations = [_spec_add(spec, agent) for spec in specs]
+        tasks = board.batch(
+            f"import {len(mutations)} task(s)", mutations, agent=agent
+        )
+        for task in tasks:
+            print(f"added {task['id']} {task['title']}")
+        print(f"imported {len(tasks)} task(s) in one board write")
         return 0
     if args.task_command == "show":
         task = state.tasks.get(args.task)
@@ -2166,6 +2246,11 @@ def build_parser():
         description="A shared board so parallel coding agents can work without talking to each other.",
     )
     parser.add_argument("--agent", help="agent identity (default: $AGHUB_AGENT or local config)")
+    parser.add_argument(
+        "--shard",
+        default=None,
+        help="target an independent board shard (default: $AGHUB_SHARD or the default board)",
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
     init = sub.add_parser("init", help="create the shared board in this repository")
@@ -2472,7 +2557,15 @@ def build_parser():
     task_sub.add_parser("list")
     task_show = task_sub.add_parser("show")
     task_show.add_argument("task")
+    task_import = task_sub.add_parser(
+        "import", help="add many tasks in one board write (YAML/JSON list, or - for stdin)"
+    )
+    task_import.add_argument("file", help="path to a task-spec list, or - to read stdin")
     task.set_defaults(func=cmd_task)
+
+    boards = sub.add_parser("boards", help="list the default board and any shards")
+    boards.add_argument("--json", action="store_true")
+    boards.set_defaults(func=cmd_boards)
 
     contract = sub.add_parser("contract", help="freeze interfaces before parallel work")
     contract_sub = contract.add_subparsers(dest="contract_command", required=True)
@@ -2763,6 +2856,8 @@ def build_parser():
 def main(argv=None):
     parser = build_parser()
     args = parser.parse_args(argv)
+    if getattr(args, "shard", None):
+        os.environ["AGHUB_SHARD"] = args.shard
     if args.command == "board":
         args.for_agent = None
     try:
