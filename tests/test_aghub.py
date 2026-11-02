@@ -143,6 +143,64 @@ class AghubTestCase(unittest.TestCase):
         self.assertIn("T-001", proc.stdout)
         self.assertIn("T-002", proc.stdout)
 
+    def test_task_import_is_one_board_write(self):
+        w = self.world
+        self.bootstrap()
+        board_dir = Path(w.fe) / ".git" / "aghub-board"
+        before = len(git(board_dir, "log", "--oneline").stdout.splitlines())
+        specs = (
+            "- title: Import A\n  paths: [src/a/**]\n"
+            "- title: Import B\n  paths: [src/b/**]\n"
+            "- title: Import C\n  paths: [src/c/**]\n  requires_approval: true\n"
+        )
+        (Path(w.fe) / "tasks.yaml").write_text(specs)
+        out = w.aghub("fe", "task", "import", "tasks.yaml", agent="fe-1")
+        self.assertIn("imported 3 task(s)", out.stdout)
+        listed = w.aghub("fe", "task", "list", agent="fe-1").stdout
+        for task_id in ("T-003", "T-004", "T-005"):
+            self.assertIn(task_id, listed)
+        after = len(git(board_dir, "log", "--oneline").stdout.splitlines())
+        self.assertEqual(after - before, 1, "import should be a single board commit")
+        self.assertIn("import 3 task(s)", git(board_dir, "log", "-1", "--format=%s").stdout)
+
+    def test_sharded_boards_are_independent(self):
+        w = self.world
+        self.bootstrap()
+        created = w.aghub(
+            "fe", "init", "--project", "test-web", "--check", "true",
+            agent="fe-1", env={"AGHUB_SHARD": "web"},
+        )
+        self.assertIn("shard", created.stdout)
+        w.aghub(
+            "fe", "task", "add", "Shard task", "--paths", "src/web/**",
+            agent="fe-1", env={"AGHUB_SHARD": "web"},
+        )
+        default_list = w.aghub("fe", "task", "list", agent="fe-1").stdout
+        self.assertNotIn("Shard task", default_list)
+        web_list = w.aghub(
+            "fe", "task", "list", agent="fe-1", env={"AGHUB_SHARD": "web"}
+        ).stdout
+        self.assertIn("Shard task", web_list)
+        boards = json.loads(w.aghub("fe", "boards", "--json", agent="fe-1").stdout)
+        by_name = {board["name"]: board for board in boards}
+        self.assertEqual(set(by_name), {"default", "web"})
+        self.assertEqual(by_name["web"]["branch"], "aghub/board-web")
+        self.assertEqual(by_name["web"]["project"], "test-web")
+
+    def test_shard_init_requires_a_default_board_and_rejects_duplicates(self):
+        w = self.world
+        self.bootstrap()
+        w.aghub(
+            "fe", "init", "--project", "p-web", "--check", "true",
+            agent="fe-1", env={"AGHUB_SHARD": "web"},
+        )
+        dup = w.aghub(
+            "fe", "init", "--project", "p-web", "--check", "true",
+            agent="fe-1", env={"AGHUB_SHARD": "web"}, check=False,
+        )
+        self.assertEqual(dup.returncode, 1)
+        self.assertIn("already exists", dup.stderr)
+
     def test_live_claim_cannot_be_stolen(self):
         self.bootstrap()
         self.world.aghub("fe", "claim", "T-001", agent="fe-1")
@@ -1449,6 +1507,72 @@ class AghubTestCase(unittest.TestCase):
         self.assertIn("older commit", payload["check"]["output"]["summary"])
 
         w.aghub("be", "submit", "T-003", agent="be-1")
+
+    def test_github_dismissed_review_retracts_the_approval(self):
+        w = self.world
+        self.bootstrap()
+        w.aghub(
+            "fe", "task", "add", "Ship API", "--paths", "src/api/**",
+            "--requires-approval", agent="fe-1",
+        )
+        w.aghub("fe", "policy", "set", "--github", "alice=fe-1", agent="fe-1")
+        w.aghub("be", "claim", "T-003", agent="be-1")
+        branch = "agent/be-1/T-003"
+        git(w.be, "checkout", "-q", branch)
+        w.commit_file("be", "src/api/items.py", "print('ok')\n", "api")
+        git(w.be, "push", "-qu", "origin", branch)
+        head = git(w.be, "rev-parse", "HEAD").stdout.strip()
+
+        def write_event(action, state="approved"):
+            event = {
+                "action": action,
+                "number": 7,
+                "repository": {"full_name": "acme/repo"},
+                "pull_request": {
+                    "number": 7,
+                    "title": "Ship API",
+                    "body": "",
+                    "html_url": "https://github.com/acme/repo/pull/7",
+                    "draft": False,
+                    "user": {"login": "alice"},
+                    "head": {"ref": branch, "sha": head, "repo": {"full_name": "acme/repo"}},
+                    "base": {"ref": "main", "repo": {"full_name": "acme/repo"}},
+                },
+                "review": {
+                    "id": 9001,
+                    "state": state,
+                    "commit_id": head,
+                    "user": {"login": "alice"},
+                    "author_association": "MEMBER",
+                    "body": "ship it",
+                },
+            }
+            path = Path(w.base) / "ev.json"
+            path.write_text(json.dumps(event))
+            return str(path)
+
+        # Record the approval, then confirm the gate is satisfied.
+        w.aghub(
+            "fe", "github", "sync", "--event", write_event("submitted"),
+            "--record-reviews", "--reviewer-agent", "github-review",
+            "--no-comment", "--no-check", agent="fe-1",
+        )
+        packet = json.loads(w.aghub("fe", "review", "T-003", "--json", agent="fe-1").stdout)
+        self.assertTrue(packet["approval"]["satisfied"])
+
+        # Dismiss the same review; the approval should stop counting.
+        dismissed = w.aghub(
+            "fe", "github", "sync", "--event", write_event("dismissed"),
+            "--record-reviews", "--reviewer-agent", "github-review",
+            "--no-comment", "--no-check", agent="fe-1",
+        )
+        self.assertIn("dismissal of review 9001", dismissed.stdout)
+        packet = json.loads(w.aghub("fe", "review", "T-003", "--json", agent="fe-1").stdout)
+        self.assertFalse(packet["approval"]["satisfied"])
+        self.assertEqual(len(packet["approval"]["dismissed"]), 1)
+
+        gated = w.aghub("be", "submit", "T-003", agent="be-1", check=False)
+        self.assertEqual(gated.returncode, 1)
 
     def test_github_webhook_records_review_from_signed_fixture(self):
         w = self.world

@@ -148,8 +148,55 @@ transaction:
 
 At 50 agents the run is still one serialized board writer at a time. The lease
 removes duplicate work and retry storms, but it does not make one git ref
-parallel. Very large swarms still need batched board writes or independent
-boards.
+parallel. Two tools push past that ceiling: **batched writes** collapse many
+mutations into one transaction, and **independent board shards** give disjoint
+work its own ref so writers never contend.
+
+#### Batched board writes
+
+`aghub task import` adds many tasks under a single fetch → mutate → push cycle
+(and a single writer-lease acquisition) instead of one transaction each. Seeding
+a plan of fifty tasks becomes one board commit, not fifty.
+
+```bash
+aghub task import plan.yaml      # a YAML/JSON list of task specs
+cat plan.json | aghub task import -
+```
+
+```yaml
+# plan.yaml
+- title: Auth API
+  paths: [src/api/**]
+  contract: [api@1]
+  requires_approval: true
+- title: Web UI
+  paths: [src/web/**]
+```
+
+The same primitive is available programmatically as `Board.batch(label,
+mutations, agent)` and `Agent.add_tasks(specs)` in the SDK. A rejected push
+replays the whole batch, so every mutation must stay a pure function of the
+state it is handed — exactly like a single transaction.
+
+#### Independent board shards
+
+For work that never needs to merge through one trunk-ordering authority, give it
+its own board. A shard is a fully independent board on its own ref
+(`aghub/board-<name>`) and worktree, sharing only the repository's remote and
+hub configuration:
+
+```bash
+aghub --shard web init --project store-web      # create the shard
+aghub --shard web task add "Ship cart" --paths 'web/**'
+aghub --shard web status                        # target it on any command
+AGHUB_SHARD=web aghub next                       # or via the environment
+aghub boards                                    # list the default board + shards
+```
+
+Each shard advances its own ref, so two shards never collide on a write and need
+no shared lease. Writers only queue against others on the *same* shard. Shards
+are independent worlds, not a consensus layer: there is no cross-shard ordering,
+so split work along boundaries that genuinely do not need to integrate together.
 
 ## Concepts
 
@@ -464,7 +511,7 @@ The diff reports routes, operations (with changed fields), and schema/property c
 
 ```bash
 aghub codegen api 1 --out generated
-aghub codegen api 1 --out generated --target sql
+aghub codegen api 1 --out generated --target sql --dialect sqlite
 aghub codegen api 1 --out generated --check   # CI gate: fail on drift
 ```
 
@@ -473,17 +520,21 @@ lanes get the same bytes for the same `name@version`.
 
 | File | Contents |
 |---|---|
-| `<name>.ts` | route literals, operation keys, schema types, and a typed `ContractClient` |
-| `<name>.py` | route tuple, operation map, dataclasses, raw schema map, and a stdlib `Client` |
-| `<name>_mock.py` | standalone stdlib mock server with CORS and example responses |
-| `<name>.sql` | starting Postgres migration inferred from component schemas |
-| `manifest.json` | contract id, sha256, routes, operations, generated files |
+| `<name>.ts` | route literals, operation keys, schema types, parameter/security metadata, and a typed `ContractClient` that attaches auth and validates parameters |
+| `<name>.py` | route tuple, operation map, dataclasses, raw schema map, and a stdlib `Client` that attaches auth and validates parameters |
+| `<name>_mock.py` | standalone stdlib mock server with CORS, example responses, parameter validation (`400`), and auth enforcement (`401`) |
+| `<name>.sql` | starting migration inferred from component schemas, in the chosen `--dialect` |
+| `manifest.json` | contract id, sha256, dialect, security schemes, routes, and operations with their parameters and required schemes |
 
 ```bash
 python3 generated/api_mock.py --port 4010
 ```
 
-The generator covers the pragmatic OpenAPI subset this protocol needs: `paths`, HTTP methods, `operationId`, `components.schemas` / Swagger `definitions`, `$ref`, arrays, enums, unions, examples, and the common scalar formats. It is deliberately not a full OpenAPI compiler, and the SQL file is a reviewable starting point — not a live schema diff.
+The generator covers the pragmatic OpenAPI subset this protocol needs: `paths`, HTTP methods, `operationId`, `components.schemas` / Swagger `definitions`, `$ref`, arrays, enums, unions, examples, and the common scalar formats. It also reads **parameters** (path/query/header, with `required` and `enum`) and **security schemes** (`http` bearer/basic and `apiKey` in header or query, plus Swagger 2 `securityDefinitions`), threading both into the clients and the mock. The SQL migration is **dialect-aware** — `--dialect postgres` (default), `sqlite`, or `mysql` — and is a reviewable starting point, not a live schema diff.
+
+<b>Parameter validation.</b> The generated clients and mock reject a request that omits a required parameter or sends a value outside a declared `enum`. The clients raise before the request leaves the process; the mock answers `400`. Only runtime-checkable constraints are enforced — `required` and `enum` — not full JSON Schema.
+
+<b>Auth schemes.</b> The clients accept a bearer token, an API key, or basic credentials and attach whatever the contract's schemes declare (an `Authorization` header, a custom header, or a query parameter). The mock returns `401` when an operation's security is non-empty and no matching credential is present; an operation with `security: []` is always public.
 
 ### The registry is the board; evals run locally
 
@@ -719,6 +770,29 @@ App key, so review attribution still comes from the board. `ping` deliveries
 are acknowledged, oversized payloads are rejected (2 MiB by default), and
 `GET /healthz` is available for a liveness probe.
 
+A single webhook worker serves **every repository the App is installed on**: the
+repo is read from each delivery's payload, so the comment and check are published
+back to the originating repo. Leave `--repo` unset to let the payload decide, or
+pass it to pin one repository.
+
+<b>Fork-safe recording.</b> A review is bound to the exact commit the reviewer
+approved — the review's own `commit_id`, falling back to the PR head SHA — so a
+fork's head cannot be swapped under an approval. Fork PRs (head repo ≠ the PR's
+base repo) are still refused unless `--allow-fork-reviews` is set, and the
+association allowlist always applies.
+
+<b>Dismissed reviews.</b> A `pull_request_review` delivery with action
+`dismissed` records an append-only dismissal that retracts that specific GitHub
+review by id. `submit`, `queue run`, the inbox, the comment, and the check all
+stop counting a dismissed approval, so a dismissal re-opens the gate until a
+fresh approval lands. Dismissing the same review twice is idempotent.
+
+<b>Richer checks.</b> When the queue rejects a branch for touching files outside
+its claim or project scope, or for conflicting with trunk, the check attaches
+file-level annotations naming those exact files (GitHub shows them inline on the
+Files tab). The check summary also reports dismissed reviews, an overdue
+reviewer SLA, and any unmet protected-path rule.
+
 For deployment smoke tests or replaying a captured delivery:
 
 ```bash
@@ -793,6 +867,8 @@ reimplemented or bypassed.
 | `aghub acl init\|list\|set\|remove\|revoke-key` | manage roles and key revocation |
 | `aghub policy show [--json]` / `policy set [--approvals N] [--ttl S] [--sla S] [--reviewer A] [--group NAME=A,B] [--require-group NAME] [--protect 'GLOB[,GLOB]:group=NAME,reviewer=A,approvals=N'] [--github LOGIN=AGENT] [--clear]` | board-wide reviewer policy |
 | `aghub task add TITLE --paths GLOB [--contract api@1] [--eval smoke] [--depends T-001] [--requires-approval] [--required-approvals N] [--reviewer-group NAME] [--reviewer A] [--review-ttl S] [--review-sla S] [--requires-sandbox]` | define work |
+| `aghub task import FILE` | add many tasks in one board write (YAML/JSON list, or `-` for stdin) |
+| `aghub --shard NAME init --project P` / `aghub --shard NAME <command>` / `aghub boards` | create and target independent board shards; list boards |
 | `aghub task show TASK` | full task YAML, including any failure trace |
 | `aghub approve TASK [--note TEXT] [--commit SHA] [--force]` | legacy alias for `review --approve` |
 | `aghub inbox [--json] [--check]` | pending approvals, requested changes, failed queue entries, stale leases |
@@ -806,7 +882,7 @@ reimplemented or bypassed.
 | `aghub eval list [--agent ID] [--suite NAME]` / `eval show ID` | inspect scorecards |
 | `aghub contract draft/freeze/show/list` | pin interfaces |
 | `aghub contract diff NAME [OLD] [NEW] [--json]` | compare two frozen versions |
-| `aghub codegen NAME [VERSION] [--out DIR] [--target all\|ts\|py\|mock\|sql] [--check]` | generate from a frozen contract |
+| `aghub codegen NAME [VERSION] [--out DIR] [--target all\|ts\|py\|mock\|sql] [--dialect postgres\|sqlite\|mysql] [--check]` | generate from a frozen contract |
 | `aghub claim TASK [--steal] [--force] [--worktree [PATH]]` | take task + path lease + branch (+ isolated checkout) |
 | `aghub heartbeat` | refresh the lease |
 | `aghub handoff TASK --next TEXT [--done]` | write the signed async delta |
@@ -863,12 +939,12 @@ projects and delete their own rows; still, point them at a scratch database.
 - **Claims are advisory in git, authoritative in the hub.** Without a hub they stop most races, not all; the queue is the backstop. With a hub, a live lease is a hard 409.
 - **Integration needs a shared remote.** `submit`/`queue run` require `origin`; local-only mode supports the board but not merging.
 - **Board writes use a hub lease when available, optimistic retries otherwise.** A configured hub grants one short, project-scoped writer lease at a time; the lease has a TTL and a fencing token, and is released in a `finally` block. `AGHUB_BOARD_LOCK=0` disables the lease, `AGHUB_BOARD_LOCK_TTL` sets its TTL in seconds (default 60), and `AGHUB_BOARD_LOCK_WAIT` bounds how long a writer waits before falling back (default 180). If the hub is absent or unreachable, every transaction keeps the original behavior: re-fetch, re-apply, and retry a rejected push with jittered backoff. `AGHUB_BOARD_ATTEMPTS` sets the retry budget (default 24). The lease is coordination, not correctness: the `aghub/board` ref remains the final arbiter, and a writer that overruns its TTL can still race.
-- **A writer lease serializes, it does not parallelize.** Throughput is bounded by the time each holder spends in fetch → mutate → push → publish. Very large swarms still need batched board writes or independent boards, not just a longer TTL.
+- **A writer lease serializes, it does not parallelize.** Throughput is bounded by the time each holder spends in fetch → mutate → push → publish. Batch many mutations into one transaction with `aghub task import` / `Board.batch`, or split work onto independent board shards (`aghub --shard <name> init`); a longer TTL alone does not raise the ceiling. Shards are independent worlds with no cross-shard ordering, so only split work that does not need to integrate through one trunk.
 - **Board authorization is guardrails, not a git firewall.** ACLs stop accidental reader writes through the CLI, but anyone who can force-push `aghub/board` can rewrite it. Event hashes and signatures make tampering visible; they do not make the branch immutable. Hub tokens protect the HTTP API, not git.
 - **Signatures bind records to published keys, not to people.** Private keys live outside the board, so a board writer cannot read them or mint a valid record for another agent without replacing that agent's published key. Old records stay valid until their key is revoked. The Ed25519 helper is pure Python, not constant-time, and is intended for local trusted-repo use rather than hostile co-tenants.
 - **Reviews are ordered by board time and evaluated as a policy.** Review order is the signed record's `at` timestamp, with its ULID as the tie-breaker; clock skew between reviewers can therefore reorder reviews. Approvals are counted once per reviewer identity, must match the current head, must be younger than the configured TTL, and must satisfy required groups plus the optional allowlist. The latest request-changes still blocks. Legacy reviews without a binding remain accepted for compatibility.
 - **Protected-path rules need the diff, so they are authoritative only at the queue.** A `review.protected_paths` rule adds a group, reviewer, or higher approval count when the branch diff matches its globs. The gate can only evaluate a rule once it knows the changed files, so the inbox (which does not fetch a per-task diff) treats rules as pending, the review packet evaluates the branch it has already fetched, and `queue run` re-derives the diff against trunk and enforces. Protected approval counts fold into the same `max(board, task, protected)` count; a reviewer SLA breach is surfaced as **overdue** but never blocks a merge on its own.
-- **The GitHub bridge has two trust boundaries: Actions or a local App worker.** The generated workflow runs on the events it subscribes to, needs a same-repository PR by default, publishes one sticky comment and one `aghub/review` check, and records only GitHub `APPROVED` / `CHANGES_REQUESTED` reviews. The App path mints an installation token from a local private key and can receive signed webhooks; the receiver must run on a trusted clone because it writes the board, and the hub still never holds the App key. Fork PRs are skipped by default and fork approvals are refused unless explicitly allowed. Dismissed or commented reviews are not treated as decisions, and the workflow identity must be an admin when ACLs are enabled. Reviewer groups and counts see the mapped board identity (`review.github`), not the GitHub login itself. The bundled RSA signer is pure Python (not constant-time) and is intended for a trusted local process, like the Ed25519 helper.
+- **The GitHub bridge has two trust boundaries: Actions or a local App worker.** The generated workflow runs on the events it subscribes to, needs a same-repository PR by default, publishes one sticky comment and one `aghub/review` check, and records only GitHub `APPROVED` / `CHANGES_REQUESTED` reviews plus `dismissed` retractions. The App path mints an installation token from a local private key and can receive signed webhooks; the receiver must run on a trusted clone because it writes the board, and the hub still never holds the App key. One webhook worker serves every repo the App is installed on (the repo comes from the payload). Reviews bind to the review's `commit_id` (fork-safe); fork PRs are refused unless explicitly allowed. A dismissed review retracts that approval by id; commented reviews are still not decisions, and the workflow identity must be an admin when ACLs are enabled. Reviewer groups and counts see the mapped board identity (`review.github`), not the GitHub login itself. The bundled RSA signer is pure Python (not constant-time) and is intended for a trusted local process, like the Ed25519 helper.
 - **A review packet needs the task branch locally.** `aghub review --diff` fetches the branch from the board's remote when possible; if the owner has not pushed it yet, the packet shows the task and gate state but not a patch.
 - **Legacy and pre-key events may be unsigned.** Records created before a key exists are reported as unsigned; `verify --strict` fails on unsigned records, while chain errors and invalid signatures always fail.
 - **Live updates send full snapshots.** SSE pushes the whole board on change and keeps the last 100 per project for `Last-Event-ID` replay; there are no per-task deltas or websocket fan-out yet. A reconnect older than the window gets the oldest retained snapshot and then the current board.
@@ -879,7 +955,7 @@ projects and delete their own rows; still, point them at a scratch database.
 - **Retention is pruning, not archival.** `--retention-days` / `--retention-events` (and `aghub hub prune`) delete old audit events and resolved review requests to bound storage; they do not archive them first, so export anything you need to keep with `aghub hub audit` beforehand. Durable task history always lives in git, not the hub.
 - **Backup/restore covers hub state, scoped per tenant.** `aghub hub backup` / `restore` move one project's snapshot, agents, leases, counters, writer lease, review packets/requests, and audit log; a token scoped to a project can only back up or restore that project. The restore skips the ephemeral SSE replay buffer and rate-limit windows and re-sequences the snapshot. It is hub state only — the board's git history is the durable record — and is implemented on the SQLite store (a Postgres-backed hub returns `501` until it grows the same methods).
 - **The merge check is sandboxed by default but is still not a security boundary.** `submit`/`queue run` execute `project.check` through the same sandbox runner as evals (`auto` uses Bubblewrap, otherwise a scrubbed snapshot). `--check-sandbox off` and `--sandbox off` intentionally opt out. Traces are signed evidence, not proof of isolation; re-run the command to reproduce.
-- **Codegen covers an OpenAPI subset.** Paths, methods, `operationId`, component schemas, `$ref`, arrays, enums, unions, examples, common scalar formats, and a starting SQL migration. Security schemes, callbacks, discriminators, and parameter validation are not generated.
+- **Codegen covers an OpenAPI subset.** Paths, methods, `operationId`, component schemas, `$ref`, arrays, enums, unions, examples, common scalar formats, parameters (path/query/header with `required` and `enum`), `http`/`apiKey` security schemes, and a dialect-aware starting SQL migration (`postgres`, `sqlite`, `mysql`). Parameter validation enforces only `required` and `enum`, not full JSON Schema; callbacks, discriminators, oauth2 flows, and `oneOf`-style request-body validation are not generated.
 - **Eval fingerprints identify an input, not a whole environment.** They cover command, suite, commit, tree, dirty/untracked input, and timeout. `eval rerun` compares fingerprints but does not pin toolchain or container images, and ignored files are not hashed.
 - **The eval sandbox is pragmatic.** The snapshot omits ignored files such as `.venv` or `node_modules`, so a command that needs them must install them inside the eval or use `--sandbox off`. Bubblewrap is optional and detected at runtime; without it, the fallback hides the environment but not the host filesystem or network.
 - **Evals are still local and BYOK.** The platform records the command, sandbox policy, scorecard, and freshness; it does not verify the machine or reproduce the environment.
@@ -888,8 +964,8 @@ projects and delete their own rows; still, point them at a scratch database.
 
 ## Next
 
-1. Batched board writes and independent/sharded boards for swarms well beyond the serial writer-lease ceiling.
-2. GitHub App path: OAuth/webhooks, fork-safe review recording, dismissed-review handling, richer check annotations, and multi-repository boards.
-3. Deeper codegen: parameter validation, auth schemes, and dialect-aware migrations.
-4. Postgres parity for backup/restore/prune, plus scheduled off-box backups and point-in-time restore.
-5. Surface protected-path decisions on the GitHub check and reviewer-SLA escalation (auto-request a backup reviewer when a review goes overdue).
+1. Postgres parity for backup/restore/prune, plus scheduled off-box backups and point-in-time restore.
+2. Deeper codegen still: request-body validation, discriminated unions, and oauth2 flows.
+3. Cross-shard views: a read-only aggregate over several board shards for a single pane of glass.
+4. GitHub App OAuth device flow and dismissed-review audit history across multiple boards.
+5. Reviewer-SLA escalation: auto-request a backup reviewer when a review goes overdue.

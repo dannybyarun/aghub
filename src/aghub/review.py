@@ -407,6 +407,7 @@ def review_packet(board, state, task_id, include_diff=False):
             "expired": summary["expired"],
             "ineligible": summary["ineligible"],
             "stale_reviews": summary["stale"],
+            "dismissed": summary["dismissed"],
             "reviews": _reviews(state, task_id, analysis=analysis),
         },
         "contracts": _contracts(board, state, task),

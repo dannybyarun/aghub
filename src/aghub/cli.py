@@ -12,9 +12,11 @@ import yaml
 from . import codegen, gitops, hubclient, keys, render, sandbox, service
 from .board import (
     Board,
+    board_entries,
     ensure_local_agent_key,
     init_board,
     read_local_config,
+    read_yaml,
     write_local_config,
 )
 from .errors import AghubError
@@ -172,6 +174,7 @@ def cmd_init(args):
     if not args.no_remote and remote is None and gitops.has_remote(repo, "origin"):
         remote = "origin"
     agent = _resolve_agent(args, None)
+    shard = getattr(args, "shard", None) or os.environ.get("AGHUB_SHARD") or None
     board = init_board(
         repo,
         args.project,
@@ -185,11 +188,13 @@ def cmd_init(args):
         check_timeout=args.check_timeout,
         require_eval_sandbox=args.require_eval_sandbox,
         scope=args.scope,
+        shard=shard,
     )
     config = read_local_config(board.common)
     config["agent"] = agent
     write_local_config(board.common, config)
-    print(f'board {board.branch} ready for "{args.project}"')
+    label = f'shard "{slug(shard)}"' if shard else "board"
+    print(f'{label} {board.branch} ready for "{args.project}"')
     print(f"  worktree  {board.dir}")
     print(f"  remote    {remote or '(local only)'}")
     state = board.load()
@@ -491,6 +496,26 @@ def _record_review(
             external_id=external_id,
             reviewer=reviewer,
             github_login=github_login,
+        ),
+        agent=agent,
+    )
+
+
+def _record_dismissal(board, agent, task_id, external_id, note="", source="github"):
+    """Record a dismissal that retracts an earlier (GitHub) review by its id."""
+    state = board.load()
+    key = _review_key(board, state, agent)
+    return board.transaction(
+        f"dismiss review {external_id} on {task_id}",
+        lambda current: service.dismiss_review(
+            current,
+            task_id,
+            agent,
+            external_id,
+            note=note,
+            private_key=key.get("private_key"),
+            public_key=key.get("public_key"),
+            source=source,
         ),
         agent=agent,
     )
@@ -1067,6 +1092,69 @@ def cmd_next(args):
     return 0
 
 
+def _load_task_specs(path):
+    if path == "-":
+        raw = sys.stdin.read()
+    else:
+        with open(os.path.expanduser(path), "r", encoding="utf-8") as handle:
+            raw = handle.read()
+    data = yaml.safe_load(raw)
+    if isinstance(data, dict) and "tasks" in data:
+        data = data["tasks"]
+    if not isinstance(data, list):
+        raise AghubError(
+            "task import expects a YAML/JSON list of task specs "
+            "(or a mapping with a top-level `tasks:` list)"
+        )
+    return data
+
+
+def _spec_add(spec, agent):
+    if not isinstance(spec, dict) or not spec.get("title"):
+        raise AghubError("each imported task needs at least a `title`")
+    return lambda state: service.add_task(
+        state,
+        spec["title"],
+        spec.get("paths") or [],
+        spec.get("contract") or spec.get("contracts") or [],
+        spec.get("depends") or spec.get("depends_on") or [],
+        spec.get("acceptance") or "",
+        agent,
+        spec.get("evals") or [],
+        require_sandbox=bool(spec.get("requires_sandbox")),
+        requires_approval=bool(spec.get("requires_approval")),
+        required_approvals=spec.get("required_approvals"),
+        review_groups=spec.get("review_groups") or spec.get("reviewer_groups") or [],
+        reviewers=spec.get("reviewers") or [],
+        review_ttl=spec.get("review_ttl"),
+        review_sla=spec.get("review_sla"),
+    )
+
+
+def cmd_boards(args):
+    repo = gitops.repo_root()
+    common = gitops.common_dir(repo)
+    if not read_local_config(common):
+        raise AghubError("aghub is not initialized here — run `aghub init --project <name>`")
+    rows = []
+    for entry in board_entries(common):
+        worktree = os.path.join(common, entry["worktree"])
+        head = gitops.short(worktree, "HEAD") if os.path.isdir(worktree) else None
+        project = (read_yaml(os.path.join(worktree, "project.yaml"), {}) or {}).get("name")
+        rows.append({**entry, "head": head, "project": project})
+    if args.json:
+        print(json.dumps(rows, indent=2))
+        return 0
+    print(f"boards ({len(rows)})")
+    for row in rows:
+        tag = " *" if row["default"] else "  "
+        print(
+            f" {tag} {row['name']:<12} {row['branch']:<22} "
+            f"{row.get('project') or '-':<16} {row.get('head') or '-'}"
+        )
+    return 0
+
+
 def cmd_task(args):
     board = _fresh_board()
     state = board.load()
@@ -1099,6 +1187,18 @@ def cmd_task(args):
             print(f"  evals  {', '.join(task['evals'])}")
         if task.get("requires_approval"):
             print(f"  review {service.describe_task_review_policy(state, task)}")
+        return 0
+    if args.task_command == "import":
+        specs = _load_task_specs(args.file)
+        if not specs:
+            raise AghubError("no tasks to import")
+        mutations = [_spec_add(spec, agent) for spec in specs]
+        tasks = board.batch(
+            f"import {len(mutations)} task(s)", mutations, agent=agent
+        )
+        for task in tasks:
+            print(f"added {task['id']} {task['title']}")
+        print(f"imported {len(tasks)} task(s) in one board write")
         return 0
     if args.task_command == "show":
         task = state.tasks.get(args.task)
@@ -1281,7 +1381,7 @@ def cmd_codegen(args):
     with open(source, "rb") as handle:
         blob = handle.read()
     files = codegen.generate(
-        args.name, version, meta, codegen.load_spec(blob), args.target
+        args.name, version, meta, codegen.load_spec(blob), args.target, args.dialect
     )
     out = os.path.abspath(os.path.expanduser(args.out))
 
@@ -1660,9 +1760,40 @@ def _github_sync_event(board, args, agent, event, token=None, api=None):
 
     recorded = None
     review_info = info.get("review") or {}
-    if (
+    action = info.get("action")
+    head_repo = info.get("head_repo")
+    base_repo = info.get("base_repo")
+    repository = args.repo or info.get("repository") or os.environ.get("GITHUB_REPOSITORY")
+    # A PR is a fork when its head repo differs from the repo it targets. Prefer
+    # the PR's base repo (correct for multi-repo webhook workers); fall back to
+    # the configured repository when the payload omits it.
+    reference_repo = base_repo or repository
+    fork = bool(head_repo and reference_repo and head_repo.lower() != reference_repo.lower())
+
+    if args.record_reviews and task.get("requires_approval") and action == "dismissed" and review_info:
+        external_id = review_info.get("id")
+        if not external_id:
+            messages.append("aghub: warning: dismissed review had no id; ignoring")
+        elif args.dry_run:
+            messages.append(f"would dismiss GitHub review {external_id} for {task['id']}")
+        else:
+            recorded = _record_dismissal(
+                board,
+                args.reviewer_agent or agent,
+                task["id"],
+                external_id,
+                note=f"GitHub dismissed review by {review_info.get('login') or '?'}",
+            )
+            state = board.load()
+            if recorded:
+                messages.append(
+                    f"recorded GitHub dismissal of review {external_id} for {task['id']}"
+                )
+            else:
+                messages.append(f"review {external_id} already dismissed")
+    elif (
         args.record_reviews
-        and info.get("action") == "submitted"
+        and action == "submitted"
         and review_info.get("state") in ("approved", "changes_requested")
         and task.get("requires_approval")
     ):
@@ -1676,9 +1807,6 @@ def _github_sync_event(board, args, agent, event, token=None, api=None):
                 f"GitHub reviewer {review_info.get('login') or '?'} is not trusted "
                 f"({review_info.get('association') or 'no association'})"
             )
-        head_repo = info.get("head_repo")
-        repository = args.repo or os.environ.get("GITHUB_REPOSITORY")
-        fork = bool(head_repo and repository and head_repo.lower() != repository.lower())
         if fork and not args.allow_fork_reviews:
             messages.append(
                 "aghub: warning: refusing to record an approval from a fork PR "
@@ -1686,9 +1814,14 @@ def _github_sync_event(board, args, agent, event, token=None, api=None):
             )
         else:
             external_id = review_info.get("id")
-            if not info.get("sha"):
+            # Bind to the exact commit the reviewer approved. On a fork the PR
+            # head sha lives on the fork; the review's own commit_id is the
+            # fork-safe source of truth, with the head sha as a fallback.
+            commit = review_info.get("commit_id") or info.get("sha")
+            if not commit:
                 raise AghubError(
-                    "pull request head sha is missing; cannot bind this review to a commit"
+                    "pull request review has no commit to bind to "
+                    "(missing review commit_id and head sha)"
                 )
             already = any(
                 item.get("source") == "github"
@@ -1706,6 +1839,8 @@ def _github_sync_event(board, args, agent, event, token=None, api=None):
                 note = f"GitHub review by {review_info.get('login') or '?'}"
                 if review_info.get("body"):
                     note += f": {review_info['body']}"
+                if fork:
+                    note += " (fork)"
                 signer = args.reviewer_agent or agent
                 login = review_info.get("login") or ""
                 reviewer = service.github_reviewer(state, login) or signer
@@ -1721,7 +1856,7 @@ def _github_sync_event(board, args, agent, event, token=None, api=None):
                         task["id"],
                         decision,
                         note,
-                        info.get("sha") or None,
+                        commit,
                         False,
                         source="github",
                         external_id=external_id,
@@ -1737,6 +1872,7 @@ def _github_sync_event(board, args, agent, event, token=None, api=None):
                     messages.append(
                         f"recorded GitHub {review_info['state']} from "
                         f"{review_info.get('login') or '?'} as {signer}{via}"
+                        + (" (fork)" if fork else "")
                     )
 
     packet = review.review_packet(board, state, task["id"])
@@ -1761,7 +1897,7 @@ def _github_sync_event(board, args, agent, event, token=None, api=None):
             "GitHub sync needs a pull_request or pull_request_review payload "
             "with a PR number and head sha"
         )
-    repo = args.repo or os.environ.get("GITHUB_REPOSITORY")
+    repo = args.repo or info.get("repository") or os.environ.get("GITHUB_REPOSITORY")
     if args.comment:
         published = github.upsert_comment(
             repo, info["number"], markdown, token=token, api=api
@@ -2215,6 +2351,11 @@ def build_parser():
         description="A shared board so parallel coding agents can work without talking to each other.",
     )
     parser.add_argument("--agent", help="agent identity (default: $AGHUB_AGENT or local config)")
+    parser.add_argument(
+        "--shard",
+        default=None,
+        help="target an independent board shard (default: $AGHUB_SHARD or the default board)",
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
     init = sub.add_parser("init", help="create the shared board in this repository")
@@ -2521,7 +2662,15 @@ def build_parser():
     task_sub.add_parser("list")
     task_show = task_sub.add_parser("show")
     task_show.add_argument("task")
+    task_import = task_sub.add_parser(
+        "import", help="add many tasks in one board write (YAML/JSON list, or - for stdin)"
+    )
+    task_import.add_argument("file", help="path to a task-spec list, or - to read stdin")
     task.set_defaults(func=cmd_task)
+
+    boards = sub.add_parser("boards", help="list the default board and any shards")
+    boards.add_argument("--json", action="store_true")
+    boards.set_defaults(func=cmd_boards)
 
     contract = sub.add_parser("contract", help="freeze interfaces before parallel work")
     contract_sub = contract.add_subparsers(dest="contract_command", required=True)
@@ -2549,6 +2698,12 @@ def build_parser():
     gen.add_argument("--out", default="generated", help="output directory (default: generated)")
     gen.add_argument(
         "--target", choices=("all", "ts", "py", "mock", "sql"), default="all"
+    )
+    gen.add_argument(
+        "--dialect",
+        choices=("postgres", "sqlite", "mysql"),
+        default="postgres",
+        help="SQL dialect for the generated migration (default: postgres)",
     )
     gen.add_argument(
         "--check", action="store_true", help="fail if the output directory is out of date"
@@ -2843,6 +2998,8 @@ def build_parser():
 def main(argv=None):
     parser = build_parser()
     args = parser.parse_args(argv)
+    if getattr(args, "shard", None):
+        os.environ["AGHUB_SHARD"] = args.shard
     if args.command == "board":
         args.for_agent = None
     try:

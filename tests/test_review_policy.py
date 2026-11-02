@@ -571,5 +571,53 @@ class ParseProtectTests(unittest.TestCase):
             _parse_protect("x/**:weird=1")
 
 
+class DismissalTests(unittest.TestCase):
+    def _approved_with_external(self, external_id="9001"):
+        record = review("R-1", "fe-1")
+        record["external_id"] = external_id
+        record["source"] = "github"
+        return record
+
+    def _dismissal(self, external_id="9001", record_id="R-2"):
+        return {
+            "id": record_id,
+            "at": now_iso(),
+            "task": "T-1",
+            "agent": "ci",
+            "decision": "dismissed",
+            "dismisses": external_id,
+            "source": "github",
+        }
+
+    def test_dismissed_github_approval_stops_counting(self):
+        state = fake_state(
+            {"review": {"approvals": 1}},
+            [self._approved_with_external(), self._dismissal()],
+        )
+        summary = service.approval_summary(state, task(), head=HEAD)
+        self.assertFalse(summary["satisfied"])
+        self.assertEqual(summary["approved_count"], 0)
+        self.assertEqual(len(summary["dismissed"]), 1)
+        self.assertIn("dismissed", summary["reason"])
+
+        # A fresh re-approval (new external id, not dismissed) satisfies again.
+        reapproved = review("R-3", "fe-1")
+        reapproved["external_id"] = "9002"
+        reapproved["source"] = "github"
+        state.approvals.append(reapproved)
+        self.assertTrue(service.approval_summary(state, task(), head=HEAD)["satisfied"])
+
+    def test_dismiss_review_is_idempotent(self):
+        state = fake_state(
+            {"review": {"approvals": 1}},
+            [self._approved_with_external()],
+            tasks={"T-1": task()},
+        )
+        first = service.dismiss_review(state, "T-1", "ci", "9001")
+        self.assertIsNotNone(first)
+        self.assertEqual(first["decision"], "dismissed")
+        self.assertIsNone(service.dismiss_review(state, "T-1", "ci", "9001"))
+
+
 if __name__ == "__main__":
     unittest.main()

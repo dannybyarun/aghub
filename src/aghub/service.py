@@ -795,17 +795,20 @@ def approvals_for(state, task_id):
     ]
 
 
-def review_records(state, task_id):
+def review_records(state, task_id, include_dismissals=False):
     """Valid review records for a task, oldest first.
 
-    A review is either an approval or a request for changes. Signatures are
-    enforced when the board uses Ed25519 attestations, matching the approval
-    gate's existing behavior.
+    A review is either an approval or a request for changes. A dismissal is a
+    meta-record that retracts a specific earlier review (by its ``external_id``)
+    and is excluded here unless ``include_dismissals`` is set, so the latest
+    decision and the counts ignore it. Signatures are enforced when the board
+    uses Ed25519 attestations, matching the approval gate's existing behavior.
     """
     records = [
         record
         for record in getattr(state, "approvals", [])
         if record.get("task") == task_id
+        and (include_dismissals or record.get("decision") != "dismissed")
     ]
     if eval_attestation_mode(state) == EVAL_ED25519_SCHEME:
         records = [
@@ -815,6 +818,15 @@ def review_records(state, task_id):
         records,
         key=lambda record: (str(record.get("at") or ""), str(record.get("id") or "")),
     )
+
+
+def dismissed_external_ids(state, task_id):
+    """External ids of reviews retracted by a dismissal record for this task."""
+    dismissed = set()
+    for record in review_records(state, task_id, include_dismissals=True):
+        if record.get("decision") == "dismissed" and record.get("dismisses"):
+            dismissed.add(str(record.get("dismisses")))
+    return dismissed
 
 
 def latest_review(state, task_id):
@@ -1059,6 +1071,7 @@ def _review_summary(record, eligible=True):
         "eligible": bool(eligible),
         "stale": False,
         "expired": False,
+        "dismissed": False,
     }
 
 
@@ -1179,6 +1192,7 @@ def approval_summary(state, task, head=None, changed_paths=None):
         "expired": [],
         "stale": [],
         "ineligible": [],
+        "dismissed": [],
         "latest_id": None,
         "latest_stale": False,
         "latest_expired": False,
@@ -1188,6 +1202,7 @@ def approval_summary(state, task, head=None, changed_paths=None):
         return summary
 
     records = review_records(state, task["id"])
+    dismissed_ids = dismissed_external_ids(state, task["id"])
     latest = records[-1] if records else None
     summary["decision"] = (
         (latest.get("decision") or "approved") if latest else "pending"
@@ -1202,6 +1217,16 @@ def approval_summary(state, task, head=None, changed_paths=None):
         identity = reviewer_identity(record)
         eligible = not policy["allowlist"] or identity in policy["reviewers"]
         entry = _review_summary(record, eligible=eligible)
+        external_id = record.get("external_id")
+        if external_id and str(external_id) in dismissed_ids:
+            entry["dismissed"] = True
+            reasons[entry["id"]] = (
+                f"{task['id']} approval by {identity or 'a reviewer'} was dismissed "
+                f"on GitHub — re-approve the current head "
+                f"with `aghub review {task['id']} --approve --note ...`"
+            )
+            summary["dismissed"].append(entry)
+            continue
         if head and str(record.get("binding") or "") == "commit":
             if not record.get("commit"):
                 entry["stale"] = True
@@ -1690,6 +1715,55 @@ def request_changes(
         reviewer=reviewer,
         github_login=github_login,
     )
+
+
+def dismiss_review(
+    state,
+    task_id,
+    agent,
+    external_id,
+    note="",
+    private_key=None,
+    public_key=None,
+    source="github",
+):
+    """Retract an earlier review by its external id (e.g. a dismissed GitHub review).
+
+    This records an append-only `dismissed` meta-record rather than mutating the
+    original approval. `approval_summary` then stops counting any approval whose
+    `external_id` was dismissed, so a dismissed GitHub approval no longer
+    satisfies the gate. Dismissing the same review twice is idempotent.
+    """
+    task = state.tasks.get(task_id)
+    if task is None:
+        raise AghubError(f"unknown task {task_id}")
+    external_id = str(external_id)
+    if external_id in dismissed_external_ids(state, task_id):
+        return None
+    record = {
+        "id": new_ulid(),
+        "at": now_iso(),
+        "task": task_id,
+        "agent": agent,
+        "decision": "dismissed",
+        "dismisses": external_id,
+        "note": note or "",
+    }
+    if source:
+        record["source"] = source
+    if private_key and public_key:
+        register_agent_key(state, agent, public_key)
+        attest_record(record, private_key, public_key, signer=agent)
+    state.new_approvals.append(record)
+    state.approvals.append(record)
+    state.emit(
+        "task.review_dismissed",
+        agent=agent,
+        task=task_id,
+        review=record["id"],
+        dismisses=external_id,
+    )
+    return record
 
 
 # -- queue ---------------------------------------------------------------
