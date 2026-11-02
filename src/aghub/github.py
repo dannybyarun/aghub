@@ -487,6 +487,8 @@ def pull_request_info(event):
     head = pr.get("head") or {}
     base = pr.get("base") or {}
     head_repo = (head.get("repo") or {}).get("full_name") or ""
+    base_repo = (base.get("repo") or {}).get("full_name") or ""
+    repository = (event.get("repository") or {}).get("full_name") or base_repo
     info = {
         "number": event.get("number") or pr.get("number"),
         "title": pr.get("title") or "",
@@ -498,6 +500,8 @@ def pull_request_info(event):
         "author": (pr.get("user") or {}).get("login") or "",
         "draft": bool(pr.get("draft")),
         "head_repo": head_repo,
+        "base_repo": base_repo,
+        "repository": repository,
         "action": event.get("action") or "",
     }
     review = event.get("review")
@@ -509,6 +513,7 @@ def pull_request_info(event):
             "association": review.get("author_association") or "",
             "body": review.get("body") or "",
             "url": review.get("html_url") or "",
+            "commit_id": review.get("commit_id") or "",
         }
     return info
 
@@ -671,6 +676,8 @@ def _approval_line(approval):
         line += f" ({len(approval['expired'])} expired)"
     if approval.get("ineligible"):
         line += f" ({len(approval['ineligible'])} ineligible)"
+    if approval.get("dismissed"):
+        line += f" ({len(approval['dismissed'])} dismissed)"
     return line
 
 
@@ -814,6 +821,41 @@ def comment_body(packet):
     return "\n".join(lines)
 
 
+def _check_annotations(packet):
+    """File-level check annotations from a queue failure trace.
+
+    GitHub shows these inline on the PR's Files tab. We only annotate the
+    precise files a trace names (claim/scope violations, merge conflicts), so
+    the signal is actionable rather than noisy. Capped at the GitHub per-request
+    limit of 50.
+    """
+    trace = packet.get("failure") or {}
+    kind = trace.get("kind")
+    files = []
+    message = ""
+    if kind == "paths":
+        files = trace.get("violations") or []
+        message = "Touched outside the task's claimed paths."
+    elif kind == "scope":
+        files = trace.get("outside") or []
+        message = f"Touched outside the project scope `{trace.get('scope') or ''}`."
+    elif kind == "merge":
+        files = trace.get("conflicted") or []
+        message = "Conflicts with trunk; rebase and resolve before merging."
+    annotations = []
+    for path in files[:50]:
+        annotations.append(
+            {
+                "path": str(path),
+                "start_line": 1,
+                "end_line": 1,
+                "annotation_level": "failure",
+                "message": message or "aghub flagged this file.",
+            }
+        )
+    return annotations
+
+
 def check_payload(packet, details_url=None):
     """Turn a review packet into one check-run conclusion + summary."""
     task = packet["task"]
@@ -873,6 +915,23 @@ def check_payload(packet, details_url=None):
         details.append(f"- expired reviews: {len(approval['expired'])}")
     if approval.get("ineligible"):
         details.append(f"- ineligible reviews: {len(approval['ineligible'])}")
+    if approval.get("dismissed"):
+        details.append(f"- dismissed reviews: {len(approval['dismissed'])}")
+    if approval.get("sla_breached"):
+        details.append("- reviewer SLA: **overdue**")
+    for rule in approval.get("protected") or []:
+        if rule.get("triggered") and not rule.get("satisfied"):
+            need = []
+            if rule.get("groups"):
+                need.append("group " + ", ".join(rule["groups"]))
+            if rule.get("reviewers"):
+                need.append("reviewer " + ", ".join(rule["reviewers"]))
+            if rule.get("approvals"):
+                need.append(f"{rule['approvals']} approvals")
+            details.append(
+                f"- protected paths ({rule.get('label')}): needs "
+                + "; ".join(need or ["review"])
+            )
     if approval.get("reason"):
         details.append(f"- policy: {approval['reason']}")
     if approval.get("note"):
@@ -899,6 +958,9 @@ def check_payload(packet, details_url=None):
             "summary": "\n".join(details),
         },
     }
+    annotations = _check_annotations(packet)
+    if annotations:
+        payload["output"]["annotations"] = annotations
     if details_url:
         payload["details_url"] = details_url
     return payload

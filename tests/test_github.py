@@ -536,6 +536,67 @@ class GitHubTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {}, clear=True):
             self.assertEqual(github._repo("acme/repo"), "acme/repo")
 
+    def test_pull_request_info_reports_repo_base_and_commit(self):
+        event = {
+            "action": "submitted",
+            "number": 7,
+            "repository": {"full_name": "acme/repo"},
+            "pull_request": {
+                "number": 7,
+                "title": "x",
+                "body": "",
+                "head": {"ref": "b", "sha": "a" * 40, "repo": {"full_name": "fork/repo"}},
+                "base": {"ref": "main", "repo": {"full_name": "acme/repo"}},
+            },
+            "review": {
+                "id": 11,
+                "state": "approved",
+                "user": {"login": "alice"},
+                "author_association": "MEMBER",
+                "commit_id": "c" * 40,
+            },
+        }
+        info = github.pull_request_info(event)
+        self.assertEqual(info["repository"], "acme/repo")
+        self.assertEqual(info["base_repo"], "acme/repo")
+        self.assertEqual(info["head_repo"], "fork/repo")
+        self.assertEqual(info["review"]["commit_id"], "c" * 40)
+
+    def test_check_annotations_from_failure_trace(self):
+        payload = packet(
+            failure={
+                "kind": "paths",
+                "reason": "touched outside claim",
+                "violations": ["src/web/x.ts", "src/web/y.ts"],
+            },
+            queue=[{"id": "Q-1", "status": "rejected", "reason": "touched outside claim"}],
+        )
+        check = github.check_payload(payload)
+        annotations = check["output"].get("annotations")
+        self.assertTrue(annotations)
+        self.assertEqual(
+            {item["path"] for item in annotations}, {"src/web/x.ts", "src/web/y.ts"}
+        )
+        self.assertEqual(annotations[0]["annotation_level"], "failure")
+        # A clean packet carries no annotations.
+        self.assertNotIn("annotations", github.check_payload(packet())["output"])
+
+    def test_comment_and_check_show_dismissed_count(self):
+        payload = packet(
+            approval={
+                "required": True,
+                "decision": "approved",
+                "reviewer": "fe-1",
+                "note": "",
+                "satisfied": False,
+                "reason": "T-003 approval by fe-1 was dismissed on GitHub",
+                "dismissed": [{"id": "R-1"}],
+                "reviews": [],
+            }
+        )
+        self.assertIn("1 dismissed", github.comment_body(payload))
+        self.assertIn("dismissed reviews: 1", github.check_payload(payload)["output"]["summary"])
+
 
 if __name__ == "__main__":
     unittest.main()

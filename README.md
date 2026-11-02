@@ -697,6 +697,29 @@ App key, so review attribution still comes from the board. `ping` deliveries
 are acknowledged, oversized payloads are rejected (2 MiB by default), and
 `GET /healthz` is available for a liveness probe.
 
+A single webhook worker serves **every repository the App is installed on**: the
+repo is read from each delivery's payload, so the comment and check are published
+back to the originating repo. Leave `--repo` unset to let the payload decide, or
+pass it to pin one repository.
+
+<b>Fork-safe recording.</b> A review is bound to the exact commit the reviewer
+approved — the review's own `commit_id`, falling back to the PR head SHA — so a
+fork's head cannot be swapped under an approval. Fork PRs (head repo ≠ the PR's
+base repo) are still refused unless `--allow-fork-reviews` is set, and the
+association allowlist always applies.
+
+<b>Dismissed reviews.</b> A `pull_request_review` delivery with action
+`dismissed` records an append-only dismissal that retracts that specific GitHub
+review by id. `submit`, `queue run`, the inbox, the comment, and the check all
+stop counting a dismissed approval, so a dismissal re-opens the gate until a
+fresh approval lands. Dismissing the same review twice is idempotent.
+
+<b>Richer checks.</b> When the queue rejects a branch for touching files outside
+its claim or project scope, or for conflicting with trunk, the check attaches
+file-level annotations naming those exact files (GitHub shows them inline on the
+Files tab). The check summary also reports dismissed reviews, an overdue
+reviewer SLA, and any unmet protected-path rule.
+
 For deployment smoke tests or replaying a captured delivery:
 
 ```bash
@@ -845,7 +868,7 @@ projects and delete their own rows; still, point them at a scratch database.
 - **Signatures bind records to published keys, not to people.** Private keys live outside the board, so a board writer cannot read them or mint a valid record for another agent without replacing that agent's published key. Old records stay valid until their key is revoked. The Ed25519 helper is pure Python, not constant-time, and is intended for local trusted-repo use rather than hostile co-tenants.
 - **Reviews are ordered by board time and evaluated as a policy.** Review order is the signed record's `at` timestamp, with its ULID as the tie-breaker; clock skew between reviewers can therefore reorder reviews. Approvals are counted once per reviewer identity, must match the current head, must be younger than the configured TTL, and must satisfy required groups plus the optional allowlist. The latest request-changes still blocks. Legacy reviews without a binding remain accepted for compatibility.
 - **Protected-path rules need the diff, so they are authoritative only at the queue.** A `review.protected_paths` rule adds a group, reviewer, or higher approval count when the branch diff matches its globs. The gate can only evaluate a rule once it knows the changed files, so the inbox (which does not fetch a per-task diff) treats rules as pending, the review packet evaluates the branch it has already fetched, and `queue run` re-derives the diff against trunk and enforces. Protected approval counts fold into the same `max(board, task, protected)` count; a reviewer SLA breach is surfaced as **overdue** but never blocks a merge on its own.
-- **The GitHub bridge has two trust boundaries: Actions or a local App worker.** The generated workflow runs on the events it subscribes to, needs a same-repository PR by default, publishes one sticky comment and one `aghub/review` check, and records only GitHub `APPROVED` / `CHANGES_REQUESTED` reviews. The App path mints an installation token from a local private key and can receive signed webhooks; the receiver must run on a trusted clone because it writes the board, and the hub still never holds the App key. Fork PRs are skipped by default and fork approvals are refused unless explicitly allowed. Dismissed or commented reviews are not treated as decisions, and the workflow identity must be an admin when ACLs are enabled. Reviewer groups and counts see the mapped board identity (`review.github`), not the GitHub login itself. The bundled RSA signer is pure Python (not constant-time) and is intended for a trusted local process, like the Ed25519 helper.
+- **The GitHub bridge has two trust boundaries: Actions or a local App worker.** The generated workflow runs on the events it subscribes to, needs a same-repository PR by default, publishes one sticky comment and one `aghub/review` check, and records only GitHub `APPROVED` / `CHANGES_REQUESTED` reviews plus `dismissed` retractions. The App path mints an installation token from a local private key and can receive signed webhooks; the receiver must run on a trusted clone because it writes the board, and the hub still never holds the App key. One webhook worker serves every repo the App is installed on (the repo comes from the payload). Reviews bind to the review's `commit_id` (fork-safe); fork PRs are refused unless explicitly allowed. A dismissed review retracts that approval by id; commented reviews are still not decisions, and the workflow identity must be an admin when ACLs are enabled. Reviewer groups and counts see the mapped board identity (`review.github`), not the GitHub login itself. The bundled RSA signer is pure Python (not constant-time) and is intended for a trusted local process, like the Ed25519 helper.
 - **A review packet needs the task branch locally.** `aghub review --diff` fetches the branch from the board's remote when possible; if the owner has not pushed it yet, the packet shows the task and gate state but not a patch.
 - **Legacy and pre-key events may be unsigned.** Records created before a key exists are reported as unsigned; `verify --strict` fails on unsigned records, while chain errors and invalid signatures always fail.
 - **Live updates send full snapshots.** SSE pushes the whole board on change and keeps the last 100 per project for `Last-Event-ID` replay; there are no per-task deltas or websocket fan-out yet. A reconnect older than the window gets the oldest retained snapshot and then the current board.
@@ -864,7 +887,7 @@ projects and delete their own rows; still, point them at a scratch database.
 ## Next
 
 1. Batched board writes and independent/sharded boards for swarms well beyond the serial writer-lease ceiling.
-2. GitHub App path: OAuth/webhooks, fork-safe review recording, dismissed-review handling, richer check annotations, and multi-repository boards.
-3. Deeper codegen: parameter validation, auth schemes, and dialect-aware migrations.
-4. Hosted hub hardening: per-tenant isolation beyond token scopes, storage retention, and backup/restore workflows.
-5. Surface protected-path decisions on the GitHub check and reviewer-SLA escalation (auto-request a backup reviewer when a review goes overdue).
+2. Deeper codegen: parameter validation, auth schemes, and dialect-aware migrations.
+3. Hosted hub hardening: per-tenant isolation beyond token scopes, storage retention, and backup/restore workflows.
+4. GitHub App OAuth device flow and dismissed-review audit history across multiple boards.
+5. Reviewer-SLA escalation: auto-request a backup reviewer when a review goes overdue.
