@@ -1,0 +1,17 @@
+{
+  "zen": "Keep it logically awesome.",
+  "hook_id": 4242,
+  "hook": {
+    "type": "Repository",
+    "events": [
+      "pull_request",
+      "pull_request_review"
+    ]
+  },
+  "repository": {
+    "full_name": "acme/repo"
+  },
+  "sender": {
+    "login": "alice"
+  }
+}

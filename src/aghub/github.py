@@ -1,17 +1,33 @@
 """GitHub bridge: put aghub review state where humans already work.
 
-The bridge is deliberately small and dependency-free. It reads the event payload
-that GitHub Actions already writes, renders one review comment, and publishes one
-check run. Approval decisions come from pull-request reviews, not from a public
-webhook endpoint, so there is no OAuth server to operate.
+The bridge is deliberately small and dependency-free. It reads event payloads
+from GitHub Actions or a verified webhook delivery, renders one review comment,
+and publishes one check run. Approval decisions come from pull-request reviews.
+
+Two authentication paths are supported:
+
+* a workflow-scoped ``GITHUB_TOKEN`` (the original Actions path), and
+* a GitHub App: a short-lived RS256 JWT proves the app identity, and is
+  exchanged for a cached installation token scoped to the repository.
+
+Webhook deliveries are authenticated with the app's webhook secret
+(``X-Hub-Signature-256``). The receiver runs on a trusted clone; the hub never
+holds the app key and never writes reviews itself.
 """
 
+import base64
+import binascii
+import calendar
+import hashlib
+import hmac
 import json
 import os
 import re
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from . import __version__, service
 from .errors import AghubError
@@ -20,6 +36,422 @@ API_URL = "https://api.github.com"
 MARKER = "<!-- aghub:review -->"
 CHECK_NAME = "aghub/review"
 DEFAULT_ASSOCIATIONS = ("OWNER", "MEMBER", "COLLABORATOR")
+WEBHOOK_PATH = "/github/webhook"
+MAX_WEBHOOK_BYTES = 2 * 1024 * 1024
+
+
+# -- GitHub App authentication ----------------------------------------------
+#
+# GitHub Apps sign a short JWT with an RSA private key, then exchange it for an
+# installation token. The project has no crypto dependencies, so the small
+# PKCS#1 v1.5 signer below is pure Python. It is a signing primitive for a
+# trusted local clone, not constant-time code for hostile co-tenants.
+
+_SHA256_DIGEST_INFO = bytes.fromhex(
+    "3031300d060960864801650304020105000420"
+)
+
+
+def _der_item(data, offset=0):
+    if offset + 2 > len(data):
+        raise AghubError("invalid private key: truncated DER")
+    tag = data[offset]
+    length = data[offset + 1]
+    offset += 2
+    if length & 0x80:
+        count = length & 0x7F
+        if count == 0 or offset + count > len(data):
+            raise AghubError("invalid private key: bad DER length")
+        length = int.from_bytes(data[offset : offset + count], "big")
+        offset += count
+    end = offset + length
+    if end > len(data):
+        raise AghubError("invalid private key: truncated DER value")
+    return tag, data[offset:end], end
+
+
+def _der_items(data):
+    items = []
+    offset = 0
+    while offset < len(data):
+        tag, value, offset = _der_item(data, offset)
+        items.append((tag, value))
+    return items
+
+
+def _pem_body(pem, label):
+    pattern = (
+        r"-----BEGIN " + label + r"-----(.*?)-----END " + label + r"-----"
+    )
+    match = re.search(pattern, pem, re.DOTALL)
+    if not match:
+        raise AghubError(f"invalid private key: missing {label} PEM block")
+    try:
+        return base64.b64decode("".join(match.group(1).split()))
+    except (ValueError, binascii.Error) as exc:
+        raise AghubError(f"invalid private key: bad PEM base64 ({exc})")
+
+
+def _int_items(values):
+    return [int.from_bytes(value, "big") for _tag, value in values]
+
+
+def _rsa_numbers(key):
+    """Return RSA (n, e, d) from a PEM private or public key."""
+    if isinstance(key, bytes):
+        key = key.decode("utf-8", errors="replace")
+    key = str(key or "")
+    if "BEGIN RSA PRIVATE KEY" in key:
+        _tag, sequence, _end = _der_item(_pem_body(key, "RSA PRIVATE KEY"))
+        values = _int_items(_der_items(sequence))
+        if len(values) < 3:
+            raise AghubError("invalid RSA private key")
+        return values[1], values[2], values[3] if len(values) > 3 else None
+    if "BEGIN PRIVATE KEY" in key:
+        _tag, sequence, _end = _der_item(_pem_body(key, "PRIVATE KEY"))
+        for tag, value in _der_items(sequence):
+            if tag != 0x04:
+                continue
+            _inner_tag, inner, _inner_end = _der_item(value)
+            values = _int_items(_der_items(inner))
+            if len(values) >= 4:
+                return values[1], values[2], values[3]
+        raise AghubError("invalid PKCS#8 RSA private key")
+    if "BEGIN RSA PUBLIC KEY" in key:
+        _tag, sequence, _end = _der_item(_pem_body(key, "RSA PUBLIC KEY"))
+        values = _int_items(_der_items(sequence))
+        if len(values) < 2:
+            raise AghubError("invalid RSA public key")
+        return values[0], values[1], None
+    if "BEGIN PUBLIC KEY" in key:
+        _tag, sequence, _end = _der_item(_pem_body(key, "PUBLIC KEY"))
+        for tag, value in _der_items(sequence):
+            if tag != 0x03:
+                continue
+            _inner_tag, inner, _inner_end = _der_item(value[1:])
+            values = _int_items(_der_items(inner))
+            if len(values) >= 2:
+                return values[0], values[1], None
+        raise AghubError("invalid RSA public key")
+    raise AghubError("invalid key: expected a PEM RSA key")
+
+
+def load_private_key(value):
+    """Accept PEM text, a path, or an env value with escaped newlines."""
+    if not value:
+        raise AghubError("GitHub App private key is required")
+    value = str(value)
+    if "BEGIN" in value:
+        return value.replace("\\n", "\n")
+    path = os.path.expanduser(value)
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            return handle.read()
+    except OSError as exc:
+        raise AghubError(f"cannot read GitHub App private key: {exc}")
+
+
+def _rsa_sign(key, message):
+    n, e, d = _rsa_numbers(key)
+    if d is None:
+        raise AghubError("invalid private key: no private exponent")
+    digest_info = _SHA256_DIGEST_INFO + hashlib.sha256(message).digest()
+    size = (n.bit_length() + 7) // 8
+    padding = size - len(digest_info) - 3
+    if padding < 8:
+        raise AghubError("RSA key is too small for SHA-256 signing")
+    encoded = b"\x00\x01" + b"\xff" * padding + b"\x00" + digest_info
+    signature = pow(int.from_bytes(encoded, "big"), d, n)
+    return signature.to_bytes(size, "big")
+
+
+def _rsa_verify(key, message, signature):
+    n, e, _d = _rsa_numbers(key)
+    size = (n.bit_length() + 7) // 8
+    if len(signature) != size:
+        return False
+    digest_info = _SHA256_DIGEST_INFO + hashlib.sha256(message).digest()
+    padding = size - len(digest_info) - 3
+    if padding < 8:
+        return False
+    expected = b"\x00\x01" + b"\xff" * padding + b"\x00" + digest_info
+    try:
+        recovered = pow(int.from_bytes(signature, "big"), e, n)
+    except (ValueError, TypeError):
+        return False
+    return hmac.compare_digest(recovered.to_bytes(size, "big"), expected)
+
+
+def _b64url(data):
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+
+
+def app_jwt(app_id, private_key, now=None, ttl=600):
+    """Create the short-lived RS256 JWT that proves a GitHub App identity."""
+    if not app_id:
+        raise AghubError("GitHub App id is required")
+    stamp = int(time.time() if now is None else now)
+    issuer = int(app_id) if str(app_id).isdigit() else str(app_id)
+    header = {"alg": "RS256", "typ": "JWT"}
+    claims = {"iat": stamp - 60, "exp": stamp - 60 + int(ttl), "iss": issuer}
+    signing_input = (
+        _b64url(json.dumps(header, separators=(",", ":")).encode("utf-8"))
+        + "."
+        + _b64url(json.dumps(claims, separators=(",", ":")).encode("utf-8"))
+    )
+    signature = _rsa_sign(private_key, signing_input.encode("ascii"))
+    return signing_input + "." + _b64url(signature)
+
+
+def installation_token(
+    app_id, private_key, installation_id, api=None, timeout=20, now=None
+):
+    """Exchange an app JWT for a repository-scoped installation token."""
+    if not installation_id:
+        raise AghubError("GitHub App installation id is required")
+    jwt = app_jwt(app_id, private_key, now=now)
+    path = "/app/installations/{}/access_tokens".format(
+        urllib.parse.quote(str(installation_id), safe="")
+    )
+    result = _request(
+        "POST", path, {}, token=jwt, api=api, timeout=timeout
+    )
+    token = result.get("token") if isinstance(result, dict) else None
+    if not token:
+        raise AghubError("GitHub did not return an installation token")
+    return result
+
+
+def _github_time(value, fallback):
+    if not value:
+        return fallback
+    try:
+        return calendar.timegm(time.strptime(str(value), "%Y-%m-%dT%H:%M:%SZ"))
+    except ValueError:
+        return fallback
+
+
+class AppAuth:
+    """Mint and cache one installation token for a trusted process."""
+
+    def __init__(
+        self,
+        app_id,
+        private_key,
+        installation_id,
+        api=None,
+        timeout=20,
+    ):
+        self.app_id = str(app_id)
+        self.private_key = load_private_key(private_key)
+        self.installation_id = str(installation_id)
+        self.api = api
+        self.timeout = timeout
+        self._token = None
+        self._expires_at = 0
+
+    def token(self, force=False, now=None):
+        stamp = time.time() if now is None else float(now)
+        if not force and self._token and self._expires_at - stamp > 60:
+            return self._token
+        result = installation_token(
+            self.app_id,
+            self.private_key,
+            self.installation_id,
+            api=self.api,
+            timeout=self.timeout,
+            now=stamp,
+        )
+        self._token = result["token"]
+        try:
+            expires_in = float(result.get("expires_in") or 3600)
+        except (TypeError, ValueError):
+            expires_in = 3600.0
+        self._expires_at = _github_time(
+            result.get("expires_at"), stamp + expires_in
+        )
+        return self._token
+
+    def header(self, force=False, now=None):
+        return f"Bearer {self.token(force=force, now=now)}"
+
+
+def app_auth(
+    app_id=None,
+    private_key=None,
+    installation_id=None,
+    api=None,
+):
+    """Build AppAuth from flags/env, or return None when no app is configured."""
+    app_id = app_id or os.environ.get("AGHUB_GITHUB_APP_ID") or os.environ.get(
+        "GITHUB_APP_ID"
+    )
+    private_key = (
+        private_key
+        or os.environ.get("AGHUB_GITHUB_APP_PRIVATE_KEY")
+        or os.environ.get("GITHUB_APP_PRIVATE_KEY")
+        or os.environ.get("AGHUB_GITHUB_APP_PRIVATE_KEY_PATH")
+        or os.environ.get("GITHUB_APP_PRIVATE_KEY_PATH")
+    )
+    installation_id = (
+        installation_id
+        or os.environ.get("AGHUB_GITHUB_INSTALLATION_ID")
+        or os.environ.get("GITHUB_INSTALLATION_ID")
+    )
+    if not (app_id or private_key or installation_id):
+        return None
+    missing = [
+        name
+        for name, value in (
+            ("app id", app_id),
+            ("private key", private_key),
+            ("installation id", installation_id),
+        )
+        if not value
+    ]
+    if missing:
+        raise AghubError(
+            "GitHub App configuration is incomplete: missing " + ", ".join(missing)
+        )
+    return AppAuth(app_id, private_key, installation_id, api=api)
+
+
+# -- webhook verification ----------------------------------------------------
+
+
+def webhook_signature(secret, body):
+    """Return the X-Hub-Signature-256 value for a payload."""
+    if not secret:
+        raise AghubError("GitHub webhook secret is required")
+    if isinstance(body, str):
+        body = body.encode("utf-8")
+    digest = hmac.new(
+        str(secret).encode("utf-8"), body or b"", hashlib.sha256
+    ).hexdigest()
+    return "sha256=" + digest
+
+
+def verify_webhook(secret, body, signature):
+    """Constant-time check of a GitHub webhook signature."""
+    if not secret:
+        raise AghubError("GitHub webhook secret is required")
+    if not signature:
+        raise AghubError("GitHub webhook signature is missing")
+    expected = webhook_signature(secret, body)
+    if not hmac.compare_digest(expected, str(signature).strip()):
+        raise AghubError("GitHub webhook signature is invalid")
+    return True
+
+
+def _header(headers, name):
+    if not headers:
+        return ""
+    getter = getattr(headers, "get", None)
+    if getter is not None:
+        value = getter(name)
+        if value:
+            return value
+    for key, value in headers.items():
+        if str(key).lower() == name.lower():
+            return value
+    return ""
+
+
+class WebhookReceiver:
+    """Verify and route one raw webhook delivery.
+
+    ``on_event(kind, payload, delivery)`` is only called after the signature
+    verifies and the JSON payload parses. The callback owns board writes.
+    """
+
+    def __init__(self, secret, on_event, max_bytes=MAX_WEBHOOK_BYTES):
+        if not secret:
+            raise AghubError("GitHub webhook secret is required")
+        if not callable(on_event):
+            raise AghubError("webhook receiver needs an event callback")
+        self.secret = secret
+        self.on_event = on_event
+        self.max_bytes = max(1, int(max_bytes))
+
+    def receive(self, headers, body):
+        if isinstance(body, str):
+            body = body.encode("utf-8")
+        body = body or b""
+        if len(body) > self.max_bytes:
+            raise AghubError(
+                f"webhook payload is too large ({len(body)} > {self.max_bytes} bytes)"
+            )
+        verify_webhook(
+            self.secret, body, _header(headers, "X-Hub-Signature-256")
+        )
+        kind = _header(headers, "X-GitHub-Event")
+        if not kind:
+            raise AghubError("GitHub webhook event header is missing")
+        try:
+            payload = json.loads(body.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError) as exc:
+            raise AghubError(f"invalid GitHub webhook payload: {exc}")
+        if not isinstance(payload, dict):
+            raise AghubError("invalid GitHub webhook payload: expected an object")
+        delivery = _header(headers, "X-GitHub-Delivery")
+        result = self.on_event(kind, payload, delivery)
+        return {"event": kind, "delivery": delivery, "result": result}
+
+
+def webhook_server(receiver, host="127.0.0.1", port=8787):
+    """A tiny HTTP server for one verified webhook receiver."""
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def _send(self, status, payload):
+            body = json.dumps(payload, sort_keys=False).encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            path = self.path.split("?", 1)[0]
+            if path in ("/healthz", "/health"):
+                self._send(200, {"ok": True, "webhook": WEBHOOK_PATH})
+                return
+            self._send(404, {"error": "not found"})
+
+        def do_POST(self):
+            path = self.path.split("?", 1)[0]
+            if path not in ("/", WEBHOOK_PATH):
+                self._send(404, {"error": "not found"})
+                return
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+            except (TypeError, ValueError):
+                length = 0
+            if length < 0 or length > receiver.max_bytes:
+                self._send(413, {"error": "payload too large"})
+                return
+            body = self.rfile.read(length) if length else b""
+            try:
+                result = receiver.receive(self.headers, body)
+            except AghubError as exc:
+                message = str(exc)
+                status = 401 if "signature" in message.lower() else 400
+                self._send(status, {"error": message})
+                return
+            except Exception as exc:  # keep the receiver alive on callback bugs
+                self._send(500, {"error": str(exc)})
+                return
+            self._send(200, result)
+
+    class Server(ThreadingHTTPServer):
+        daemon_threads = True
+
+    server = Server((host, int(port)), Handler)
+    server.receiver = receiver
+    return server
+
 
 
 def load_event(path=None):

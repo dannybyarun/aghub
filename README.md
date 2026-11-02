@@ -4,7 +4,7 @@
 
 Two agents, two clones, one project. One takes the backend, one takes the frontend. Neither sends a message. They read a board, claim a lane, build against a frozen contract, and hand off in writing.
 
-This is a working vertical slice of that protocol: the board, claims, contracts, handoffs, codegen from frozen contracts, a serial merge queue that turns failures into trace-carrying tasks, locally signed and sandboxed evals, hash-chained board history, project ACLs, human review inboxes and approval gates with board-wide reviewer policy, a web review workspace, a GitHub pull-request bridge, an MCP server and Python SDK, and a hub that arbitrates live leases, serializes board writes with a TTL-bounded writer lease, and serves a web board.
+This is a working vertical slice of that protocol: the board, claims, contracts, handoffs, codegen from frozen contracts, a serial merge queue that turns failures into trace-carrying tasks, locally signed and sandboxed evals, hash-chained board history, project ACLs, human review inboxes and approval gates with board-wide reviewer policy, a web review workspace, a GitHub pull-request bridge with App auth and signed webhooks, an MCP server and Python SDK, and a hub that arbitrates live leases, serializes board writes with a TTL-bounded writer lease, and serves a web board.
 
 ```
 $ aghub status
@@ -143,6 +143,7 @@ transaction:
 - `AGHUB_BOARD_LOCK_WAIT` bounds how long a writer waits before falling back
   to optimistic retries (default 180; the swarm demo uses 300).
 - `AGHUB_BOARD_ATTEMPTS` sets the retry budget (default 24).
+- `AGHUB_HUB_TIMEOUT` sets the hub request timeout in seconds (default 15).
 - `AGHUB_TRACE_BOARD=1` prints each lease wait and retry to stderr.
 
 At 50 agents the run is still one serialized board writer at a time. The lease
@@ -578,10 +579,11 @@ installs or vendors the CLI differently.
 
 ### Review inbox, web workspace, and the GitHub bridge
 
-The review layer has three entry points over one policy. `aghub inbox` is local
+The review layer has four entry points over one policy. `aghub inbox` is local
 and read-only; the hub serves a browser review queue with the published diff and
 queues decisions as signed intents; `aghub github sync` publishes the same
-review packet onto a pull request.
+review packet onto a pull request; `aghub github webhook` records reviews from
+signed App deliveries on a trusted clone.
 
 ```bash
 aghub review T-007 --publish   # mirror the packet and diff to the hub
@@ -623,6 +625,58 @@ aghub github sync --task T-007 --dry-run --json  # inspect the comment and check
 aghub github sync --record-reviews           # use GITHUB_EVENT_PATH + GITHUB_TOKEN
 aghub github sync --task T-007 --no-comment --check
 ```
+
+#### GitHub App authentication
+
+The workflow path uses `GITHUB_TOKEN`. A GitHub App avoids per-workflow tokens
+and works from a long-running trusted machine:
+
+```bash
+export AGHUB_GITHUB_APP_ID=123456
+export AGHUB_GITHUB_APP_PRIVATE_KEY_PATH=/etc/aghub/app.pem
+export AGHUB_GITHUB_INSTALLATION_ID=987654
+aghub github sync --event "$GITHUB_EVENT_PATH" --record-reviews
+```
+
+The CLI signs a short-lived RS256 JWT with the app key, exchanges it for one
+installation token, and caches that token until shortly before it expires. The
+flags `--app-id`, `--private-key`, and `--installation-id` override the env;
+`AGHUB_GITHUB_APP_PRIVATE_KEY` may contain the PEM itself (literal `\n`
+escapes are accepted). `--api-url` or `GITHUB_API_URL` selects GitHub
+Enterprise. The app key stays on the trusted clone; the hub never receives it.
+
+#### Webhook-driven review sync
+
+GitHub can deliver events to a trusted clone instead of running the workflow:
+
+```bash
+aghub github webhook \
+  --bind 127.0.0.1 --port 8787 \
+  --secret "$AGHUB_GITHUB_WEBHOOK_SECRET" \
+  --repo acme/repo --reviewer-agent github-review
+```
+
+Point the App's webhook URL at `http://your-worker:8787/github/webhook`
+(or put it behind a TLS proxy) and subscribe to **Pull request reviews**. Every
+delivery is checked against `X-Hub-Signature-256` before JSON is parsed; only
+`pull_request_review` events are recorded, and GitHub's review id keeps retries
+idempotent. The receiver signs the review with the local board key, not with the
+App key, so review attribution still comes from the board. `ping` deliveries
+are acknowledged, oversized payloads are rejected (2 MiB by default), and
+`GET /healthz` is available for a liveness probe.
+
+For deployment smoke tests or replaying a captured delivery:
+
+```bash
+aghub github webhook --event review.json --signature "sha256=..." \
+  --secret "$AGHUB_GITHUB_WEBHOOK_SECRET" --repo acme/repo \
+  --no-comment --no-check --json
+```
+
+`--event` requires `--signature`; it processes exactly one verified delivery and
+exits, which is also how the fixture tests exercise the path. The HTTP
+receiver adds `--dry-run`, `--no-comment`, `--no-check`, `--json`, and the same
+association/fork rules as `github sync`.
 
 The check is `success` when merged or the policy is satisfied and the task is
 ready for the queue, `failure` when the queue rejected the branch,
@@ -706,7 +760,8 @@ reimplemented or bypassed.
 | `aghub submit TASK` | push branch and enqueue |
 | `aghub queue run\|list\|show [ID]\|verify [ID]` | integration and queue inspection |
 | `aghub ci workflow [--out PATH] [--trunk BRANCH] [--contract NAME] [--codegen-out DIR] [--github-review]` / `ci status [--json]` | CI template, review bridge, and gate |
-| `aghub github sync [--task TASK] [--event PATH] [--repo OWNER/NAME] [--record-reviews] [--dry-run] [--json]` | publish review comment/check and record trusted PR reviews |
+| `aghub github sync [--task TASK] [--event PATH] [--repo OWNER/NAME] [--record-reviews] [--app-id ID] [--private-key PEM] [--installation-id ID] [--dry-run] [--json]` | publish review comment/check and record trusted PR reviews |
+| `aghub github webhook [--bind H] [--port P] [--secret S] [--event PATH --signature SIG] [--no-comment] [--no-check]` | verify GitHub App webhooks and record review events on a trusted clone |
 | `aghub mcp serve [--agent ID]` / `mcp tools` | MCP stdio server and tool catalog |
 | `aghub sync` | fetch board + trunk |
 | `aghub hub serve [--host H] [--port P] [--db PATH] [--token T] [--read-token T] [--tokens-file F] [--rate-limit N] [--postgres DSN]` | run the lease/presence hub + web board |
@@ -757,7 +812,7 @@ projects and delete their own rows; still, point them at a scratch database.
 - **Board authorization is guardrails, not a git firewall.** ACLs stop accidental reader writes through the CLI, but anyone who can force-push `aghub/board` can rewrite it. Event hashes and signatures make tampering visible; they do not make the branch immutable. Hub tokens protect the HTTP API, not git.
 - **Signatures bind records to published keys, not to people.** Private keys live outside the board, so a board writer cannot read them or mint a valid record for another agent without replacing that agent's published key. Old records stay valid until their key is revoked. The Ed25519 helper is pure Python, not constant-time, and is intended for local trusted-repo use rather than hostile co-tenants.
 - **Reviews are ordered by board time and evaluated as a policy.** Review order is the signed record's `at` timestamp, with its ULID as the tie-breaker; clock skew between reviewers can therefore reorder reviews. Approvals are counted once per reviewer identity, must match the current head, must be younger than the configured TTL, and must satisfy required groups plus the optional allowlist. The latest request-changes still blocks. Counts and expiry are policy, not diff conditions: there are no per-path approvals or approvals that only apply to a matching patch. Legacy reviews without a binding remain accepted for compatibility.
-- **The GitHub bridge is a workflow, not an App.** It runs only on the events in the generated workflow, needs a same-repository PR by default, publishes one sticky comment and one `aghub/review` check, and records only GitHub `APPROVED` / `CHANGES_REQUESTED` reviews. Fork PRs are skipped (read-only token, no secrets) and fork approvals are refused unless explicitly allowed. Dismissed or commented reviews are not treated as decisions, and the workflow identity must be an admin when ACLs are enabled. Reviewer groups and counts see the mapped board identity (`review.github`), not the GitHub login itself.
+- **The GitHub bridge has two trust boundaries: Actions or a local App worker.** The generated workflow runs on the events it subscribes to, needs a same-repository PR by default, publishes one sticky comment and one `aghub/review` check, and records only GitHub `APPROVED` / `CHANGES_REQUESTED` reviews. The App path mints an installation token from a local private key and can receive signed webhooks; the receiver must run on a trusted clone because it writes the board, and the hub still never holds the App key. Fork PRs are skipped by default and fork approvals are refused unless explicitly allowed. Dismissed or commented reviews are not treated as decisions, and the workflow identity must be an admin when ACLs are enabled. Reviewer groups and counts see the mapped board identity (`review.github`), not the GitHub login itself. The bundled RSA signer is pure Python (not constant-time) and is intended for a trusted local process, like the Ed25519 helper.
 - **A review packet needs the task branch locally.** `aghub review --diff` fetches the branch from the board's remote when possible; if the owner has not pushed it yet, the packet shows the task and gate state but not a patch.
 - **Legacy and pre-key events may be unsigned.** Records created before a key exists are reported as unsigned; `verify --strict` fails on unsigned records, while chain errors and invalid signatures always fail.
 - **Live updates send full snapshots.** SSE pushes the whole board on change and keeps the last 100 per project for `Last-Event-ID` replay; there are no per-task deltas or websocket fan-out yet. A reconnect older than the window gets the oldest retained snapshot and then the current board.

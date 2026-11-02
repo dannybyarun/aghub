@@ -15,7 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 PYTHONPATH = str(ROOT / "src")
 sys.path.insert(0, PYTHONPATH)
 
-from aghub import hubclient, render  # noqa: E402
+from aghub import github, hubclient, render  # noqa: E402
 from aghub.board import Board  # noqa: E402
 from aghub.hub import build_server  # noqa: E402
 
@@ -1359,6 +1359,119 @@ class AghubTestCase(unittest.TestCase):
         self.assertTrue(payload["approval"]["stale"])
         self.assertEqual(payload["check"]["conclusion"], "action_required")
         self.assertIn("older commit", payload["check"]["output"]["summary"])
+
+        w.aghub("be", "submit", "T-003", agent="be-1")
+
+    def test_github_webhook_records_review_from_signed_fixture(self):
+        w = self.world
+        self.bootstrap()
+        w.aghub(
+            "fe",
+            "task",
+            "add",
+            "Ship API",
+            "--paths",
+            "src/api/**",
+            "--requires-approval",
+            agent="fe-1",
+        )
+        w.aghub(
+            "fe", "policy", "set", "--github", "alice=fe-1", agent="fe-1"
+        )
+        w.aghub("be", "claim", "T-003", agent="be-1")
+        branch = "agent/be-1/T-003"
+        git(w.be, "checkout", "-q", branch)
+        w.commit_file("be", "src/api/items.py", "print('ok')\n", "api")
+        git(w.be, "push", "-qu", "origin", branch)
+        head = git(w.be, "rev-parse", "HEAD").stdout.strip()
+
+        fixture = ROOT / "tests" / "fixtures" / "github" / "pull_request_review.approved.json"
+        event = json.loads(fixture.read_text())
+        event["pull_request"]["head"]["ref"] = branch
+        event["pull_request"]["head"]["sha"] = head
+        event["review"]["id"] = 424242
+        body = json.dumps(event).encode("utf-8")
+        signature = github.webhook_signature("hook-secret", body)
+        event_path = Path(w.base) / "webhook-event.json"
+        event_path.write_bytes(body)
+
+        delivered = w.aghub(
+            "fe",
+            "github",
+            "webhook",
+            "--event",
+            str(event_path),
+            "--signature",
+            signature,
+            "--secret",
+            "hook-secret",
+            "--repo",
+            "acme/repo",
+            "--reviewer-agent",
+            "github-review",
+            "--no-comment",
+            "--no-check",
+            "--json",
+            agent="fe-1",
+        )
+        payload = json.loads(delivered.stdout)
+        self.assertEqual(payload["event"], "pull_request_review")
+        self.assertEqual(payload["result"]["task"], "T-003")
+        self.assertEqual(payload["result"]["recorded"]["external_id"], "424242")
+
+        state = json.loads(w.aghub("fe", "status", "--json", agent="fe-1").stdout)
+        records = [item for item in state["approvals"] if item["task"] == "T-003"]
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["source"], "github")
+        self.assertEqual(records[0]["reviewer"], "fe-1")
+        self.assertEqual(records[0]["commit"], head)
+
+        again = w.aghub(
+            "fe",
+            "github",
+            "webhook",
+            "--event",
+            str(event_path),
+            "--signature",
+            signature,
+            "--secret",
+            "hook-secret",
+            "--repo",
+            "acme/repo",
+            "--reviewer-agent",
+            "github-review",
+            "--no-comment",
+            "--no-check",
+            "--json",
+            agent="fe-1",
+        )
+        self.assertIn(
+            "already recorded", " ".join(json.loads(again.stdout)["result"]["messages"])
+        )
+        state = json.loads(w.aghub("fe", "status", "--json", agent="fe-1").stdout)
+        self.assertEqual(
+            len([item for item in state["approvals"] if item["task"] == "T-003"]), 1
+        )
+
+        rejected = w.aghub(
+            "fe",
+            "github",
+            "webhook",
+            "--event",
+            str(event_path),
+            "--signature",
+            "sha256=" + "0" * 64,
+            "--secret",
+            "hook-secret",
+            "--repo",
+            "acme/repo",
+            "--no-comment",
+            "--no-check",
+            agent="fe-1",
+            check=False,
+        )
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn("signature", rejected.stderr.lower())
 
         w.aghub("be", "submit", "T-003", agent="be-1")
 

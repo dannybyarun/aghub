@@ -4,6 +4,7 @@ import json
 import os
 import shlex
 import sys
+import threading
 import time
 
 import yaml
@@ -1567,18 +1568,13 @@ def cmd_ci(args):
     return 0 if payload["ok"] else 1
 
 
-def cmd_github(args):
+def _github_sync_event(board, args, agent, event, token=None, api=None):
+    """Record trusted reviews and publish the review comment/check for one event."""
     from . import github, review
 
-    def log(*values, **kwargs):
-        kwargs.setdefault("file", sys.stderr if args.json else sys.stdout)
-        print(*values, **kwargs)
-
-    board = _fresh_board()
-    state = board.load()
-    agent = _resolve_agent(args, read_local_config(board.common))
-    event = github.load_event(args.event)
+    messages = []
     info = github.pull_request_info(event)
+    state = board.load()
 
     task = None
     if args.task:
@@ -1593,18 +1589,14 @@ def cmd_github(args):
         )
     if task is None:
         where = f"PR #{info.get('number')}" if info.get("number") else "this event"
-        message = f"no aghub task for {where} (branch {info.get('branch') or '—'})"
-        if args.json:
-            print(
-                json.dumps(
-                    {"task": None, "reason": message},
-                    indent=2,
-                    sort_keys=False,
-                )
-            )
-        else:
-            print(message)
-        return 0
+        return {
+            "task": None,
+            "reason": (
+                f"no aghub task for {where} "
+                f"(branch {info.get('branch') or '—'})"
+            ),
+            "messages": messages,
+        }
 
     recorded = None
     review_info = info.get("review") or {}
@@ -1628,10 +1620,9 @@ def cmd_github(args):
         repository = args.repo or os.environ.get("GITHUB_REPOSITORY")
         fork = bool(head_repo and repository and head_repo.lower() != repository.lower())
         if fork and not args.allow_fork_reviews:
-            print(
+            messages.append(
                 "aghub: warning: refusing to record an approval from a fork PR "
-                "(pass --allow-fork-reviews to change this)",
-                file=sys.stderr,
+                "(pass --allow-fork-reviews to change this)"
             )
         else:
             external_id = review_info.get("id")
@@ -1645,7 +1636,7 @@ def cmd_github(args):
                 for item in state.approvals
             )
             if already:
-                log(f"review {external_id} already recorded")
+                messages.append(f"review {external_id} already recorded")
             else:
                 decision = (
                     "approved"
@@ -1659,10 +1650,9 @@ def cmd_github(args):
                 login = review_info.get("login") or ""
                 reviewer = service.github_reviewer(state, login) or signer
                 if args.dry_run:
-                    print(
+                    messages.append(
                         f"would record {decision} for {task['id']} from "
-                        f"{login or '?'} as {reviewer}",
-                        file=sys.stderr,
+                        f"{login or '?'} as {reviewer}"
                     )
                 else:
                     recorded = _record_review(
@@ -1684,7 +1674,7 @@ def cmd_github(args):
                         if reviewer and reviewer != signer
                         else ""
                     )
-                    log(
+                    messages.append(
                         f"recorded GitHub {review_info['state']} from "
                         f"{review_info.get('login') or '?'} as {signer}{via}"
                     )
@@ -1694,30 +1684,17 @@ def cmd_github(args):
     markdown = github.comment_body(packet)
     details_url = args.details_url or info.get("url") or None
     check = github.check_payload(packet, details_url=details_url)
-
-    if args.json:
-        print(
-            json.dumps(
-                {
-                    "task": task["id"],
-                    "recorded": recorded,
-                    "approval": packet["approval"],
-                    "comment": markdown,
-                    "check": check,
-                },
-                indent=2,
-                sort_keys=False,
-            )
-        )
-        return 0
+    result = {
+        "task": task["id"],
+        "recorded": recorded,
+        "approval": packet["approval"],
+        "comment": markdown,
+        "check": check,
+        "messages": messages,
+    }
 
     if args.dry_run:
-        print(markdown)
-        print(
-            f"\ncheck: {check['name']} · {check['conclusion']} · "
-            f"{check['output']['title']}"
-        )
-        return 0
+        return result
 
     if not info.get("number") or not info.get("sha"):
         raise AghubError(
@@ -1726,21 +1703,176 @@ def cmd_github(args):
         )
     repo = args.repo or os.environ.get("GITHUB_REPOSITORY")
     if args.comment:
-        result = github.upsert_comment(
-            repo, info["number"], markdown, token=args.token
+        published = github.upsert_comment(
+            repo, info["number"], markdown, token=token, api=api
         )
-        log(
-            f"comment {result['id']} {'updated' if result['updated'] else 'created'} "
+        result["comment_result"] = published
+        messages.append(
+            f"comment {published['id']} "
+            f"{'updated' if published['updated'] else 'created'} "
             f"on PR #{info['number']}"
         )
     if args.check:
-        result = github.upsert_check(repo, info["sha"], check, token=args.token)
-        log(
-            f"check {result['id']} {'updated' if result['updated'] else 'created'} "
+        published = github.upsert_check(
+            repo, info["sha"], check, token=token, api=api
+        )
+        result["check_result"] = published
+        messages.append(
+            f"check {published['id']} "
+            f"{'updated' if published['updated'] else 'created'} "
             f"on {info['sha'][:12]} ({check['conclusion']})"
         )
+    return result
+
+
+def cmd_github(args):
+    from . import github
+
+    board = _fresh_board()
+    agent = _resolve_agent(args, read_local_config(board.common))
+    auth = github.app_auth(
+        getattr(args, "app_id", None),
+        getattr(args, "private_key", None),
+        getattr(args, "installation_id", None),
+        api=getattr(args, "api_url", None),
+    )
+    event = github.load_event(args.event)
+
+    token = args.token or (auth.token() if auth and not args.dry_run else None)
+    result = _github_sync_event(
+        board, args, agent, event, token=token, api=args.api_url
+    )
+
+    if result["task"] is None:
+        if args.json:
+            print(json.dumps(result, indent=2, sort_keys=False))
+        else:
+            print(result["reason"])
+        return 0
+
+    if args.json:
+        print(json.dumps(result, indent=2, sort_keys=False))
+        return 0
+
+    for message in result["messages"]:
+        if message.startswith("aghub: warning:"):
+            print(message, file=sys.stderr)
+        else:
+            print(message)
+
+    if args.dry_run:
+        print(result["comment"])
+        print(
+            f"\ncheck: {result['check']['name']} · "
+            f"{result['check']['conclusion']} · "
+            f"{result['check']['output']['title']}"
+        )
+        return 0
     return 0
 
+
+def _github_webhook_summary(delivery):
+    inner = delivery.get("result") or {}
+    if delivery.get("event") == "ping":
+        return "pong"
+    if inner.get("task") is None:
+        return inner.get("reason") or "ignored"
+    lines = []
+    for message in inner.get("messages") or []:
+        lines.append(message)
+    approval = inner.get("approval") or {}
+    lines.append(
+        f"{inner['task']}: approval {approval.get('decision') or 'pending'}"
+    )
+    return "\n".join(lines)
+
+
+def cmd_github_webhook(args):
+    """Run a verified GitHub webhook receiver on this trusted clone."""
+    from . import github
+
+    secret = (
+        args.secret
+        or os.environ.get("AGHUB_GITHUB_WEBHOOK_SECRET")
+        or os.environ.get("GITHUB_WEBHOOK_SECRET")
+    )
+    if not secret:
+        raise AghubError(
+            "a webhook secret is required (--secret or "
+            "AGHUB_GITHUB_WEBHOOK_SECRET)"
+        )
+    board = _fresh_board()
+    agent = _resolve_agent(args, read_local_config(board.common))
+    auth = github.app_auth(
+        getattr(args, "app_id", None),
+        getattr(args, "private_key", None),
+        getattr(args, "installation_id", None),
+        api=getattr(args, "api_url", None),
+    )
+    lock = threading.Lock()
+
+    def on_event(kind, event, delivery):
+        if kind == "ping":
+            return {"message": "pong", "delivery": delivery}
+        if kind != "pull_request_review":
+            return {
+                "ignored": f"{kind or 'unknown'} is not a pull_request_review event"
+            }
+        sync_args = argparse.Namespace(
+            task=args.task,
+            repo=args.repo,
+            record_reviews=True,
+            allow_association=args.allow_association,
+            allow_fork_reviews=args.allow_fork_reviews,
+            reviewer_agent=args.reviewer_agent,
+            comment=not args.no_comment,
+            check=not args.no_check,
+            details_url=args.details_url,
+            dry_run=args.dry_run,
+            json=True,
+        )
+        with lock:
+            board.sync()
+            token = None
+            if not args.dry_run:
+                token = args.token or (auth.token() if auth else None)
+            return _github_sync_event(
+                board, sync_args, agent, event, token=token, api=args.api_url
+            )
+
+    receiver = github.WebhookReceiver(secret, on_event, max_bytes=args.max_body)
+
+    if args.event:
+        if not args.signature:
+            raise AghubError("--signature is required with --event")
+        with open(args.event, "rb") as handle:
+            body = handle.read()
+        headers = {
+            "X-GitHub-Event": args.event_name,
+            "X-GitHub-Delivery": args.delivery or "",
+            "X-Hub-Signature-256": args.signature,
+        }
+        delivery = receiver.receive(headers, body)
+        if args.json:
+            print(json.dumps(delivery, indent=2, sort_keys=False))
+        else:
+            print(_github_webhook_summary(delivery))
+        return 0
+
+    server = github.webhook_server(receiver, args.bind, args.port)
+    host, port = server.server_address[:2]
+    print(
+        f"aghub: listening for GitHub webhooks on "
+        f"http://{host}:{port}{github.WEBHOOK_PATH}",
+        flush=True,
+    )
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+    return 0
 
 def cmd_heartbeat(args):
     board = Board.discover()
@@ -2403,7 +2535,81 @@ def build_parser():
     github_sync.add_argument("--details-url", default=None)
     github_sync.add_argument("--dry-run", action="store_true", help="print, do not call GitHub")
     github_sync.add_argument("--json", action="store_true")
+    github_sync.add_argument(
+        "--app-id", default=None, help="GitHub App id (default: AGHUB_GITHUB_APP_ID)"
+    )
+    github_sync.add_argument(
+        "--private-key",
+        default=None,
+        help="GitHub App private key PEM or path (default: AGHUB_GITHUB_APP_PRIVATE_KEY)",
+    )
+    github_sync.add_argument(
+        "--installation-id",
+        default=None,
+        help="GitHub App installation id (default: AGHUB_GITHUB_INSTALLATION_ID)",
+    )
+    github_sync.add_argument(
+        "--api-url", default=None, help="GitHub API base (default: GITHUB_API_URL)"
+    )
     github.set_defaults(func=cmd_github)
+
+    github_webhook = github_sub.add_parser(
+        "webhook",
+        help="receive signed GitHub App webhooks and record reviews on a trusted clone",
+    )
+    github_webhook.add_argument("--task", default=None, help="explicit task id")
+    github_webhook.add_argument(
+        "--event", default=None, help="process one payload file instead of serving"
+    )
+    github_webhook.add_argument(
+        "--event-name", default="pull_request_review", help="X-GitHub-Event value for --event"
+    )
+    github_webhook.add_argument(
+        "--signature", default=None, help="X-Hub-Signature-256 value for --event"
+    )
+    github_webhook.add_argument(
+        "--delivery", default=None, help="X-GitHub-Delivery value for --event"
+    )
+    github_webhook.add_argument(
+        "--secret",
+        default=None,
+        help="webhook secret (default: AGHUB_GITHUB_WEBHOOK_SECRET)",
+    )
+    github_webhook.add_argument("--bind", default="127.0.0.1")
+    github_webhook.add_argument("--port", type=int, default=8787)
+    github_webhook.add_argument("--repo", default=None, help="owner/name")
+    github_webhook.add_argument("--token", default=None, help="explicit GitHub token")
+    github_webhook.add_argument(
+        "--reviewer-agent",
+        default=None,
+        help="board identity for recorded reviews (default: this agent)",
+    )
+    github_webhook.add_argument(
+        "--allow-association",
+        default="OWNER,MEMBER,COLLABORATOR",
+        help="trusted GitHub author associations (comma separated)",
+    )
+    github_webhook.add_argument(
+        "--allow-fork-reviews",
+        action="store_true",
+        help="record reviews from fork PRs (unsafe by default)",
+    )
+    github_webhook.add_argument("--no-comment", action="store_true")
+    github_webhook.add_argument("--no-check", action="store_true")
+    github_webhook.add_argument("--details-url", default=None)
+    github_webhook.add_argument("--dry-run", action="store_true")
+    github_webhook.add_argument("--json", action="store_true")
+    github_webhook.add_argument(
+        "--max-body",
+        type=int,
+        default=2097152,
+        help="maximum webhook payload bytes (default: 2 MiB)",
+    )
+    github_webhook.add_argument("--app-id", default=None)
+    github_webhook.add_argument("--private-key", default=None)
+    github_webhook.add_argument("--installation-id", default=None)
+    github_webhook.add_argument("--api-url", default=None)
+    github_webhook.set_defaults(func=cmd_github_webhook)
 
     heartbeat = sub.add_parser("heartbeat", help="refresh this agent's lease")
     heartbeat.set_defaults(func=cmd_heartbeat)

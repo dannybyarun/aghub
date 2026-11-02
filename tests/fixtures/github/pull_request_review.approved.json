@@ -1,0 +1,42 @@
+{
+  "action": "submitted",
+  "number": 7,
+  "pull_request": {
+    "number": 7,
+    "title": "Ship API",
+    "body": "Implements T-003.",
+    "html_url": "https://github.com/acme/repo/pull/7",
+    "draft": false,
+    "user": {
+      "login": "alice"
+    },
+    "head": {
+      "ref": "agent/be-1/T-003",
+      "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "repo": {
+        "full_name": "acme/repo"
+      }
+    },
+    "base": {
+      "ref": "main",
+      "sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    }
+  },
+  "review": {
+    "id": 9001,
+    "state": "approved",
+    "user": {
+      "login": "alice"
+    },
+    "author_association": "MEMBER",
+    "body": "ship it",
+    "html_url": "https://github.com/acme/repo/pull/7#pullrequestreview-9001"
+  },
+  "repository": {
+    "full_name": "acme/repo",
+    "default_branch": "main"
+  },
+  "sender": {
+    "login": "alice"
+  }
+}

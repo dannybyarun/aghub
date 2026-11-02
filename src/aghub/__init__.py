@@ -1,3 +1,3 @@
 """aghub — a shared board for parallel coding agents."""
 
-__version__ = "0.7.0"
+__version__ = "0.8.0"
