@@ -162,6 +162,35 @@ def audit_export(
     )
 
 
+def backup(base, project, token=None):
+    """Download one project's hub-state archive (a parsed JSON object)."""
+    text = request(
+        base, "GET", "/api/admin/backup?project=" + quote(project), token=token, raw=True
+    )
+    import json as _json
+
+    return _json.loads(text)
+
+
+def restore(base, archive, replace=False, token=None):
+    return request(
+        base,
+        "POST",
+        "/api/admin/restore",
+        {"archive": archive, "replace": bool(replace)},
+        token=token,
+    )
+
+
+def prune(base, max_age_days=None, max_events=None, token=None):
+    payload = {}
+    if max_age_days is not None:
+        payload["max_age_days"] = int(max_age_days)
+    if max_events is not None:
+        payload["max_events"] = int(max_events)
+    return request(base, "POST", "/api/admin/prune", payload, token=token)
+
+
 def board(base, project=None, token=None):
     path = "/api/board"
     if project:

@@ -2043,6 +2043,8 @@ def cmd_hub(args):
             tokens=tokens,
             rate_limit=args.rate_limit,
             postgres=args.postgres,
+            retention_days=args.retention_days,
+            retention_events=args.retention_events,
         )
         return 0
 
@@ -2126,6 +2128,53 @@ def cmd_hub(args):
             print(f"wrote {path} ({len(text.splitlines())} records)")
         else:
             sys.stdout.write(text)
+        return 0
+
+    if args.hub_command == "backup":
+        try:
+            archive = hubclient.backup(
+                hubs, args.project, token=config.get("hub_token")
+            )
+        except hubclient.HubError as exc:
+            raise AghubError(f"backup failed: {exc}")
+        text = json.dumps(archive, indent=2)
+        if args.out:
+            path = os.path.abspath(args.out)
+            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(text)
+            print(f"wrote {path} (project {archive.get('project')})")
+        else:
+            sys.stdout.write(text + "\n")
+        return 0
+
+    if args.hub_command == "restore":
+        with open(os.path.expanduser(args.file), "r", encoding="utf-8") as handle:
+            archive = json.load(handle)
+        try:
+            result = hubclient.restore(
+                hubs, archive, replace=args.replace, token=config.get("hub_token")
+            )
+        except hubclient.HubError as exc:
+            raise AghubError(f"restore failed: {exc}")
+        restored = result.get("restored") or {}
+        print(f"restored project {restored.get('project')}")
+        return 0
+
+    if args.hub_command == "prune":
+        if args.max_age_days is None and args.max_events is None:
+            raise AghubError("pass --max-age-days and/or --max-events")
+        try:
+            result = hubclient.prune(
+                hubs,
+                max_age_days=args.max_age_days,
+                max_events=args.max_events,
+                token=config.get("hub_token"),
+            )
+        except hubclient.HubError as exc:
+            raise AghubError(f"prune failed: {exc}")
+        removed = result.get("removed") or {}
+        print("pruned " + (", ".join(f"{value} {key}" for key, value in removed.items()) or "nothing"))
         return 0
 
     healthy = None
@@ -2731,6 +2780,18 @@ def build_parser():
         help="Postgres DSN (requires the optional psycopg package)",
     )
     hub_serve.add_argument("--verbose", action="store_true")
+    hub_serve.add_argument(
+        "--retention-days",
+        type=int,
+        default=None,
+        help="prune audit events and resolved review requests older than N days (hourly)",
+    )
+    hub_serve.add_argument(
+        "--retention-events",
+        type=int,
+        default=None,
+        help="keep at most N audit events per project (hourly)",
+    )
     hub_connect = hub_sub.add_parser("connect")
     hub_connect.add_argument(
         "url", nargs="+", help="primary hub URL followed by optional failover URLs"
@@ -2744,6 +2805,25 @@ def build_parser():
     hub_audit.add_argument("--after", type=int, default=0)
     hub_audit.add_argument("--limit", type=int, default=1000)
     hub_audit.add_argument("--out", default=None, metavar="PATH")
+    hub_backup = hub_sub.add_parser(
+        "backup", help="export a project's hub state to a JSON archive (admin token)"
+    )
+    hub_backup.add_argument("--project", required=True)
+    hub_backup.add_argument("--out", default=None, metavar="PATH")
+    hub_restore = hub_sub.add_parser(
+        "restore", help="restore a project from a backup archive (admin token)"
+    )
+    hub_restore.add_argument("file", help="path to a backup archive")
+    hub_restore.add_argument(
+        "--replace",
+        action="store_true",
+        help="delete the project's existing hub rows before restoring",
+    )
+    hub_prune = hub_sub.add_parser(
+        "prune", help="trim old audit events and resolved reviews (admin token)"
+    )
+    hub_prune.add_argument("--max-age-days", type=int, default=None)
+    hub_prune.add_argument("--max-events", type=int, default=None)
     hub_sub.add_parser("status")
     hub.set_defaults(func=cmd_hub)
 
