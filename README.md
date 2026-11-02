@@ -326,6 +326,9 @@ Non-admin tokens can export only their own actor; asking for another actor retur
 | `GET /api/history?project=NAME&after=SEQ&limit=N` | bounded board history (max 100) |
 | `GET /api/audit?project=NAME&after=SEQ&limit=N&actor=NAME` | hub operation audit log (admin token) |
 | `GET /api/audit/export?format=jsonl\|csv&actor=NAME&project=NAME&after=SEQ&limit=N` | per-token audit export (JSONL/CSV) |
+| `GET /api/admin/backup?project=NAME` | export one project's hub state as a JSON archive (admin, token-scoped) |
+| `POST /api/admin/restore` | restore a project from a backup archive (admin, token-scoped) |
+| `POST /api/admin/prune` | trim old audit events and resolved reviews (admin, token-scoped) |
 | `POST /api/snapshot` | publish a board snapshot (optional `fencing` rejects a stale writer) |
 | `POST /api/heartbeat` | presence + lease extension |
 | `POST /api/claim` | acquire a lease (409 on conflict) |
@@ -335,6 +338,25 @@ Non-admin tokens can export only their own actor; asking for another actor retur
 | `GET /api/review/requests?project=NAME&status=pending` / `POST /api/review/requests` | queue and submit browser review intents |
 | `POST /api/review/claim\|resolve\|cancel` | worker claim / signed result / cancellation |
 | `POST /api/debug/expire` | simulate a dead agent |
+
+#### Retention, backup, and restore
+
+A long-lived hosted hub accumulates audit events and resolved review requests. Two knobs keep its storage bounded, pruned hourly by a background task:
+
+```bash
+aghub hub serve --host 0.0.0.0 --tokens-file tokens.json \
+  --retention-days 30 --retention-events 5000
+```
+
+`--retention-days N` deletes audit events and resolved/cancelled review requests older than N days; `--retention-events N` keeps at most N audit events per project. An operator can also prune on demand, and back up or restore one tenant at a time:
+
+```bash
+aghub hub backup --project store-web --out store-web.json
+aghub hub restore store-web.json --replace
+aghub hub prune --max-age-days 30 --max-events 5000
+```
+
+These three commands call the `admin` endpoints and are **token-scoped**: an admin token limited to `["store-web"]` can back up, restore, and prune only `store-web`, so one tenant's operator can never read or overwrite another tenant's state. Backups capture the snapshot, agents, leases, counters, the writer lease, review packets, and review requests, plus the audit log; the restore gives the snapshot a fresh sequence so SSE ordering stays monotonic, and skips the ephemeral SSE replay buffer and rate-limit windows. A restore is idempotent for its rows (`--replace` first clears the project). These admin operations are available on the default SQLite store; a hub backed by Postgres reports `501` until the store grows the same methods.
 
 ### ACLs and reviews
 
@@ -872,9 +894,10 @@ reimplemented or bypassed.
 | `aghub github webhook [--bind H] [--port P] [--secret S] [--event PATH --signature SIG] [--no-comment] [--no-check]` | verify GitHub App webhooks and record review events on a trusted clone |
 | `aghub mcp serve [--agent ID]` / `mcp tools` | MCP stdio server and tool catalog |
 | `aghub sync` | fetch board + trunk |
-| `aghub hub serve [--host H] [--port P] [--db PATH] [--token T] [--read-token T] [--tokens-file F] [--rate-limit N] [--postgres DSN]` | run the lease/presence hub + web board |
+| `aghub hub serve [--host H] [--port P] [--db PATH] [--token T] [--read-token T] [--tokens-file F] [--rate-limit N] [--postgres DSN] [--retention-days N] [--retention-events N]` | run the lease/presence hub + web board |
 | `aghub hub connect URL [URL ...] [--token T]` | point this clone at a hub, with optional failover URLs |
 | `aghub hub audit [--format jsonl\|csv] [--actor ID] [--project NAME] [--after SEQ] [--limit N] [--out PATH]` | export the hub operation log |
+| `aghub hub backup --project NAME [--out PATH]` / `hub restore FILE [--replace]` / `hub prune [--max-age-days N] [--max-events N]` | admin: back up, restore, or trim a tenant's hub state |
 | `aghub hub status` | probe every configured hub and the published project |
 | `aghub hub disconnect` | fall back to git-only state |
 | `aghub debug expire AGENT` | simulate a dead agent (demo/test) |
@@ -929,6 +952,8 @@ projects and delete their own rows; still, point them at a scratch database.
 - **Failover needs one authority.** A failover set must point at hubs backed by the same store (Postgres, or the same SQLite file with one writer). Two independent databases are two independent worlds: failover provides availability, not consensus.
 - **Quotas are coarse fixed windows.** `requests_per_minute` uses a per-actor counter in the shared store, not a token bucket, so a tenant can burst at a window boundary. `max_request_bytes` is checked from `Content-Length`; chunked request bodies are not accepted. A quota `429` is authoritative and is never retried against another hub.
 - **Audit export is not the signed git history.** `/api/audit/export` records hub requests and lease operations with a token actor label. Tamper evidence for tasks, contracts, handoffs, and merges still comes from `aghub verify` over the hash-chained board.
+- **Retention is pruning, not archival.** `--retention-days` / `--retention-events` (and `aghub hub prune`) delete old audit events and resolved review requests to bound storage; they do not archive them first, so export anything you need to keep with `aghub hub audit` beforehand. Durable task history always lives in git, not the hub.
+- **Backup/restore covers hub state, scoped per tenant.** `aghub hub backup` / `restore` move one project's snapshot, agents, leases, counters, writer lease, review packets/requests, and audit log; a token scoped to a project can only back up or restore that project. The restore skips the ephemeral SSE replay buffer and rate-limit windows and re-sequences the snapshot. It is hub state only — the board's git history is the durable record — and is implemented on the SQLite store (a Postgres-backed hub returns `501` until it grows the same methods).
 - **The merge check is sandboxed by default but is still not a security boundary.** `submit`/`queue run` execute `project.check` through the same sandbox runner as evals (`auto` uses Bubblewrap, otherwise a scrubbed snapshot). `--check-sandbox off` and `--sandbox off` intentionally opt out. Traces are signed evidence, not proof of isolation; re-run the command to reproduce.
 - **Codegen covers an OpenAPI subset.** Paths, methods, `operationId`, component schemas, `$ref`, arrays, enums, unions, examples, common scalar formats, parameters (path/query/header with `required` and `enum`), `http`/`apiKey` security schemes, and a dialect-aware starting SQL migration (`postgres`, `sqlite`, `mysql`). Parameter validation enforces only `required` and `enum`, not full JSON Schema; callbacks, discriminators, oauth2 flows, and `oneOf`-style request-body validation are not generated.
 - **Eval fingerprints identify an input, not a whole environment.** They cover command, suite, commit, tree, dirty/untracked input, and timeout. `eval rerun` compares fingerprints but does not pin toolchain or container images, and ignored files are not hashed.
@@ -939,7 +964,7 @@ projects and delete their own rows; still, point them at a scratch database.
 
 ## Next
 
-1. Hosted hub hardening: per-tenant isolation beyond token scopes, storage retention, and backup/restore workflows.
+1. Postgres parity for backup/restore/prune, plus scheduled off-box backups and point-in-time restore.
 2. Deeper codegen still: request-body validation, discriminated unions, and oauth2 flows.
 3. Cross-shard views: a read-only aggregate over several board shards for a single pane of glass.
 4. GitHub App OAuth device flow and dismissed-review audit history across multiple boards.

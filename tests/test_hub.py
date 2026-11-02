@@ -201,6 +201,49 @@ class HubStoreTests(unittest.TestCase):
         self.assertFalse(forced["expired"])
         self.assertFalse(self.store.board_lock("p")["active"])
 
+    def test_prune_trims_old_events_and_caps_counts(self):
+        for _ in range(3):
+            self.store.publish("p", {"project": {"name": "p"}})
+        self.store.conn.execute(
+            "UPDATE events SET at=? WHERE project='p'", (ago_iso(40 * 86400),)
+        )
+        self.store.conn.commit()
+        removed = self.store.prune(max_age_days=30)
+        self.assertGreater(removed["events"], 0)
+        self.assertEqual(self.store.audit("p", limit=100), [])
+
+    def test_prune_caps_events_per_project(self):
+        for _ in range(5):
+            self.store.publish("p", {"project": {"name": "p"}})
+        self.store.prune(max_events=2)
+        self.assertLessEqual(len(self.store.audit("p", limit=100)), 2)
+
+    def test_prune_can_scope_to_specific_projects(self):
+        self.store.publish("q", {"project": {"name": "q"}})
+        self.store.conn.execute("UPDATE events SET at=?", (ago_iso(40 * 86400),))
+        self.store.conn.commit()
+        self.store.prune(max_age_days=30, projects=["p"])
+        # p's events are gone; q's are untouched.
+        self.assertEqual(self.store.audit("p", limit=100), [])
+        self.assertTrue(self.store.audit("q", limit=100))
+
+    def test_backup_and_restore_roundtrip(self):
+        self.store.claim("p", "T-1", "a", ["src/**"], 600)
+        archive = self.store.export_project("p")
+        self.assertEqual(archive["project"], "p")
+        self.assertEqual(len(archive["leases"]), 1)
+        fresh = HubStore(":memory:")
+        self.addCleanup(fresh.close)
+        fresh.import_project(archive)
+        board = fresh.board("p")
+        self.assertEqual(board["project"], "p")
+        self.assertEqual(len(board["leases"]), 1)
+        self.assertEqual(board["leases"][0]["agent"], "a")
+
+    def test_import_rejects_non_archive(self):
+        with self.assertRaises(AghubError):
+            self.store.import_project({"not": "a backup"})
+
 
 class HubHttpTests(unittest.TestCase):
     @classmethod
@@ -231,6 +274,51 @@ class HubHttpTests(unittest.TestCase):
             sock.bind(("127.0.0.1", 0))
             port = sock.getsockname()[1]
         return f"http://127.0.0.1:{port}"
+
+    def test_admin_backup_and_restore_are_scoped(self):
+        tokens = {
+            "root": {"role": "admin"},
+            "web": {"role": "admin", "projects": ["web"]},
+            "w": {"role": "writer", "projects": ["web"]},
+        }
+        _server, _store, base = self._local_server(tokens=tokens)
+        hubclient.publish(base, "web", {"project": {"name": "web"}, "tasks": [{"id": "T-1"}]}, token="root")
+        hubclient.publish(base, "api", {"project": {"name": "api"}}, token="root")
+
+        archive = hubclient.backup(base, "web", token="web")
+        self.assertEqual(archive["project"], "web")
+
+        with self.assertRaises(hubclient.HubError) as cross:
+            hubclient.backup(base, "api", token="web")
+        self.assertEqual(cross.exception.status, 403)
+
+        with self.assertRaises(hubclient.HubError) as writer:
+            hubclient.backup(base, "web", token="w")
+        self.assertEqual(writer.exception.status, 403)
+
+        archive["project"] = "web2"
+        archive["snapshot"]["snapshot"] = archive["snapshot"]["snapshot"].replace(
+            '"web"', '"web2"'
+        )
+        hubclient.restore(base, archive, token="root")
+        self.assertEqual(hubclient.board(base, "web2", token="root")["project"], "web2")
+
+        with self.assertRaises(hubclient.HubError) as cross_restore:
+            hubclient.restore(
+                base,
+                {"aghub_backup": 1, "project": "api", "snapshot": {"snapshot": "{}"}},
+                token="web",
+            )
+        self.assertEqual(cross_restore.exception.status, 403)
+
+    def test_admin_prune_requires_admin(self):
+        tokens = {"root": {"role": "admin"}, "w": {"role": "writer"}}
+        _server, _store, base = self._local_server(tokens=tokens)
+        hubclient.publish(base, "p", {"project": {"name": "p"}}, token="root")
+        with self.assertRaises(hubclient.HubError) as denied:
+            hubclient.prune(base, max_events=0, token="w")
+        self.assertEqual(denied.exception.status, 403)
+        self.assertIn("events", hubclient.prune(base, max_events=0, token="root")["removed"])
 
     def test_health_is_open_and_api_requires_token(self):
         self.assertTrue(hubclient.health(self.base)["ok"])
