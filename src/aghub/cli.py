@@ -501,6 +501,26 @@ def _record_review(
     )
 
 
+def _record_dismissal(board, agent, task_id, external_id, note="", source="github"):
+    """Record a dismissal that retracts an earlier (GitHub) review by its id."""
+    state = board.load()
+    key = _review_key(board, state, agent)
+    return board.transaction(
+        f"dismiss review {external_id} on {task_id}",
+        lambda current: service.dismiss_review(
+            current,
+            task_id,
+            agent,
+            external_id,
+            note=note,
+            private_key=key.get("private_key"),
+            public_key=key.get("public_key"),
+            source=source,
+        ),
+        agent=agent,
+    )
+
+
 def cmd_approve(args):
     board = _fresh_board()
     state = board.load()
@@ -1740,9 +1760,40 @@ def _github_sync_event(board, args, agent, event, token=None, api=None):
 
     recorded = None
     review_info = info.get("review") or {}
-    if (
+    action = info.get("action")
+    head_repo = info.get("head_repo")
+    base_repo = info.get("base_repo")
+    repository = args.repo or info.get("repository") or os.environ.get("GITHUB_REPOSITORY")
+    # A PR is a fork when its head repo differs from the repo it targets. Prefer
+    # the PR's base repo (correct for multi-repo webhook workers); fall back to
+    # the configured repository when the payload omits it.
+    reference_repo = base_repo or repository
+    fork = bool(head_repo and reference_repo and head_repo.lower() != reference_repo.lower())
+
+    if args.record_reviews and task.get("requires_approval") and action == "dismissed" and review_info:
+        external_id = review_info.get("id")
+        if not external_id:
+            messages.append("aghub: warning: dismissed review had no id; ignoring")
+        elif args.dry_run:
+            messages.append(f"would dismiss GitHub review {external_id} for {task['id']}")
+        else:
+            recorded = _record_dismissal(
+                board,
+                args.reviewer_agent or agent,
+                task["id"],
+                external_id,
+                note=f"GitHub dismissed review by {review_info.get('login') or '?'}",
+            )
+            state = board.load()
+            if recorded:
+                messages.append(
+                    f"recorded GitHub dismissal of review {external_id} for {task['id']}"
+                )
+            else:
+                messages.append(f"review {external_id} already dismissed")
+    elif (
         args.record_reviews
-        and info.get("action") == "submitted"
+        and action == "submitted"
         and review_info.get("state") in ("approved", "changes_requested")
         and task.get("requires_approval")
     ):
@@ -1756,9 +1807,6 @@ def _github_sync_event(board, args, agent, event, token=None, api=None):
                 f"GitHub reviewer {review_info.get('login') or '?'} is not trusted "
                 f"({review_info.get('association') or 'no association'})"
             )
-        head_repo = info.get("head_repo")
-        repository = args.repo or os.environ.get("GITHUB_REPOSITORY")
-        fork = bool(head_repo and repository and head_repo.lower() != repository.lower())
         if fork and not args.allow_fork_reviews:
             messages.append(
                 "aghub: warning: refusing to record an approval from a fork PR "
@@ -1766,9 +1814,14 @@ def _github_sync_event(board, args, agent, event, token=None, api=None):
             )
         else:
             external_id = review_info.get("id")
-            if not info.get("sha"):
+            # Bind to the exact commit the reviewer approved. On a fork the PR
+            # head sha lives on the fork; the review's own commit_id is the
+            # fork-safe source of truth, with the head sha as a fallback.
+            commit = review_info.get("commit_id") or info.get("sha")
+            if not commit:
                 raise AghubError(
-                    "pull request head sha is missing; cannot bind this review to a commit"
+                    "pull request review has no commit to bind to "
+                    "(missing review commit_id and head sha)"
                 )
             already = any(
                 item.get("source") == "github"
@@ -1786,6 +1839,8 @@ def _github_sync_event(board, args, agent, event, token=None, api=None):
                 note = f"GitHub review by {review_info.get('login') or '?'}"
                 if review_info.get("body"):
                     note += f": {review_info['body']}"
+                if fork:
+                    note += " (fork)"
                 signer = args.reviewer_agent or agent
                 login = review_info.get("login") or ""
                 reviewer = service.github_reviewer(state, login) or signer
@@ -1801,7 +1856,7 @@ def _github_sync_event(board, args, agent, event, token=None, api=None):
                         task["id"],
                         decision,
                         note,
-                        info.get("sha") or None,
+                        commit,
                         False,
                         source="github",
                         external_id=external_id,
@@ -1817,6 +1872,7 @@ def _github_sync_event(board, args, agent, event, token=None, api=None):
                     messages.append(
                         f"recorded GitHub {review_info['state']} from "
                         f"{review_info.get('login') or '?'} as {signer}{via}"
+                        + (" (fork)" if fork else "")
                     )
 
     packet = review.review_packet(board, state, task["id"])
@@ -1841,7 +1897,7 @@ def _github_sync_event(board, args, agent, event, token=None, api=None):
             "GitHub sync needs a pull_request or pull_request_review payload "
             "with a PR number and head sha"
         )
-    repo = args.repo or os.environ.get("GITHUB_REPOSITORY")
+    repo = args.repo or info.get("repository") or os.environ.get("GITHUB_REPOSITORY")
     if args.comment:
         published = github.upsert_comment(
             repo, info["number"], markdown, token=token, api=api

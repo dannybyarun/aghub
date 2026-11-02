@@ -1508,6 +1508,72 @@ class AghubTestCase(unittest.TestCase):
 
         w.aghub("be", "submit", "T-003", agent="be-1")
 
+    def test_github_dismissed_review_retracts_the_approval(self):
+        w = self.world
+        self.bootstrap()
+        w.aghub(
+            "fe", "task", "add", "Ship API", "--paths", "src/api/**",
+            "--requires-approval", agent="fe-1",
+        )
+        w.aghub("fe", "policy", "set", "--github", "alice=fe-1", agent="fe-1")
+        w.aghub("be", "claim", "T-003", agent="be-1")
+        branch = "agent/be-1/T-003"
+        git(w.be, "checkout", "-q", branch)
+        w.commit_file("be", "src/api/items.py", "print('ok')\n", "api")
+        git(w.be, "push", "-qu", "origin", branch)
+        head = git(w.be, "rev-parse", "HEAD").stdout.strip()
+
+        def write_event(action, state="approved"):
+            event = {
+                "action": action,
+                "number": 7,
+                "repository": {"full_name": "acme/repo"},
+                "pull_request": {
+                    "number": 7,
+                    "title": "Ship API",
+                    "body": "",
+                    "html_url": "https://github.com/acme/repo/pull/7",
+                    "draft": False,
+                    "user": {"login": "alice"},
+                    "head": {"ref": branch, "sha": head, "repo": {"full_name": "acme/repo"}},
+                    "base": {"ref": "main", "repo": {"full_name": "acme/repo"}},
+                },
+                "review": {
+                    "id": 9001,
+                    "state": state,
+                    "commit_id": head,
+                    "user": {"login": "alice"},
+                    "author_association": "MEMBER",
+                    "body": "ship it",
+                },
+            }
+            path = Path(w.base) / "ev.json"
+            path.write_text(json.dumps(event))
+            return str(path)
+
+        # Record the approval, then confirm the gate is satisfied.
+        w.aghub(
+            "fe", "github", "sync", "--event", write_event("submitted"),
+            "--record-reviews", "--reviewer-agent", "github-review",
+            "--no-comment", "--no-check", agent="fe-1",
+        )
+        packet = json.loads(w.aghub("fe", "review", "T-003", "--json", agent="fe-1").stdout)
+        self.assertTrue(packet["approval"]["satisfied"])
+
+        # Dismiss the same review; the approval should stop counting.
+        dismissed = w.aghub(
+            "fe", "github", "sync", "--event", write_event("dismissed"),
+            "--record-reviews", "--reviewer-agent", "github-review",
+            "--no-comment", "--no-check", agent="fe-1",
+        )
+        self.assertIn("dismissal of review 9001", dismissed.stdout)
+        packet = json.loads(w.aghub("fe", "review", "T-003", "--json", agent="fe-1").stdout)
+        self.assertFalse(packet["approval"]["satisfied"])
+        self.assertEqual(len(packet["approval"]["dismissed"]), 1)
+
+        gated = w.aghub("be", "submit", "T-003", agent="be-1", check=False)
+        self.assertEqual(gated.returncode, 1)
+
     def test_github_webhook_records_review_from_signed_fixture(self):
         w = self.world
         self.bootstrap()
