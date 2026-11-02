@@ -1281,7 +1281,7 @@ def cmd_codegen(args):
     with open(source, "rb") as handle:
         blob = handle.read()
     files = codegen.generate(
-        args.name, version, meta, codegen.load_spec(blob), args.target
+        args.name, version, meta, codegen.load_spec(blob), args.target, args.dialect
     )
     out = os.path.abspath(os.path.expanduser(args.out))
 
@@ -2500,6 +2500,12 @@ def build_parser():
     gen.add_argument("--out", default="generated", help="output directory (default: generated)")
     gen.add_argument(
         "--target", choices=("all", "ts", "py", "mock", "sql"), default="all"
+    )
+    gen.add_argument(
+        "--dialect",
+        choices=("postgres", "sqlite", "mysql"),
+        default="postgres",
+        help="SQL dialect for the generated migration (default: postgres)",
     )
     gen.add_argument(
         "--check", action="store_true", help="fail if the output directory is out of date"
