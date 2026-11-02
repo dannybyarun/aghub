@@ -926,6 +926,94 @@ class AghubTestCase(unittest.TestCase):
         self.assertEqual(verified.returncode, 0)
         self.assertIn("0 invalid", verified.stdout)
 
+    def test_queue_enforces_protected_path_group(self):
+        w = self.world
+        self.bootstrap()
+        # Protect the API lane: any diff under src/api/** needs the security
+        # group, whose only member is the ci identity.
+        w.aghub(
+            "fe",
+            "policy",
+            "set",
+            "--group",
+            "security=ci",
+            "--protect",
+            "src/api/**:group=security",
+            agent="fe-1",
+        )
+        w.aghub(
+            "fe",
+            "task",
+            "add",
+            "Ship API",
+            "--paths",
+            "src/api/**",
+            "--requires-approval",
+            agent="fe-1",
+        )
+        w.aghub("be", "claim", "T-003", agent="be-1")
+        git(w.be, "checkout", "-q", "agent/be-1/T-003")
+        w.commit_file(
+            "be", "src/api/items.py", 'ROUTES = ["/items", "/items/{id}"]\n', "api"
+        )
+        git(w.be, "push", "-qu", "origin", "agent/be-1/T-003")
+
+        # A general reviewer satisfies the base count but not the protected rule.
+        w.aghub("fe", "approve", "T-003", "--note", "looks fine", agent="fe-1")
+        gated = w.aghub("be", "submit", "T-003", agent="be-1", check=False)
+        self.assertEqual(gated.returncode, 1)
+        self.assertIn("security", gated.stderr)
+
+        packet = json.loads(
+            w.aghub("fe", "review", "T-003", "--json", agent="fe-1").stdout
+        )
+        rule = packet["approval"]["protected"][0]
+        self.assertTrue(rule["triggered"])
+        self.assertEqual(rule["matched"], ["src/api/items.py"])
+
+        # Force it past the advisory submit gate; the queue is the authority.
+        w.aghub("be", "submit", "T-003", "--force", agent="be-1")
+        w.aghub("ci", "init", "--project", "test", agent="ci")
+        rejected = w.aghub("ci", "queue", "run", agent="ci")
+        self.assertIn("REJECTED", rejected.stdout)
+        self.assertIn("security", rejected.stdout)
+        self.assertNotIn("merge T-003", git(w.ci, "log", "--oneline", "origin/main").stdout)
+
+        # The security reviewer clears the protected rule; the merge proceeds.
+        w.aghub("ci", "approve", "T-003", "--note", "security ok", agent="ci")
+        w.aghub("be", "submit", "T-003", agent="be-1")
+        merged = w.aghub("ci", "queue", "run", agent="ci")
+        self.assertIn("merged", merged.stdout)
+        self.assertIn("merge T-003", git(w.ci, "log", "--oneline", "origin/main").stdout)
+
+    def test_policy_show_round_trips_protected_and_sla(self):
+        w = self.world
+        self.bootstrap()
+        w.aghub(
+            "fe",
+            "policy",
+            "set",
+            "--sla",
+            "3600",
+            "--group",
+            "db=be-1",
+            "--protect",
+            "migrations/**,**/schema.sql:group=db,approvals=2",
+            agent="fe-1",
+        )
+        policy = json.loads(w.aghub("fe", "policy", "show", "--json", agent="fe-1").stdout)
+        self.assertEqual(policy["sla_seconds"], 3600)
+        self.assertEqual(len(policy["protected_paths"]), 1)
+        rule = policy["protected_paths"][0]
+        self.assertEqual(rule["paths"], ["migrations/**", "**/schema.sql"])
+        self.assertEqual(rule["groups"], ["db"])
+        self.assertEqual(rule["approvals"], 2)
+
+        w.aghub("fe", "policy", "set", "--no-sla", "--clear-protected", agent="fe-1")
+        cleared = json.loads(w.aghub("fe", "policy", "show", "--json", agent="fe-1").stdout)
+        self.assertIsNone(cleared["sla_seconds"])
+        self.assertEqual(cleared["protected_paths"], [])
+
     def test_review_inbox_and_changes_requested_gate(self):
         w = self.world
         self.bootstrap()

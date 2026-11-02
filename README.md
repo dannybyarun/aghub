@@ -351,18 +351,50 @@ aghub policy set --approvals 2 --ttl 3600 \
   GitHub and web reviews are signed by the trusted worker, while `reviewer`
   records the human or board identity the decision belongs to.
 
+Two rules make review policy respond to *what* a branch changes and *how long*
+a decision waits:
+
+```bash
+aghub policy set --sla 3600 \
+  --group security=sec-1 \
+  --protect 'src/security/**,**/auth.py:group=security' \
+  --protect 'migrations/**:reviewer=carol,approvals=2'
+```
+
+- `review.protected_paths` are diff-conditioned rules. A rule lists path globs
+  and the requirement to apply when the task branch touches any of them:
+  `group=NAME` (an approval from that group), `reviewer=ID` (an approval from
+  that identity), and `approvals=N` (raise the required count). A rule triggers
+  only when the diff matches, so ordinary lanes keep the base policy. Protected
+  reviewers must be in the allowlist and protected groups must be defined, the
+  same validation per-task groups and reviewers already get. `--protect`
+  replaces the whole rule set; `--clear-protected` removes it.
+- `review.sla_seconds` flags a review that has been pending longer than the
+  threshold. The clock starts at the earliest open queue submission for the
+  task (or, before submit, when an owned branch last changed). A breach is
+  surfaced, not enforced: it marks the task **overdue** in the inbox, the review
+  packet, and the web board. Requesting changes pauses the clock, because the
+  task is then waiting on its owner, not a reviewer. `0` or `--no-sla` clears it.
+
+Because the gate needs the diff to decide which protected rules apply, the rules
+are **advisory where the diff is not yet known and authoritative at the merge
+queue**, which always re-derives the diff against trunk. The inbox is advisory
+(it does not fetch a diff per task), the review packet evaluates the branch it
+already fetched, and `queue run` is the final arbiter — matching the same
+advisory-at-write, authoritative-at-merge split the path claims already use.
+
 Per-task fields can tighten the board policy but cannot loosen it:
 
 ```bash
 aghub task add "Deploy billing" --paths 'src/billing/**' \
   --required-approvals 3 --reviewer-group security \
-  --reviewer alice --review-ttl 900
+  --reviewer alice --review-ttl 900 --review-sla 1800
 ```
 
-Task required counts use `max(board, task)`, TTLs use `min(board, task)`, task
-groups add to board groups, and task reviewers narrow the board allowlist.
-Supplying any of these flags implies `--requires-approval`. A policy change
-needs an admin only when ACLs are enabled.
+Task required counts use `max(board, task)`, TTLs and SLAs use
+`min(board, task)`, task groups add to board groups, and task reviewers narrow
+the board allowlist. Supplying any of these flags implies `--requires-approval`.
+A policy change needs an admin only when ACLs are enabled.
 
 Commit binding is recorded as `commit` plus `binding: commit`. Reviews require a
 pushed branch (or an explicit `--commit SHA`); if the branch cannot be resolved,
@@ -737,8 +769,8 @@ reimplemented or bypassed.
 | `aghub next` | first ready task, or the exact blockers |
 | `aghub agent [ID] [--key] [--rotate-key] [--revoke-key] [--key-id ID]` | set identity and manage this clone's eval key |
 | `aghub acl init\|list\|set\|remove\|revoke-key` | manage roles and key revocation |
-| `aghub policy show [--json]` / `policy set [--approvals N] [--ttl S] [--reviewer A] [--group NAME=A,B] [--require-group NAME] [--github LOGIN=AGENT] [--clear]` | board-wide reviewer policy |
-| `aghub task add TITLE --paths GLOB [--contract api@1] [--eval smoke] [--depends T-001] [--requires-approval] [--required-approvals N] [--reviewer-group NAME] [--reviewer A] [--review-ttl S] [--requires-sandbox]` | define work |
+| `aghub policy show [--json]` / `policy set [--approvals N] [--ttl S] [--sla S] [--reviewer A] [--group NAME=A,B] [--require-group NAME] [--protect 'GLOB[,GLOB]:group=NAME,reviewer=A,approvals=N'] [--github LOGIN=AGENT] [--clear]` | board-wide reviewer policy |
+| `aghub task add TITLE --paths GLOB [--contract api@1] [--eval smoke] [--depends T-001] [--requires-approval] [--required-approvals N] [--reviewer-group NAME] [--reviewer A] [--review-ttl S] [--review-sla S] [--requires-sandbox]` | define work |
 | `aghub task show TASK` | full task YAML, including any failure trace |
 | `aghub approve TASK [--note TEXT] [--commit SHA] [--force]` | legacy alias for `review --approve` |
 | `aghub inbox [--json] [--check]` | pending approvals, requested changes, failed queue entries, stale leases |
@@ -811,7 +843,8 @@ projects and delete their own rows; still, point them at a scratch database.
 - **A writer lease serializes, it does not parallelize.** Throughput is bounded by the time each holder spends in fetch → mutate → push → publish. Very large swarms still need batched board writes or independent boards, not just a longer TTL.
 - **Board authorization is guardrails, not a git firewall.** ACLs stop accidental reader writes through the CLI, but anyone who can force-push `aghub/board` can rewrite it. Event hashes and signatures make tampering visible; they do not make the branch immutable. Hub tokens protect the HTTP API, not git.
 - **Signatures bind records to published keys, not to people.** Private keys live outside the board, so a board writer cannot read them or mint a valid record for another agent without replacing that agent's published key. Old records stay valid until their key is revoked. The Ed25519 helper is pure Python, not constant-time, and is intended for local trusted-repo use rather than hostile co-tenants.
-- **Reviews are ordered by board time and evaluated as a policy.** Review order is the signed record's `at` timestamp, with its ULID as the tie-breaker; clock skew between reviewers can therefore reorder reviews. Approvals are counted once per reviewer identity, must match the current head, must be younger than the configured TTL, and must satisfy required groups plus the optional allowlist. The latest request-changes still blocks. Counts and expiry are policy, not diff conditions: there are no per-path approvals or approvals that only apply to a matching patch. Legacy reviews without a binding remain accepted for compatibility.
+- **Reviews are ordered by board time and evaluated as a policy.** Review order is the signed record's `at` timestamp, with its ULID as the tie-breaker; clock skew between reviewers can therefore reorder reviews. Approvals are counted once per reviewer identity, must match the current head, must be younger than the configured TTL, and must satisfy required groups plus the optional allowlist. The latest request-changes still blocks. Legacy reviews without a binding remain accepted for compatibility.
+- **Protected-path rules need the diff, so they are authoritative only at the queue.** A `review.protected_paths` rule adds a group, reviewer, or higher approval count when the branch diff matches its globs. The gate can only evaluate a rule once it knows the changed files, so the inbox (which does not fetch a per-task diff) treats rules as pending, the review packet evaluates the branch it has already fetched, and `queue run` re-derives the diff against trunk and enforces. Protected approval counts fold into the same `max(board, task, protected)` count; a reviewer SLA breach is surfaced as **overdue** but never blocks a merge on its own.
 - **The GitHub bridge has two trust boundaries: Actions or a local App worker.** The generated workflow runs on the events it subscribes to, needs a same-repository PR by default, publishes one sticky comment and one `aghub/review` check, and records only GitHub `APPROVED` / `CHANGES_REQUESTED` reviews. The App path mints an installation token from a local private key and can receive signed webhooks; the receiver must run on a trusted clone because it writes the board, and the hub still never holds the App key. Fork PRs are skipped by default and fork approvals are refused unless explicitly allowed. Dismissed or commented reviews are not treated as decisions, and the workflow identity must be an admin when ACLs are enabled. Reviewer groups and counts see the mapped board identity (`review.github`), not the GitHub login itself. The bundled RSA signer is pure Python (not constant-time) and is intended for a trusted local process, like the Ed25519 helper.
 - **A review packet needs the task branch locally.** `aghub review --diff` fetches the branch from the board's remote when possible; if the owner has not pushed it yet, the packet shows the task and gate state but not a patch.
 - **Legacy and pre-key events may be unsigned.** Records created before a key exists are reported as unsigned; `verify --strict` fails on unsigned records, while chain errors and invalid signatures always fail.
@@ -831,7 +864,7 @@ projects and delete their own rows; still, point them at a scratch database.
 ## Next
 
 1. Batched board writes and independent/sharded boards for swarms well beyond the serial writer-lease ceiling.
-2. Diff-conditioned approvals and reviewer SLAs: require a reviewer when a patch touches a protected path, or when a review has been pending too long.
-3. GitHub App path: OAuth/webhooks, fork-safe review recording, dismissed-review handling, richer check annotations, and multi-repository boards.
-4. Deeper codegen: parameter validation, auth schemes, and dialect-aware migrations.
-5. Hosted hub hardening: per-tenant isolation beyond token scopes, storage retention, and backup/restore workflows.
+2. GitHub App path: OAuth/webhooks, fork-safe review recording, dismissed-review handling, richer check annotations, and multi-repository boards.
+3. Deeper codegen: parameter validation, auth schemes, and dialect-aware migrations.
+4. Hosted hub hardening: per-tenant isolation beyond token scopes, storage retention, and backup/restore workflows.
+5. Surface protected-path decisions on the GitHub check and reviewer-SLA escalation (auto-request a backup reviewer when a review goes overdue).

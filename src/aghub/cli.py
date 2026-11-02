@@ -311,6 +311,51 @@ def cmd_acl(args):
     raise AghubError(f"unknown acl command {args.acl_command}")
 
 
+def _parse_protect(spec):
+    """Parse a --protect rule: 'GLOB[,GLOB...]:key=value[,key=value...]'.
+
+    Keys after the colon are repeatable `group=NAME`, `reviewer=ID`, and a
+    single `approvals=N`. Examples::
+
+        src/security/**:group=security
+        src/db/**,**/schema.sql:reviewer=carol,approvals=2
+    """
+    paths_part, sep, req_part = spec.partition(":")
+    paths = [item.strip() for item in paths_part.split(",") if item.strip()]
+    if not paths:
+        raise AghubError(
+            "--protect needs at least one path glob, e.g. "
+            "'src/security/**:group=security'"
+        )
+    rule = {"paths": paths, "groups": [], "reviewers": []}
+    for token in req_part.split(",") if sep else []:
+        token = token.strip()
+        if not token:
+            continue
+        key, keysep, value = token.partition("=")
+        key, value = key.strip().lower(), value.strip()
+        if not keysep or not value:
+            raise AghubError(
+                f"--protect requirement '{token}' must be key=value "
+                "(group=, reviewer=, approvals=)"
+            )
+        if key in ("group", "groups"):
+            rule["groups"].append(value)
+        elif key in ("reviewer", "reviewers"):
+            rule["reviewers"].append(value)
+        elif key in ("approvals", "approval"):
+            try:
+                rule["approvals"] = int(value)
+            except ValueError:
+                raise AghubError(f"--protect approvals must be a number, got {value!r}")
+        else:
+            raise AghubError(
+                f"--protect has an unknown requirement {key!r} "
+                "(use group=, reviewer=, approvals=)"
+            )
+    return rule
+
+
 def cmd_policy(args):
     board = _fresh_board()
     state = board.load()
@@ -333,6 +378,10 @@ def cmd_policy(args):
         updates["clear_ttl"] = True
     elif args.ttl is not None:
         updates["ttl_seconds"] = args.ttl
+    if args.no_sla:
+        updates["clear_sla"] = True
+    elif args.sla is not None:
+        updates["sla_seconds"] = args.sla
     if args.clear_reviewers:
         updates["clear_reviewers"] = True
     if args.reviewers:
@@ -363,8 +412,15 @@ def cmd_policy(args):
         updates["github"] = github
     if args.clear_github:
         updates["clear_github"] = True
+    if args.clear_protected:
+        updates["clear_protected"] = True
+    if args.protect:
+        updates["protected_paths"] = [_parse_protect(spec) for spec in args.protect]
     if not updates:
-        raise AghubError("nothing to change — pass --approvals, --ttl, --group, ...")
+        raise AghubError(
+            "nothing to change — pass --approvals, --ttl, --sla, --group, "
+            "--protect, ..."
+        )
 
     policy = board.transaction(
         "review policy",
@@ -1033,6 +1089,7 @@ def cmd_task(args):
                 review_groups=args.review_groups,
                 reviewers=args.reviewers,
                 review_ttl=args.review_ttl,
+                review_sla=args.review_sla,
             ),
             agent=agent,
         )
@@ -1444,7 +1501,10 @@ def cmd_submit(args):
         raise AghubError(f"could not push {branch}: {detail}")
     local = gitops.git(["rev-parse", branch], cwd=board.repo, check=False)
     head = local.stdout.strip() or head
-    missing = service.approval_gate(state, task, head=head)
+    changed_paths = service.branch_changed_paths(board, task, state.project)
+    missing = service.approval_gate(
+        state, task, head=head, changed_paths=changed_paths
+    )
     if missing and not args.force:
         raise AghubError(missing)
     key = (
@@ -2200,6 +2260,13 @@ def build_parser():
     )
     policy_set.add_argument("--no-ttl", action="store_true", help="approvals never expire")
     policy_set.add_argument(
+        "--sla",
+        type=int,
+        default=None,
+        help="flag a review pending longer than this many seconds (0 clears it)",
+    )
+    policy_set.add_argument("--no-sla", action="store_true", help="no reviewer SLA")
+    policy_set.add_argument(
         "--reviewer",
         dest="reviewers",
         action="append",
@@ -2227,10 +2294,22 @@ def build_parser():
         default=[],
         help="map LOGIN=AGENT for GitHub pull-request reviews (repeatable)",
     )
+    policy_set.add_argument(
+        "--protect",
+        dest="protect",
+        action="append",
+        default=[],
+        help=(
+            "require review when a diff touches a path: "
+            "'GLOB[,GLOB...]:group=NAME[,reviewer=ID,approvals=N]' (repeatable, "
+            "replaces the rule set)"
+        ),
+    )
     policy_set.add_argument("--clear-reviewers", action="store_true")
     policy_set.add_argument("--clear-groups", action="store_true")
     policy_set.add_argument("--clear-required-groups", action="store_true")
     policy_set.add_argument("--clear-github", action="store_true")
+    policy_set.add_argument("--clear-protected", action="store_true")
     policy_set.add_argument("--clear", action="store_true", help="reset the whole review policy")
     policy_set.add_argument("--json", action="store_true")
     policy.set_defaults(func=cmd_policy)
@@ -2378,6 +2457,12 @@ def build_parser():
         type=int,
         default=None,
         help="approval lifetime for this task in seconds (tightens the board policy)",
+    )
+    task_add.add_argument(
+        "--review-sla",
+        type=int,
+        default=None,
+        help="flag this task's review when pending longer than this many seconds",
     )
     task_add.add_argument(
         "--requires-sandbox",

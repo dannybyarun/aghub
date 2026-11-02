@@ -48,7 +48,8 @@ def inbox(state, board=None):
             if board is not None and task.get("requires_approval")
             else None
         )
-        gap = service.approval_gate(state, task, head=head)
+        summary = service.approval_summary(state, task, head=head)
+        gap = summary["reason"]
         base = {
             "task": task_id,
             "title": task.get("title") or "",
@@ -74,19 +75,29 @@ def inbox(state, board=None):
                 }
             )
         elif gap and (task.get("owner") or entries):
-            summary = service.approval_summary(state, task, head=head)
+            overdue = summary["sla_breached"]
+            detail = gap
+            if overdue:
+                detail = (
+                    f"review overdue — pending {human_age(summary['pending_age'])} "
+                    f"(sla {human_age(summary['sla_seconds'])}); {gap}"
+                )
             items.append(
                 {
                     **base,
                     "kind": "approval",
                     "priority": 0,
-                    "detail": gap,
+                    "overdue": overdue,
+                    "detail": detail,
                     "action": f"aghub review {task_id} --approve --note ...",
                     "policy": {
                         "required_approvals": summary["required_approvals"],
                         "approved_count": summary["approved_count"],
                         "required_groups": summary["required_groups"],
                         "missing_groups": summary["missing_groups"],
+                        "sla_seconds": summary["sla_seconds"],
+                        "pending_age": summary["pending_age"],
+                        "sla_breached": summary["sla_breached"],
                     },
                 }
             )
@@ -140,7 +151,8 @@ def render_inbox(project, items):
         if item.get("fix_task"):
             bits.append(f"fix {item['fix_task']}")
         lines.append(
-            f"  {item['kind']:<9} {item['task']:<7} {item['title']}"
+            f"  {('overdue' if item.get('overdue') else item['kind']):<9} "
+            f"{item['task']:<7} {item['title']}"
         )
         lines.append(f"            {item['detail']}")
         lines.append(f"            {item['action']}")
@@ -336,7 +348,15 @@ def review_packet(board, state, task_id, include_diff=False):
     entries = _queue_for(state, task_id)
     decision, record = service.review_decision(state, task_id)
     head = branch_head(board, task, update=True)
-    summary = service.approval_summary(state, task, head=head)
+    changes = branch_changes(board, state, task, include_diff=include_diff)
+    changed_paths = (
+        [item["path"] for item in changes.get("files") or []]
+        if not changes.get("error")
+        else None
+    )
+    summary = service.approval_summary(
+        state, task, head=head, changed_paths=changed_paths
+    )
     stale = summary["latest_stale"]
     analysis = {}
     for item in (
@@ -378,6 +398,11 @@ def review_packet(board, state, task_id, include_diff=False):
             "groups": summary["groups"],
             "reviewers": summary["reviewers"],
             "ttl_seconds": summary["ttl_seconds"],
+            "sla_seconds": summary["sla_seconds"],
+            "pending_age": summary["pending_age"],
+            "sla_breached": summary["sla_breached"],
+            "protected": summary["protected"],
+            "protected_known": summary["protected_known"],
             "approvals": summary["approvals"],
             "expired": summary["expired"],
             "ineligible": summary["ineligible"],
@@ -389,7 +414,7 @@ def review_packet(board, state, task_id, include_diff=False):
         "queue": entries,
         "handoff": latest_handoff,
         "failure": task.get("trace"),
-        "changes": branch_changes(board, state, task, include_diff=include_diff),
+        "changes": changes,
         "actions": [],
     }
     if task.get("requires_approval") and not summary["satisfied"]:
@@ -449,11 +474,15 @@ def render_review(packet, include_diff=False):
         label += f" ({len(approval['ineligible'])} ineligible)"
     if approval.get("required") and approval.get("satisfied") is False:
         label += " (policy not satisfied)"
+    if approval.get("sla_breached"):
+        label += " (review overdue)"
     lines.append(f"  review    {label}" + (" (required)" if approval["required"] else ""))
     if approval["required"]:
         policy = [f"{approved}/{required} approval" + ("" if required == 1 else "s")]
         if approval.get("ttl_seconds"):
             policy.append(f"ttl {human_age(approval['ttl_seconds'])}")
+        if approval.get("sla_seconds"):
+            policy.append(f"sla {human_age(approval['sla_seconds'])}")
         if approval.get("required_groups"):
             missing = set(approval.get("missing_groups") or [])
             groups = [
@@ -464,6 +493,25 @@ def render_review(packet, include_diff=False):
         if approval.get("reviewers"):
             policy.append("reviewers " + ", ".join(approval["reviewers"]))
         lines.append(f"  policy    {' · '.join(policy)}")
+        if approval.get("sla_breached"):
+            lines.append(
+                f"  overdue   review pending {human_age(approval.get('pending_age'))}"
+            )
+        for rule in approval.get("protected") or []:
+            if rule.get("triggered") is True:
+                need = []
+                if rule.get("groups"):
+                    need.append("group " + ", ".join(rule["groups"]))
+                if rule.get("reviewers"):
+                    need.append("reviewer " + ", ".join(rule["reviewers"]))
+                if rule.get("approvals"):
+                    need.append(f"{rule['approvals']} approvals")
+                mark = "ok" if rule.get("satisfied") else "needs " + "; ".join(need or ["review"])
+                lines.append(f"  protected {rule['label']} → {mark}")
+            elif rule.get("triggered") is None:
+                lines.append(
+                    f"  protected {rule['label']} → pending diff (enforced at merge)"
+                )
     if approval.get("head"):
         lines.append(f"  head      {str(approval['head'])[:7]}")
     if approval.get("commit"):
