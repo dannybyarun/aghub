@@ -489,7 +489,7 @@ The diff reports routes, operations (with changed fields), and schema/property c
 
 ```bash
 aghub codegen api 1 --out generated
-aghub codegen api 1 --out generated --target sql
+aghub codegen api 1 --out generated --target sql --dialect sqlite
 aghub codegen api 1 --out generated --check   # CI gate: fail on drift
 ```
 
@@ -498,17 +498,21 @@ lanes get the same bytes for the same `name@version`.
 
 | File | Contents |
 |---|---|
-| `<name>.ts` | route literals, operation keys, schema types, and a typed `ContractClient` |
-| `<name>.py` | route tuple, operation map, dataclasses, raw schema map, and a stdlib `Client` |
-| `<name>_mock.py` | standalone stdlib mock server with CORS and example responses |
-| `<name>.sql` | starting Postgres migration inferred from component schemas |
-| `manifest.json` | contract id, sha256, routes, operations, generated files |
+| `<name>.ts` | route literals, operation keys, schema types, parameter/security metadata, and a typed `ContractClient` that attaches auth and validates parameters |
+| `<name>.py` | route tuple, operation map, dataclasses, raw schema map, and a stdlib `Client` that attaches auth and validates parameters |
+| `<name>_mock.py` | standalone stdlib mock server with CORS, example responses, parameter validation (`400`), and auth enforcement (`401`) |
+| `<name>.sql` | starting migration inferred from component schemas, in the chosen `--dialect` |
+| `manifest.json` | contract id, sha256, dialect, security schemes, routes, and operations with their parameters and required schemes |
 
 ```bash
 python3 generated/api_mock.py --port 4010
 ```
 
-The generator covers the pragmatic OpenAPI subset this protocol needs: `paths`, HTTP methods, `operationId`, `components.schemas` / Swagger `definitions`, `$ref`, arrays, enums, unions, examples, and the common scalar formats. It is deliberately not a full OpenAPI compiler, and the SQL file is a reviewable starting point — not a live schema diff.
+The generator covers the pragmatic OpenAPI subset this protocol needs: `paths`, HTTP methods, `operationId`, `components.schemas` / Swagger `definitions`, `$ref`, arrays, enums, unions, examples, and the common scalar formats. It also reads **parameters** (path/query/header, with `required` and `enum`) and **security schemes** (`http` bearer/basic and `apiKey` in header or query, plus Swagger 2 `securityDefinitions`), threading both into the clients and the mock. The SQL migration is **dialect-aware** — `--dialect postgres` (default), `sqlite`, or `mysql` — and is a reviewable starting point, not a live schema diff.
+
+<b>Parameter validation.</b> The generated clients and mock reject a request that omits a required parameter or sends a value outside a declared `enum`. The clients raise before the request leaves the process; the mock answers `400`. Only runtime-checkable constraints are enforced — `required` and `enum` — not full JSON Schema.
+
+<b>Auth schemes.</b> The clients accept a bearer token, an API key, or basic credentials and attach whatever the contract's schemes declare (an `Authorization` header, a custom header, or a query parameter). The mock returns `401` when an operation's security is non-empty and no matching credential is present; an operation with `security: []` is always public.
 
 ### The registry is the board; evals run locally
 
@@ -833,7 +837,7 @@ reimplemented or bypassed.
 | `aghub eval list [--agent ID] [--suite NAME]` / `eval show ID` | inspect scorecards |
 | `aghub contract draft/freeze/show/list` | pin interfaces |
 | `aghub contract diff NAME [OLD] [NEW] [--json]` | compare two frozen versions |
-| `aghub codegen NAME [VERSION] [--out DIR] [--target all\|ts\|py\|mock\|sql] [--check]` | generate from a frozen contract |
+| `aghub codegen NAME [VERSION] [--out DIR] [--target all\|ts\|py\|mock\|sql] [--dialect postgres\|sqlite\|mysql] [--check]` | generate from a frozen contract |
 | `aghub claim TASK [--steal] [--force] [--worktree [PATH]]` | take task + path lease + branch (+ isolated checkout) |
 | `aghub heartbeat` | refresh the lease |
 | `aghub handoff TASK --next TEXT [--done]` | write the signed async delta |
@@ -903,7 +907,7 @@ projects and delete their own rows; still, point them at a scratch database.
 - **Quotas are coarse fixed windows.** `requests_per_minute` uses a per-actor counter in the shared store, not a token bucket, so a tenant can burst at a window boundary. `max_request_bytes` is checked from `Content-Length`; chunked request bodies are not accepted. A quota `429` is authoritative and is never retried against another hub.
 - **Audit export is not the signed git history.** `/api/audit/export` records hub requests and lease operations with a token actor label. Tamper evidence for tasks, contracts, handoffs, and merges still comes from `aghub verify` over the hash-chained board.
 - **The merge check is sandboxed by default but is still not a security boundary.** `submit`/`queue run` execute `project.check` through the same sandbox runner as evals (`auto` uses Bubblewrap, otherwise a scrubbed snapshot). `--check-sandbox off` and `--sandbox off` intentionally opt out. Traces are signed evidence, not proof of isolation; re-run the command to reproduce.
-- **Codegen covers an OpenAPI subset.** Paths, methods, `operationId`, component schemas, `$ref`, arrays, enums, unions, examples, common scalar formats, and a starting SQL migration. Security schemes, callbacks, discriminators, and parameter validation are not generated.
+- **Codegen covers an OpenAPI subset.** Paths, methods, `operationId`, component schemas, `$ref`, arrays, enums, unions, examples, common scalar formats, parameters (path/query/header with `required` and `enum`), `http`/`apiKey` security schemes, and a dialect-aware starting SQL migration (`postgres`, `sqlite`, `mysql`). Parameter validation enforces only `required` and `enum`, not full JSON Schema; callbacks, discriminators, oauth2 flows, and `oneOf`-style request-body validation are not generated.
 - **Eval fingerprints identify an input, not a whole environment.** They cover command, suite, commit, tree, dirty/untracked input, and timeout. `eval rerun` compares fingerprints but does not pin toolchain or container images, and ignored files are not hashed.
 - **The eval sandbox is pragmatic.** The snapshot omits ignored files such as `.venv` or `node_modules`, so a command that needs them must install them inside the eval or use `--sandbox off`. Bubblewrap is optional and detected at runtime; without it, the fallback hides the environment but not the host filesystem or network.
 - **Evals are still local and BYOK.** The platform records the command, sandbox policy, scorecard, and freshness; it does not verify the machine or reproduce the environment.
@@ -913,7 +917,7 @@ projects and delete their own rows; still, point them at a scratch database.
 ## Next
 
 1. GitHub App path: OAuth/webhooks, fork-safe review recording, dismissed-review handling, richer check annotations, and multi-repository boards.
-2. Deeper codegen: parameter validation, auth schemes, and dialect-aware migrations.
-3. Hosted hub hardening: per-tenant isolation beyond token scopes, storage retention, and backup/restore workflows.
+2. Hosted hub hardening: per-tenant isolation beyond token scopes, storage retention, and backup/restore workflows.
+3. Deeper codegen still: request-body validation, discriminated unions, and oauth2 flows.
 4. Cross-shard views: a read-only aggregate over several board shards for a single pane of glass.
 5. Surface protected-path decisions on the GitHub check and reviewer-SLA escalation (auto-request a backup reviewer when a review goes overdue).
