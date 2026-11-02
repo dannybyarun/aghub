@@ -41,6 +41,9 @@ def extract(spec):
     if not isinstance(raw_paths, dict):
         raw_paths = {}
 
+    schemes = _security_schemes(spec)
+    default_security = _security_names(spec.get("security"), schemes)
+
     operations = []
     for path in sorted(str(item) for item in raw_paths):
         item = raw_paths.get(path)
@@ -50,6 +53,10 @@ def extract(spec):
             operation = item.get(method)
             if not isinstance(operation, dict):
                 continue
+            if "security" in operation:
+                security = _security_names(operation.get("security"), schemes)
+            else:
+                security = list(default_security)
             operations.append(
                 {
                     "method": method.upper(),
@@ -59,6 +66,8 @@ def extract(spec):
                     "summary": operation.get("summary")
                     or operation.get("description")
                     or "",
+                    "parameters": _parameters(item, operation, spec),
+                    "security": security,
                     "response": _response_example(operation, spec),
                 }
             )
@@ -74,7 +83,114 @@ def extract(spec):
     if not isinstance(schemas, dict):
         schemas = {}
 
-    return {"routes": routes, "operations": operations, "schemas": schemas, "spec": spec}
+    return {
+        "routes": routes,
+        "operations": operations,
+        "schemas": schemas,
+        "security_schemes": schemes,
+        "security": default_security,
+        "spec": spec,
+    }
+
+
+_PARAM_KINDS = {
+    "integer": "integer",
+    "number": "number",
+    "boolean": "boolean",
+    "string": "string",
+    "array": "array",
+}
+
+
+def _param_type(schema):
+    if not isinstance(schema, dict):
+        return "string"
+    kind = schema.get("type")
+    if isinstance(kind, list):
+        kind = next((item for item in kind if item != "null"), "string")
+    if kind == "array" or isinstance(schema.get("items"), dict):
+        return "array"
+    return _PARAM_KINDS.get(kind, "string")
+
+
+def _parameters(item, operation, spec):
+    """Merge path- and operation-level parameters, operation wins on conflict."""
+    collected = {}
+    for source in (item.get("parameters"), operation.get("parameters")):
+        if not isinstance(source, list):
+            continue
+        for param in source:
+            if isinstance(param, dict) and param.get("$ref"):
+                param = _resolve(spec, param["$ref"])
+            if not isinstance(param, dict):
+                continue
+            name = param.get("name")
+            location = param.get("in")
+            if not name or not location:
+                continue
+            schema = param.get("schema")
+            if not isinstance(schema, dict):
+                # Swagger 2 keeps type/enum directly on the parameter.
+                schema = {
+                    "type": param.get("type"),
+                    "enum": param.get("enum"),
+                }
+            collected[(location, name)] = {
+                "name": str(name),
+                "in": str(location),
+                "required": bool(param.get("required")) or location == "path",
+                "type": _param_type(schema),
+                "enum": [value for value in (schema.get("enum") or [])],
+            }
+    return [collected[key] for key in sorted(collected)]
+
+
+def _security_schemes(spec):
+    """Normalize OpenAPI 3 securitySchemes (or Swagger 2 securityDefinitions)."""
+    components = spec.get("components")
+    raw = components.get("securitySchemes") if isinstance(components, dict) else None
+    if not isinstance(raw, dict):
+        raw = spec.get("securityDefinitions")
+    schemes = {}
+    if not isinstance(raw, dict):
+        return schemes
+    for name in sorted(str(key) for key in raw):
+        defn = raw.get(name)
+        if not isinstance(defn, dict):
+            continue
+        kind = str(defn.get("type") or "").strip()
+        entry = {"name": name, "type": kind}
+        if kind == "apiKey" or (kind == "" and defn.get("in")):
+            entry["type"] = "apiKey"
+            entry["in"] = str(defn.get("in") or "header")
+            entry["parameter"] = str(defn.get("name") or "Authorization")
+        elif kind == "http":
+            entry["scheme"] = str(defn.get("scheme") or "bearer").lower()
+            entry["bearer_format"] = str(defn.get("bearerFormat") or "")
+        elif kind in ("basic", "apiKey"):
+            pass
+        else:
+            # oauth2 / openIdConnect carry a bearer token in practice.
+            entry["scheme"] = "bearer"
+        if kind == "basic":  # Swagger 2 spelling of http basic.
+            entry["type"] = "http"
+            entry["scheme"] = "basic"
+        schemes[name] = entry
+    return schemes
+
+
+def _security_names(requirements, schemes):
+    """Flatten a security requirement list to the scheme names it references."""
+    if not isinstance(requirements, list):
+        return []
+    names = []
+    for requirement in requirements:
+        if not isinstance(requirement, dict):
+            continue
+        for name in requirement:
+            if name in schemes and name not in names:
+                names.append(name)
+    return names
 
 
 def diff_specs(old_spec, new_spec):
@@ -175,9 +291,13 @@ def _canonical(value):
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
 
-def generate(name, version, meta, spec, target="all"):
+def generate(name, version, meta, spec, target="all", dialect="postgres"):
     if target not in ("all", "ts", "py", "mock", "sql"):
         raise AghubError(f"unknown codegen target '{target}'")
+    if dialect not in SQL_DIALECTS:
+        raise AghubError(
+            f"unknown SQL dialect '{dialect}' (choose from {', '.join(sorted(SQL_DIALECTS))})"
+        )
     model = extract(spec)
     sha = meta.get("sha256") or ""
     files = {}
@@ -188,17 +308,32 @@ def generate(name, version, meta, spec, target="all"):
     if target in ("all", "mock"):
         files[mock_filename(name)] = render_mock(name, version, sha, model)
     if target in ("all", "sql"):
-        files[f"{_file_stem(name)}.sql"] = render_sql(name, version, sha, model)
+        files[f"{_file_stem(name)}.sql"] = render_sql(
+            name, version, sha, model, dialect=dialect
+        )
 
     manifest = {
         "contract": f"{name}@{version}",
         "sha256": sha,
+        "dialect": dialect,
         "routes": model["routes"],
+        "security_schemes": {
+            key: value["type"] for key, value in model["security_schemes"].items()
+        },
         "operations": [
             {
                 "method": operation["method"],
                 "path": operation["path"],
                 "operation_id": operation["operation_id"],
+                "parameters": [
+                    {
+                        "name": param["name"],
+                        "in": param["in"],
+                        "required": param["required"],
+                    }
+                    for param in operation["parameters"]
+                ],
+                "security": operation["security"],
             }
             for operation in model["operations"]
         ],
@@ -296,6 +431,11 @@ def _doc(text, prefix="//"):
     return lines
 
 
+def _scheme_public(scheme):
+    """A scheme as exposed to generated clients (drops the internal name key)."""
+    return {key: value for key, value in scheme.items() if key != "name"}
+
+
 # -- TypeScript ----------------------------------------------------------
 
 
@@ -334,6 +474,37 @@ def render_ts(name, version, sha, model):
         ]
     )
 
+    lines.extend(["", "export const SECURITY_SCHEMES = "
+                  + json.dumps(
+                      {name: _scheme_public(scheme)
+                       for name, scheme in model["security_schemes"].items()},
+                      indent=2,
+                  )
+                  + " as const;"])
+    lines.append("")
+    lines.append(
+        "export interface ParameterSpec { name: string; in: string; "
+        "required: boolean; type: string; enum: readonly unknown[]; }"
+    )
+    op_params = {
+        f"{operation['method']} {operation['path']}": operation["parameters"]
+        for operation in model["operations"]
+    }
+    lines.append(
+        "export const OPERATION_PARAMETERS: Record<string, ParameterSpec[]> = "
+        + json.dumps(op_params, indent=2)
+        + ";"
+    )
+    op_security = {
+        f"{operation['method']} {operation['path']}": operation["security"]
+        for operation in model["operations"]
+    }
+    lines.append(
+        "export const OPERATION_SECURITY: Record<string, readonly string[]> = "
+        + json.dumps(op_security, indent=2)
+        + ";"
+    )
+
     schemas = model["schemas"]
     if schemas:
         lines.extend(["", "// -- schemas --"])
@@ -365,10 +536,53 @@ def render_ts(name, version, sha, model):
             "  headers?: Record<string, string>;",
             "}",
             "",
+            "export interface AuthOptions {",
+            "  bearerToken?: string;",
+            "  apiKey?: string;",
+            "  basic?: { user: string; password: string };",
+            "}",
+            "",
             "export class ContractClient {",
-            '  constructor(public baseUrl = "", private fetcher: typeof fetch = fetch) {}',
+            "  constructor(",
+            '    public baseUrl = "",',
+            "    private auth: AuthOptions = {},",
+            "    private fetcher: typeof fetch = fetch,",
+            "  ) {}",
+            "",
+            "  private validate(operation: string, options: RequestOptions): void {",
+            "    for (const spec of OPERATION_PARAMETERS[operation] || []) {",
+            '      const bag = spec.in === "query" ? options.query : '
+            '(spec.in === "path" ? options.pathParams : options.headers);',
+            "      const value = bag ? (bag as Record<string, unknown>)[spec.name] : undefined;",
+            "      if (spec.required && (value === undefined || value === null)) {",
+            '        throw new Error(operation + ": missing required " + spec.in + '
+            '" parameter " + spec.name);',
+            "      }",
+            "      if (value !== undefined && spec.enum.length && !spec.enum.includes(value)) {",
+            '        throw new Error(operation + ": " + spec.name + " must be one of " + '
+            "JSON.stringify(spec.enum));",
+            "      }",
+            "    }",
+            "  }",
+            "",
+            "  private applyAuth(headers: Record<string, string>, search: URLSearchParams): void {",
+            "    for (const scheme of Object.values(SECURITY_SCHEMES) as any[]) {",
+            '      if (scheme.type === "http" && scheme.scheme === "bearer" && this.auth.bearerToken) {',
+            '        headers["Authorization"] = "Bearer " + this.auth.bearerToken;',
+            '      } else if (scheme.type === "http" && scheme.scheme === "basic" && this.auth.basic) {',
+            '        const raw = this.auth.basic.user + ":" + this.auth.basic.password;',
+            "        const encoded = typeof btoa === \"function\" ? btoa(raw) : "
+            'Buffer.from(raw).toString("base64");',
+            '        headers["Authorization"] = "Basic " + encoded;',
+            '      } else if (scheme.type === "apiKey" && this.auth.apiKey) {',
+            '        if (scheme.in === "query") search.set(scheme.parameter, this.auth.apiKey);',
+            "        else headers[scheme.parameter] = this.auth.apiKey;",
+            "      }",
+            "    }",
+            "  }",
             "",
             "  async call<T = unknown>(operation: string, options: RequestOptions = {}): Promise<T> {",
+            "    this.validate(operation, options);",
             '    const [method, template] = operation.split(" ", 2);',
             "    const path = template.replace(/\\{([^}]+)\\}/g, (_, name: string) =>",
             "      encodeURIComponent(String((options.pathParams || {})[name] ?? \"\")));",
@@ -377,13 +591,15 @@ def render_ts(name, version, sha, model):
             "    for (const [key, value] of Object.entries(options.query || {})) {",
             "      if (value !== undefined) search.set(key, String(value));",
             "    }",
+            "    const headers: Record<string, string> = {",
+            '      "Content-Type": "application/json",',
+            "      ...(options.headers || {}),",
+            "    };",
+            "    this.applyAuth(headers, search);",
             '    if (search.toString()) url += "?" + search.toString();',
             "    const response = await this.fetcher(url, {",
             "      method,",
-            "      headers: {",
-            '        "Content-Type": "application/json",',
-            "        ...(options.headers || {}),",
-            "      },",
+            "      headers,",
             "      body: options.body === undefined ? undefined : JSON.stringify(options.body),",
             "    });",
             "    const text = await response.text();",
@@ -490,6 +706,7 @@ def render_py(name, version, sha, model):
         "from __future__ import annotations",
         "",
         "import json as _json",
+        "import base64 as _base64",
         "import urllib.parse as _urlparse",
         "import urllib.request as _urlreq",
         "from dataclasses import dataclass",
@@ -510,6 +727,28 @@ def render_py(name, version, sha, model):
             f"    ({operation['method']!r}, {operation['path']!r}): "
             f"{operation['operation_id']!r},"
         )
+    lines.append("}")
+    lines.append("")
+    lines.append(
+        "SECURITY_SCHEMES: dict[str, Any] = "
+        + _py_literal(
+            {
+                name: _scheme_public(scheme)
+                for name, scheme in model["security_schemes"].items()
+            }
+        )
+    )
+    lines.append("")
+    lines.append("OPERATION_PARAMETERS: dict[str, Any] = {")
+    for operation in model["operations"]:
+        key = f"{operation['method']} {operation['path']}"
+        lines.append(f"    {key!r}: {_py_literal(operation['parameters'])},")
+    lines.append("}")
+    lines.append("")
+    lines.append("OPERATION_SECURITY: dict[str, Any] = {")
+    for operation in model["operations"]:
+        key = f"{operation['method']} {operation['path']}"
+        lines.append(f"    {key!r}: {operation['security']!r},")
     lines.append("}")
     lines.append("")
     lines.append("SCHEMAS: dict[str, Any] = {")
@@ -552,9 +791,49 @@ def render_py(name, version, sha, model):
             "class Client:",
             '    """Typed, dependency-free HTTP client for this contract."""',
             "",
-            '    def __init__(self, base_url: str = "", headers: dict[str, str] | None = None):',
+            "    def __init__(",
+            "        self,",
+            '        base_url: str = "",',
+            "        headers: dict[str, str] | None = None,",
+            "        bearer_token: str | None = None,",
+            "        api_key: str | None = None,",
+            "        basic: tuple[str, str] | None = None,",
+            "    ):",
             "        self.base_url = base_url.rstrip('/')",
             "        self.headers = dict(headers or {})",
+            "        self.bearer_token = bearer_token",
+            "        self.api_key = api_key",
+            "        self.basic = basic",
+            "",
+            "    def _validate(self, method: str, path_template: str, "
+            "path_params: dict[str, Any] | None, query: dict[str, Any] | None) -> None:",
+            "        for spec in OPERATION_PARAMETERS.get(method + ' ' + path_template, []):",
+            "            bag = {'query': query, 'path': path_params}.get(spec['in'])",
+            "            value = (bag or {}).get(spec['name']) if bag is not None else None",
+            "            if spec['required'] and value is None:",
+            "                raise ValueError(",
+            "                    f\"{method} {path_template}: missing required \"",
+            "                    f\"{spec['in']} parameter {spec['name']}\"",
+            "                )",
+            "            if value is not None and spec['enum'] and value not in spec['enum']:",
+            "                raise ValueError(",
+            "                    f\"{method} {path_template}: {spec['name']} must be one of \"",
+            "                    f\"{spec['enum']}\"",
+            "                )",
+            "",
+            "    def _apply_auth(self, headers: dict[str, str], values: dict[str, Any]) -> None:",
+            "        for scheme in SECURITY_SCHEMES.values():",
+            "            kind = scheme.get('type')",
+            "            if kind == 'http' and scheme.get('scheme') == 'bearer' and self.bearer_token:",
+            "                headers['Authorization'] = 'Bearer ' + self.bearer_token",
+            "            elif kind == 'http' and scheme.get('scheme') == 'basic' and self.basic:",
+            "                raw = f'{self.basic[0]}:{self.basic[1]}'.encode('utf-8')",
+            "                headers['Authorization'] = 'Basic ' + _base64.b64encode(raw).decode('ascii')",
+            "            elif kind == 'apiKey' and self.api_key:",
+            "                if scheme.get('in') == 'query':",
+            "                    values[scheme.get('parameter', 'api_key')] = self.api_key",
+            "                else:",
+            "                    headers[scheme.get('parameter', 'Authorization')] = self.api_key",
             "",
             "    def call(",
             "        self,",
@@ -565,14 +844,16 @@ def render_py(name, version, sha, model):
             "        body: Any = None,",
             "        headers: dict[str, str] | None = None,",
             "    ) -> Any:",
+            "        self._validate(method, path_template, path_params, query)",
             "        path = path_template",
             "        for key, value in (path_params or {}).items():",
             "            path = path.replace('{' + key + '}', _urlparse.quote(str(value), safe=''))",
             "        values = {key: value for key, value in (query or {}).items() if value is not None}",
+            "        request_headers = {**self.headers, **(headers or {})}",
+            "        self._apply_auth(request_headers, values)",
             "        if values:",
             "            path += ('&' if '?' in path else '?') + _urlparse.urlencode(values)",
             "        payload = None",
-            "        request_headers = {**self.headers, **(headers or {})}",
             "        if body is not None:",
             "            payload = _json.dumps(body).encode('utf-8')",
             "            request_headers.setdefault('Content-Type', 'application/json')",
@@ -653,41 +934,90 @@ def _py_literal(value):
 # -- SQL migration -------------------------------------------------------
 
 
-def _sql_type(schema, spec, depth=0):
+SQL_DIALECTS = {"postgres", "sqlite", "mysql"}
+
+# Each dialect maps the logical column categories below to a concrete type.
+_SQL_TYPES = {
+    "postgres": {
+        "json": "JSONB",
+        "uuid": "UUID",
+        "date": "DATE",
+        "datetime": "TIMESTAMPTZ",
+        "int": "BIGINT",
+        "int32": "INTEGER",
+        "number": "DOUBLE PRECISION",
+        "bool": "BOOLEAN",
+        "text": "TEXT",
+    },
+    "sqlite": {
+        "json": "TEXT",
+        "uuid": "TEXT",
+        "date": "TEXT",
+        "datetime": "TEXT",
+        "int": "INTEGER",
+        "int32": "INTEGER",
+        "number": "REAL",
+        "bool": "INTEGER",
+        "text": "TEXT",
+    },
+    "mysql": {
+        "json": "JSON",
+        "uuid": "CHAR(36)",
+        "date": "DATE",
+        "datetime": "DATETIME",
+        "int": "BIGINT",
+        "int32": "INT",
+        "number": "DOUBLE",
+        "bool": "TINYINT(1)",
+        "text": "VARCHAR(255)",
+    },
+}
+
+# Categories that make sense as a single-column primary key.
+_SQL_KEYABLE = {"text", "uuid", "int", "int32"}
+
+
+def _sql_category(schema, spec, depth=0):
+    """Reduce a schema to one of the logical column categories in `_SQL_TYPES`."""
     if not isinstance(schema, dict) or depth > 8:
-        return "JSONB"
+        return "json"
     if schema.get("$ref"):
-        return _sql_type(_resolve(spec, schema["$ref"]), spec, depth + 1)
+        return _sql_category(_resolve(spec, schema["$ref"]), spec, depth + 1)
     if schema.get("enum"):
-        return "TEXT"
+        return "text"
     for union in ("oneOf", "anyOf"):
         if isinstance(schema.get(union), list) and schema[union]:
-            return _sql_type(schema[union][0], spec, depth + 1)
+            return _sql_category(schema[union][0], spec, depth + 1)
     kind = schema.get("type")
     if isinstance(kind, list):
         kind = next((item for item in kind if item != "null"), "string")
     if kind == "array" or isinstance(schema.get("items"), dict):
-        return "JSONB"
+        return "json"
     if kind == "object" or isinstance(schema.get("properties"), dict):
-        return "JSONB"
+        return "json"
     fmt = schema.get("format")
     if kind == "string":
-        return {"uuid": "UUID", "date": "DATE", "date-time": "TIMESTAMPTZ"}.get(
-            fmt, "TEXT"
-        )
+        return {"uuid": "uuid", "date": "date", "date-time": "datetime"}.get(fmt, "text")
     if kind == "integer":
-        return "BIGINT" if fmt in ("int64", None) else "INTEGER"
+        return "int" if fmt in ("int64", None) else "int32"
     if kind == "number":
-        return "DOUBLE PRECISION"
+        return "number"
     if kind == "boolean":
-        return "BOOLEAN"
-    return "JSONB"
+        return "bool"
+    return "json"
 
 
-def render_sql(name, version, sha, model):
+def _sql_type(schema, spec, dialect="postgres", depth=0):
+    category = _sql_category(schema, spec, depth)
+    return _SQL_TYPES[dialect][category]
+
+
+def render_sql(name, version, sha, model, dialect="postgres"):
+    if dialect not in SQL_DIALECTS:
+        raise AghubError(f"unknown SQL dialect '{dialect}'")
     lines = [
         f"-- Generated by aghub from {name}@{version} (sha256 {sha or 'unknown'}).",
-        "-- Review before applying; this is a starting migration, not a live diff.",
+        f"-- Dialect: {dialect}. Review before applying; a starting migration, not a live diff.",
         "",
     ]
     for operation in model["operations"]:
@@ -707,9 +1037,10 @@ def render_sql(name, version, sha, model):
         columns = []
         for prop, prop_schema in properties.items():
             column = _sql_ident(prop)
-            kind = _sql_type(prop_schema, model["spec"])
+            category = _sql_category(prop_schema, model["spec"])
+            kind = _SQL_TYPES[dialect][category]
             constraints = ""
-            if column == "id" and kind in ("TEXT", "UUID", "BIGINT"):
+            if column == "id" and category in _SQL_KEYABLE:
                 constraints = " PRIMARY KEY"
             elif prop in required:
                 constraints = " NOT NULL"
@@ -744,6 +1075,27 @@ def render_mock(name, version, sha, model):
         width=100,
         sort_dicts=False,
     )
+    parameters = pprint.pformat(
+        {
+            (operation["method"], operation["path"]): operation["parameters"]
+            for operation in model["operations"]
+        },
+        width=100,
+        sort_dicts=False,
+    )
+    security = pprint.pformat(
+        {
+            (operation["method"], operation["path"]): operation["security"]
+            for operation in model["operations"]
+        },
+        width=100,
+        sort_dicts=False,
+    )
+    schemes = pprint.pformat(
+        {name: _scheme_public(scheme) for name, scheme in model["security_schemes"].items()},
+        width=100,
+        sort_dicts=False,
+    )
     template = '''#!/usr/bin/env python3
 """Mock server generated by aghub from $CONTRACT$ (sha256 $SHA$)."""
 
@@ -751,7 +1103,7 @@ import argparse
 import json
 import re
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs
 
 ROUTES = $ROUTES$
 
@@ -760,6 +1112,12 @@ $OPERATIONS$
 }
 
 RESPONSES = $RESPONSES$
+
+PARAMETERS = $PARAMETERS$
+
+SECURITY = $SECURITY$
+
+SECURITY_SCHEMES = $SCHEMES$
 
 
 def route_pattern(route):
@@ -794,6 +1152,42 @@ def match(method, path):
     return None
 
 
+def check_auth(method, route, headers, query):
+    required = SECURITY.get((method, route)) or []
+    if not required:
+        return None
+    for name in required:
+        scheme = SECURITY_SCHEMES.get(name) or {}
+        kind = scheme.get("type")
+        if kind == "apiKey":
+            parameter = scheme.get("parameter")
+            if scheme.get("in") == "query":
+                if parameter in query:
+                    return None
+            elif headers.get(parameter):
+                return None
+        elif headers.get("Authorization"):
+            return None
+    return {"error": "unauthorized", "required": required}
+
+
+def validate_params(method, route, query):
+    for spec in PARAMETERS.get((method, route), []):
+        if spec["in"] != "query":
+            continue
+        value = query.get(spec["name"])
+        if spec["required"] and value is None:
+            return {"error": "missing required parameter", "parameter": spec["name"]}
+        allowed = [str(item) for item in spec["enum"]]
+        if value is not None and allowed and str(value) not in allowed:
+            return {
+                "error": "invalid parameter",
+                "parameter": spec["name"],
+                "allowed": spec["enum"],
+            }
+    return None
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "aghub-mock/1.0"
 
@@ -822,14 +1216,27 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def _handle(self):
-        path = urlparse(self.path).path
+        parsed = urlparse(self.path)
+        path = parsed.path
         result = match(self.command, path)
         if result is None:
             self._send(404, {"error": "no such route", "path": path})
-        elif "error" in result:
+            return
+        if "error" in result:
             self._send(405, result)
-        else:
-            self._send(200, result["response"])
+            return
+        route = result["route"]
+        raw_query = parse_qs(parsed.query)
+        query = {key: value[0] if len(value) == 1 else value for key, value in raw_query.items()}
+        auth_error = check_auth(self.command, route, self.headers, query)
+        if auth_error is not None:
+            self._send(401, auth_error)
+            return
+        param_error = validate_params(self.command, route, query)
+        if param_error is not None:
+            self._send(400, param_error)
+            return
+        self._send(200, result["response"])
 
     do_GET = _handle
     do_POST = _handle
@@ -866,6 +1273,9 @@ if __name__ == "__main__":
         .replace("$ROUTES$", routes)
         .replace("$OPERATIONS$", operations)
         .replace("$RESPONSES$", responses)
+        .replace("$PARAMETERS$", parameters)
+        .replace("$SECURITY$", security)
+        .replace("$SCHEMES$", schemes)
     )
 
 
