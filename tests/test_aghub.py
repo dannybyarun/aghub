@@ -143,6 +143,64 @@ class AghubTestCase(unittest.TestCase):
         self.assertIn("T-001", proc.stdout)
         self.assertIn("T-002", proc.stdout)
 
+    def test_task_import_is_one_board_write(self):
+        w = self.world
+        self.bootstrap()
+        board_dir = Path(w.fe) / ".git" / "aghub-board"
+        before = len(git(board_dir, "log", "--oneline").stdout.splitlines())
+        specs = (
+            "- title: Import A\n  paths: [src/a/**]\n"
+            "- title: Import B\n  paths: [src/b/**]\n"
+            "- title: Import C\n  paths: [src/c/**]\n  requires_approval: true\n"
+        )
+        (Path(w.fe) / "tasks.yaml").write_text(specs)
+        out = w.aghub("fe", "task", "import", "tasks.yaml", agent="fe-1")
+        self.assertIn("imported 3 task(s)", out.stdout)
+        listed = w.aghub("fe", "task", "list", agent="fe-1").stdout
+        for task_id in ("T-003", "T-004", "T-005"):
+            self.assertIn(task_id, listed)
+        after = len(git(board_dir, "log", "--oneline").stdout.splitlines())
+        self.assertEqual(after - before, 1, "import should be a single board commit")
+        self.assertIn("import 3 task(s)", git(board_dir, "log", "-1", "--format=%s").stdout)
+
+    def test_sharded_boards_are_independent(self):
+        w = self.world
+        self.bootstrap()
+        created = w.aghub(
+            "fe", "init", "--project", "test-web", "--check", "true",
+            agent="fe-1", env={"AGHUB_SHARD": "web"},
+        )
+        self.assertIn("shard", created.stdout)
+        w.aghub(
+            "fe", "task", "add", "Shard task", "--paths", "src/web/**",
+            agent="fe-1", env={"AGHUB_SHARD": "web"},
+        )
+        default_list = w.aghub("fe", "task", "list", agent="fe-1").stdout
+        self.assertNotIn("Shard task", default_list)
+        web_list = w.aghub(
+            "fe", "task", "list", agent="fe-1", env={"AGHUB_SHARD": "web"}
+        ).stdout
+        self.assertIn("Shard task", web_list)
+        boards = json.loads(w.aghub("fe", "boards", "--json", agent="fe-1").stdout)
+        by_name = {board["name"]: board for board in boards}
+        self.assertEqual(set(by_name), {"default", "web"})
+        self.assertEqual(by_name["web"]["branch"], "aghub/board-web")
+        self.assertEqual(by_name["web"]["project"], "test-web")
+
+    def test_shard_init_requires_a_default_board_and_rejects_duplicates(self):
+        w = self.world
+        self.bootstrap()
+        w.aghub(
+            "fe", "init", "--project", "p-web", "--check", "true",
+            agent="fe-1", env={"AGHUB_SHARD": "web"},
+        )
+        dup = w.aghub(
+            "fe", "init", "--project", "p-web", "--check", "true",
+            agent="fe-1", env={"AGHUB_SHARD": "web"}, check=False,
+        )
+        self.assertEqual(dup.returncode, 1)
+        self.assertIn("already exists", dup.stderr)
+
     def test_live_claim_cannot_be_stolen(self):
         self.bootstrap()
         self.world.aghub("fe", "claim", "T-001", agent="fe-1")
