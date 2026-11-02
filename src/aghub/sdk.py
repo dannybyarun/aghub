@@ -108,6 +108,7 @@ class Agent:
         review_groups=None,
         reviewers=None,
         review_ttl=None,
+        review_sla=None,
     ):
         argv = ["task", "add", title]
         for path in paths or []:
@@ -128,6 +129,8 @@ class Agent:
             argv.extend(["--reviewer", reviewer])
         if review_ttl is not None:
             argv.extend(["--review-ttl", str(review_ttl)])
+        if review_sla is not None:
+            argv.extend(["--review-sla", str(review_sla)])
         return self.call(*argv)
 
     def approve(self, task, note="", commit=None):
