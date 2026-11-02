@@ -9,10 +9,12 @@ from urllib.parse import quote
 class HubError(Exception):
     """The hub is unreachable or returned an error."""
 
-    def __init__(self, message, status=None, payload=None):
+    def __init__(self, message, status=None, payload=None, transient=False, timed_out=False):
         super().__init__(message)
         self.status = status
         self.payload = payload or {}
+        self.transient = transient
+        self.timed_out = timed_out
 
 
 class HubConflict(HubError):
@@ -21,6 +23,9 @@ class HubConflict(HubError):
 
 class _RetryableHubError(HubError):
     """A hub was unreachable or returned a transient gateway error."""
+
+    def __init__(self, message, timed_out=False):
+        super().__init__(message, transient=True, timed_out=timed_out)
 
 
 _warned = False
@@ -38,7 +43,16 @@ def _token(token=None):
     return token or os.environ.get("AGHUB_HUB_TOKEN")
 
 
-def _request_one(base, method, path, payload=None, token=None, timeout=5, raw=False):
+def _default_timeout():
+    try:
+        return max(1.0, float(os.environ.get("AGHUB_HUB_TIMEOUT", "15") or 15))
+    except (TypeError, ValueError):
+        return 15.0
+
+
+def _request_one(base, method, path, payload=None, token=None, timeout=None, raw=False):
+    if timeout is None:
+        timeout = _default_timeout()
     url = base.rstrip("/") + path
     data = None
     if payload is not None:
@@ -70,10 +84,16 @@ def _request_one(base, method, path, payload=None, token=None, timeout=5, raw=Fa
             raise _RetryableHubError(f"{exc.code}: {message}")
         raise HubError(f"{exc.code}: {message}", status=exc.code, payload=detail)
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
-        raise _RetryableHubError(str(getattr(exc, "reason", exc)))
+        reason = getattr(exc, "reason", exc)
+        timed_out = (
+            isinstance(exc, TimeoutError)
+            or isinstance(reason, TimeoutError)
+            or "timed out" in str(reason).lower()
+        )
+        raise _RetryableHubError(str(reason), timed_out=timed_out)
 
 
-def request(base, method, path, payload=None, token=None, timeout=5, raw=False):
+def request(base, method, path, payload=None, token=None, timeout=None, raw=False):
     """Call a hub, failing over across a list of URLs on transport errors.
 
     A 409, 401, 403, 429 or other 4xx is authoritative and is never retried
@@ -92,14 +112,20 @@ def request(base, method, path, payload=None, token=None, timeout=5, raw=False):
                 candidates[0], method, path, payload, token, timeout, raw
             )
         except _RetryableHubError as exc:
-            raise HubError(str(exc))
+            raise HubError(str(exc), transient=True, timed_out=exc.timed_out)
     failures = []
+    timed_out = False
     for candidate in candidates:
         try:
             return _request_one(candidate, method, path, payload, token, timeout, raw)
         except _RetryableHubError as exc:
             failures.append(f"{candidate}: {exc}")
-    raise HubError("all hubs failed: " + "; ".join(failures))
+            timed_out = timed_out or exc.timed_out
+    raise HubError(
+        "all hubs failed: " + "; ".join(failures),
+        transient=True,
+        timed_out=timed_out,
+    )
 
 
 def health(base, token=None):

@@ -146,6 +146,9 @@ class HubStore:
         self.conn.row_factory = sqlite3.Row
         self.lock = threading.RLock()
         with self.lock:
+            self.conn.execute("PRAGMA journal_mode=WAL")
+            self.conn.execute("PRAGMA synchronous=NORMAL")
+            self.conn.execute("PRAGMA busy_timeout=5000")
             self.conn.executescript(SCHEMA)
             columns = {
                 row["name"] for row in self.conn.execute("PRAGMA table_info(snapshots)")
@@ -1131,6 +1134,7 @@ class HubStore:
 class HubServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
+    request_queue_size = 256
 
 
 class Handler(BaseHTTPRequestHandler):

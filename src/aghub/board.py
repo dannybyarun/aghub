@@ -567,6 +567,16 @@ class Board:
                     time.sleep(min(2.0, delay + 0.5))
                     delay = min(1.0, delay * 1.6)
                     continue
+                if getattr(exc, "timed_out", False):
+                    if time.monotonic() >= deadline:
+                        hubclient.warn_once(
+                            "hub timed out while granting the board writer lock; "
+                            "continuing with optimistic board writes"
+                        )
+                        return None
+                    time.sleep(min(1.0, delay) * (0.5 + random.random()))
+                    delay = min(1.0, delay * 1.6)
+                    continue
                 hubclient.warn_once(
                     f"hub at {self.hub} is unreachable ({exc}); continuing with "
                     "optimistic board writes"
