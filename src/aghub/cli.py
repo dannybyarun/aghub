@@ -333,6 +333,10 @@ def cmd_policy(args):
         updates["clear_ttl"] = True
     elif args.ttl is not None:
         updates["ttl_seconds"] = args.ttl
+    if args.no_sla:
+        updates["clear_sla"] = True
+    elif args.sla is not None:
+        updates["sla_seconds"] = args.sla
     if args.clear_reviewers:
         updates["clear_reviewers"] = True
     if args.reviewers:
@@ -363,6 +367,12 @@ def cmd_policy(args):
         updates["github"] = github
     if args.clear_github:
         updates["clear_github"] = True
+    if args.protect:
+        updates["protected"] = args.protect
+    if args.unprotect:
+        updates["unprotected"] = args.unprotect
+    if args.clear_protected:
+        updates["clear_protected"] = True
     if not updates:
         raise AghubError("nothing to change — pass --approvals, --ttl, --group, ...")
 
@@ -1435,7 +1445,8 @@ def cmd_submit(args):
         detail = (local.stderr or local.stdout or "").strip()
         raise AghubError(f"cannot resolve {branch}: {detail}")
     head = local.stdout.strip()
-    missing = service.approval_gate(state, task, head=head)
+    changed = service.branch_changes(board, head)
+    missing = service.approval_gate(state, task, head=head, changed=changed)
     if missing and not args.force:
         raise AghubError(missing)
     push = gitops.git(["push", "-u", board.remote, branch], cwd=board.repo, check=False)
@@ -1444,7 +1455,9 @@ def cmd_submit(args):
         raise AghubError(f"could not push {branch}: {detail}")
     local = gitops.git(["rev-parse", branch], cwd=board.repo, check=False)
     head = local.stdout.strip() or head
-    missing = service.approval_gate(state, task, head=head)
+    missing = service.approval_gate(
+        state, task, head=head, changed=service.branch_changes(board, head)
+    )
     if missing and not args.force:
         raise AghubError(missing)
     key = (
@@ -2200,6 +2213,13 @@ def build_parser():
     )
     policy_set.add_argument("--no-ttl", action="store_true", help="approvals never expire")
     policy_set.add_argument(
+        "--sla",
+        type=int,
+        default=None,
+        help="review SLA in seconds: flag pending reviews after this long (0 clears)",
+    )
+    policy_set.add_argument("--no-sla", action="store_true", help="disable the review SLA")
+    policy_set.add_argument(
         "--reviewer",
         dest="reviewers",
         action="append",
@@ -2230,6 +2250,22 @@ def build_parser():
     policy_set.add_argument("--clear-reviewers", action="store_true")
     policy_set.add_argument("--clear-groups", action="store_true")
     policy_set.add_argument("--clear-required-groups", action="store_true")
+    policy_set.add_argument(
+        "--protect",
+        action="append",
+        default=[],
+        help=(
+            "condition approvals on touched paths: PATH[=GROUP] "
+            "(repeatable; GROUP adds that review group's approval)"
+        ),
+    )
+    policy_set.add_argument(
+        "--unprotect",
+        action="append",
+        default=[],
+        help="remove a protected path pattern (repeatable)",
+    )
+    policy_set.add_argument("--clear-protected", action="store_true")
     policy_set.add_argument("--clear-github", action="store_true")
     policy_set.add_argument("--clear", action="store_true", help="reset the whole review policy")
     policy_set.add_argument("--json", action="store_true")

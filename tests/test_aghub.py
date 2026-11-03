@@ -11,6 +11,8 @@ import unittest
 import urllib.request
 from pathlib import Path
 
+import yaml
+
 ROOT = Path(__file__).resolve().parents[1]
 PYTHONPATH = str(ROOT / "src")
 sys.path.insert(0, PYTHONPATH)
@@ -1661,6 +1663,186 @@ class AghubTestCase(unittest.TestCase):
         self.assertIsNone(task["owner"])
         self.assertEqual(state["hub"], "live")
 
+    def test_protected_paths_condition_the_approval_on_the_patch(self):
+        w = self.world
+        w.aghub("fe", "init", "--project", "gate", "--check", "python3 check.py", agent="fe-1")
+        w.aghub("fe", "acl", "init", agent="fe-1")
+        w.aghub("fe", "acl", "set", "sec-1", "admin", agent="fe-1")
+        w.aghub("be", "init", "--project", "gate", agent="be-1")
+        w.aghub("fe", "acl", "set", "be-1", "writer", agent="fe-1")
+        w.aghub(
+            "fe", "contract", "freeze", "api", "1",
+            "--from", "contracts/api.yaml", agent="fe-1",
+        )
+        w.aghub(
+            "fe",
+            "policy",
+            "set",
+            "--group",
+            "security=fe-1",
+            "--reviewer",
+            "fe-1",
+            "--reviewer",
+            "sec-1",
+            "--protect",
+            "src/api/secret/**=security",
+            agent="fe-1",
+        )
+        policy = json.loads(
+            w.aghub("fe", "policy", "show", "--json", agent="fe-1").stdout
+        )
+        self.assertEqual(
+            policy["protected"],
+            [{"path": "src/api/secret/**", "require": "security"}],
+        )
+
+        w.aghub(
+            "fe",
+            "task",
+            "add",
+            "Rotate secrets",
+            "--paths",
+            "src/api/**",
+            "--requires-approval",
+            agent="fe-1",
+        )
+        w.aghub("be", "claim", "T-001", agent="be-1")
+        branch = "agent/be-1/T-001"
+        git(w.be, "checkout", "-q", branch)
+        w.commit_file("be", "src/api/secret/keys.py", "KEYS = {}\n", "keys")
+        git(w.be, "push", "-qu", "origin", branch)
+
+        blocked = w.aghub("be", "submit", "T-001", agent="be-1", check=False)
+        self.assertEqual(blocked.returncode, 1)
+        self.assertIn("security", blocked.stderr)
+        self.assertIn("src/api/secret/**", blocked.stderr)
+
+        w.aghub(
+            "fe", "review", "T-001", "--approve", "--note", "keys look fine",
+            agent="fe-1",
+        )
+        still_short = w.aghub("be", "submit", "T-001", agent="be-1", check=False)
+        self.assertEqual(still_short.returncode, 1)
+        self.assertIn("requires 2 approvals", still_short.stderr)
+
+        w.aghub(
+            "fe",
+            "task",
+            "add",
+            "Plain change",
+            "--paths",
+            "src/api/**",
+            "--requires-approval",
+            agent="fe-1",
+        )
+        w.aghub("be", "claim", "T-002", agent="be-1")
+        git(w.be, "checkout", "-q", "agent/be-1/T-002")
+        w.commit_file("be", "src/api/items.py", "# items\n", "items")
+        git(w.be, "push", "-qu", "origin", "agent/be-1/T-002")
+        w.aghub("fe", "review", "T-002", "--approve", "--note", "ok", agent="fe-1")
+        plain = w.aghub("be", "submit", "T-002", agent="be-1", check=False)
+        self.assertEqual(plain.returncode, 0, plain.stderr)
+        self.assertNotIn("protected", plain.stdout + plain.stderr)
+
+        w.aghub(
+            "fe", "review", "T-001", "--approve", "--note", "lgtm", agent="sec-1"
+        )
+        w.aghub("be", "submit", "T-001", agent="be-1")
+
+    def test_review_sla_flags_an_old_review_request(self):
+        w = self.world
+        self.bootstrap()
+        w.aghub("fe", "policy", "set", "--sla", "3600", agent="fe-1")
+        policy = json.loads(
+            w.aghub("fe", "policy", "show", "--json", agent="fe-1").stdout
+        )
+        self.assertEqual(policy["sla_seconds"], 3600)
+
+        w.aghub(
+            "fe",
+            "task",
+            "add",
+            "Slow review",
+            "--paths",
+            "src/api/**",
+            "--requires-approval",
+            agent="fe-1",
+        )
+        w.aghub("be", "claim", "T-003", agent="be-1")
+        branch = "agent/be-1/T-003"
+        git(w.be, "checkout", "-q", branch)
+        w.commit_file("be", "src/api/items.py", "# items\n", "items")
+        git(w.be, "push", "-qu", "origin", branch)
+        w.aghub("fe", "review", "T-003", "--approve", "--note", "items", agent="fe-1")
+        w.aghub("be", "submit", "T-003", agent="be-1")
+
+        packet = json.loads(
+            w.aghub("fe", "review", "T-003", "--json", agent="fe-1").stdout
+        )
+        self.assertFalse(packet["approval"]["overdue"])
+        self.assertEqual(packet["approval"]["sla_seconds"], 3600)
+        self.assertIsNotNone(packet["approval"]["pending_since"])
+
+        # A protected path arrives after review, so the same submission now
+        # waits for a second reviewer: that wait is what the SLA tracks.
+        w.aghub(
+            "fe",
+            "policy",
+            "set",
+            "--group",
+            "security=fe-1",
+            "--protect",
+            "src/api/secret/**",
+            agent="fe-1",
+        )
+        git(w.be, "checkout", "-q", branch)
+        w.commit_file("be", "src/api/secret/key.py", "KEY = 1\n", "key")
+        git(w.be, "push", "-qu", "origin", branch)
+        head = git(w.be, "rev-parse", branch).stdout.strip()
+
+        def edit_queue(board_dir):
+            """Rewrite the shared queue as a human could, then push it."""
+            git(board_dir, "fetch", "-q", "origin", "aghub/board")
+            git(board_dir, "reset", "-q", "--hard", "origin/aghub/board")
+            queue_file = Path(board_dir) / "queue.yaml"
+            queue = yaml.safe_load(queue_file.read_text())
+            changed = 0
+            for entry in queue["entries"]:
+                if entry.get("task") != "T-003":
+                    continue
+                entry["submitted_commit"] = head
+                entry["submission"]["commit"] = head
+                entry["submitted_at"] = "2020-01-01T00:00:00Z"
+                changed += 1
+            self.assertEqual(changed, 1)
+            queue_file.write_text(yaml.safe_dump(queue, sort_keys=False))
+            git(board_dir, "commit", "-qam", "expire review request")
+            git(board_dir, "push", "-q", "origin", "aghub/board")
+
+        edit_queue(str(Path(w.fe) / ".git" / "aghub-board"))
+
+        inbox = json.loads(w.aghub("fe", "inbox", "--json", agent="fe-1").stdout)
+        overdue = [item for item in inbox["items"] if item["task"] == "T-003"]
+        self.assertEqual(len(overdue), 1)
+        self.assertEqual(overdue[0]["kind"], "approval")
+        self.assertTrue(overdue[0]["policy"]["overdue"])
+        self.assertEqual(overdue[0]["priority"], -1)
+        self.assertIn("SLA", overdue[0]["detail"])
+
+        packet = json.loads(
+            w.aghub("fe", "review", "T-003", "--json", agent="fe-1").stdout
+        )
+        self.assertTrue(packet["approval"]["overdue"])
+        self.assertGreaterEqual(packet["approval"]["pending_seconds"], 3600)
+        self.assertIn("SLA", packet["approval"]["reason"])
+
+        w.aghub("fe", "policy", "set", "--no-sla", agent="fe-1")
+        packet = json.loads(
+            w.aghub("fe", "review", "T-003", "--json", agent="fe-1").stdout
+        )
+        self.assertFalse(packet["approval"]["overdue"])
+        self.assertNotIn("SLA", packet["approval"]["reason"] or "")
+
 
 class PathTests(unittest.TestCase):
     def test_globs(self):
@@ -1674,6 +1856,7 @@ class PathTests(unittest.TestCase):
         self.assertTrue(overlaps("src/web/**", "src/web/components/x.tsx"))
         self.assertFalse(overlaps("src/web/**", "src/api/**"))
         self.assertFalse(overlaps("src/web/**", "src/website/**"))
+
 
 
 if __name__ == "__main__":

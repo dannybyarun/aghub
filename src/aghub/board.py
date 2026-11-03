@@ -467,6 +467,10 @@ class Board:
     def load(self):
         return State(self).load()
 
+    def project_config(self):
+        """Just `project.yaml`: a field without the cost of a full board load."""
+        return read_yaml(os.path.join(self.dir, "project.yaml"), {}) or {}
+
     def _remote_ready(self):
         return bool(self.remote) and gitops.remote_branch_exists(self.repo, self.remote, self.branch)
 

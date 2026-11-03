@@ -48,7 +48,12 @@ def inbox(state, board=None):
             if board is not None and task.get("requires_approval")
             else None
         )
-        gap = service.approval_gate(state, task, head=head)
+        changed = (
+            service.branch_changes(board, head)
+            if board is not None and head
+            else None
+        )
+        gap = service.approval_gate(state, task, head=head, changed=changed)
         base = {
             "task": task_id,
             "title": task.get("title") or "",
@@ -64,7 +69,7 @@ def inbox(state, board=None):
                 {
                     **base,
                     "kind": "changes",
-                    "priority": 0,
+                    "priority": -1,
                     "detail": (
                         f"{service.reviewer_identity(record) or 'a reviewer'} "
                         f"requested changes: "
@@ -74,12 +79,14 @@ def inbox(state, board=None):
                 }
             )
         elif gap and (task.get("owner") or entries):
-            summary = service.approval_summary(state, task, head=head)
+            summary = service.approval_summary(
+                state, task, head=head, changed=changed
+            )
             items.append(
                 {
                     **base,
                     "kind": "approval",
-                    "priority": 0,
+                    "priority": -1 if summary["overdue"] else 0,
                     "detail": gap,
                     "action": f"aghub review {task_id} --approve --note ...",
                     "policy": {
@@ -87,6 +94,12 @@ def inbox(state, board=None):
                         "approved_count": summary["approved_count"],
                         "required_groups": summary["required_groups"],
                         "missing_groups": summary["missing_groups"],
+                        "protected": [
+                            hit["path"] for hit in summary["protected"]
+                        ],
+                        "sla_seconds": summary["sla_seconds"],
+                        "pending_seconds": summary["pending_seconds"],
+                        "overdue": summary["overdue"],
                     },
                 }
             )
@@ -336,7 +349,9 @@ def review_packet(board, state, task_id, include_diff=False):
     entries = _queue_for(state, task_id)
     decision, record = service.review_decision(state, task_id)
     head = branch_head(board, task, update=True)
-    summary = service.approval_summary(state, task, head=head)
+    summary = service.approval_summary(
+        state, task, head=head, changed=service.branch_changes(board, head)
+    )
     stale = summary["latest_stale"]
     analysis = {}
     for item in (
@@ -376,6 +391,11 @@ def review_packet(board, state, task_id, include_diff=False):
             "required_groups": summary["required_groups"],
             "missing_groups": summary["missing_groups"],
             "groups": summary["groups"],
+            "protected": summary["protected"],
+            "sla_seconds": summary["sla_seconds"],
+            "pending_since": summary["pending_since"],
+            "pending_seconds": summary["pending_seconds"],
+            "overdue": summary["overdue"],
             "reviewers": summary["reviewers"],
             "ttl_seconds": summary["ttl_seconds"],
             "approvals": summary["approvals"],

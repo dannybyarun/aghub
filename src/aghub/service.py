@@ -869,6 +869,8 @@ def normalize_review_policy(project):
     ttl = max(0, ttl) if ttl is not None else None
     if ttl == 0:
         ttl = None
+    sla = _int_or_none(raw.get("sla_seconds"))
+    sla = sla if sla and sla > 0 else None
     groups = {}
     raw_groups = raw.get("groups")
     if isinstance(raw_groups, dict):
@@ -885,6 +887,19 @@ def normalize_review_policy(project):
             agent = str(agent).strip()
             if login and agent:
                 github[login] = agent
+    protected = []
+    raw_protected = raw.get("protected")
+    if isinstance(raw_protected, list):
+        for item in raw_protected:
+            if isinstance(item, str):
+                item = {"path": item}
+            if not isinstance(item, dict):
+                continue
+            pattern = str(item.get("path") or "").strip().strip("/")
+            if not pattern:
+                continue
+            group = str(item.get("require") or "").strip()
+            protected.append({"path": pattern, "require": group or None})
     return {
         "approvals": approvals,
         "ttl_seconds": ttl,
@@ -892,6 +907,8 @@ def normalize_review_policy(project):
         "required_groups": _string_list(raw.get("required_groups")),
         "reviewers": _string_list(raw.get("reviewers")),
         "github": github,
+        "protected": protected,
+        "sla_seconds": sla,
     }
 
 
@@ -926,12 +943,67 @@ def review_policy_for(state, task=None):
         "required": bool(task.get("requires_approval")),
         "approvals": required,
         "ttl_seconds": ttl,
+        "sla_seconds": policy["sla_seconds"],
         "reviewers": reviewers,
         "allowlist": restricted,
         "groups": dict(policy["groups"]),
         "required_groups": required_groups,
         "github": dict(policy["github"]),
+        "protected": [dict(item) for item in policy["protected"]],
     }
+
+
+def protected_hits(entries, changed):
+    """Protected paths touched by a change set, each with its required group."""
+    changed = [str(path).strip("/") for path in (changed or []) if str(path).strip()]
+    hits = []
+    for entry in entries or []:
+        pattern = entry.get("path")
+        if not pattern:
+            continue
+        touched = sorted({path for path in changed if matches(pattern, path)})
+        if touched:
+            hits.append(
+                {
+                    "path": pattern,
+                    "require": entry.get("require"),
+                    "files": touched,
+                }
+            )
+    return hits
+
+
+def changed_paths(board, base, head):
+    """Paths changed between two commits, or None when git cannot answer."""
+    if not base or not head:
+        return None
+    result = gitops.git(
+        ["diff", "--name-only", base, head], cwd=board.repo, check=False
+    )
+    if result.returncode != 0:
+        return None
+    return [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
+
+
+def branch_changes(board, head, trunk=None):
+    """Paths that `head` changes against trunk, or None when git cannot tell."""
+    if not head:
+        return None
+    if trunk is None:
+        # Read only the trunk ref: a full board load per gate would make
+        # `queue run` and the inbox reload the whole project for every task.
+        trunk = board.project_config().get("trunk") or "main"
+    for ref in (
+        f"refs/remotes/{board.remote}/{trunk}" if board.remote else None,
+        trunk,
+    ):
+        if not ref:
+            continue
+        found = gitops.git(["merge-base", ref, head], cwd=board.repo, check=False)
+        base = (found.stdout or "").strip()
+        if found.returncode == 0 and base:
+            return changed_paths(board, base, head)
+    return None
 
 
 def describe_review_policy(state):
@@ -941,6 +1013,10 @@ def describe_review_policy(state):
     ]
     if policy["ttl_seconds"]:
         bits.append(f"expires after {human_age(policy['ttl_seconds'])}")
+    if policy["sla_seconds"]:
+        bits.append(f"review SLA {human_age(policy['sla_seconds'])}")
+    if policy["protected"]:
+        bits.append(f"{len(policy['protected'])} protected path(s)")
     if policy["required_groups"]:
         bits.append("groups " + ", ".join(policy["required_groups"]))
     if policy["reviewers"]:
@@ -995,7 +1071,98 @@ def _review_summary(record, eligible=True):
     }
 
 
-def approval_summary(state, task, head=None):
+def review_pending_since(state, task, head=None):
+    """When the change under review started waiting, and for which head.
+
+    The clock starts at the submission that carried `head`, otherwise at the
+    claim, otherwise at the task itself.
+    """
+    task_id = (task or {}).get("id")
+    since = None
+    for entry in state.queue or []:
+        if entry.get("task") != task_id:
+            continue
+        entry_head = entry.get("submitted_commit") or entry.get("commit")
+        if head and entry_head and not same_commit(entry_head, head):
+            continue
+        stamp = entry.get("submitted_at") or entry.get("at")
+        if stamp and (since is None or stamp < since):
+            since = stamp
+    if since is None:
+        since = (task or {}).get("claimed_at") or (task or {}).get("created_at")
+    return since
+
+
+def _apply_review_sla(summary, state, task, head):
+    sla = summary.get("sla_seconds")
+    if not sla:
+        return
+    pending_since = review_pending_since(state, task, head=head)
+    if pending_since is None:
+        return
+    age = age_seconds(pending_since)
+    summary["pending_since"] = pending_since
+    summary["pending_seconds"] = age
+    summary["overdue"] = bool(age is not None and age > sla)
+
+
+def _apply_protected_policy(policy, summary, approvals, changed):
+    """Diff-conditioned groups and approvals for the paths in `changed`."""
+    hits = protected_hits(policy.get("protected"), changed)
+    summary["changed"] = list(changed or []) if changed is not None else None
+    summary["protected"] = hits
+    if not hits:
+        return
+    # A protected patch needs one more distinct reviewer than the board
+    # baseline; the reviewer who signs for the protected group counts toward
+    # that extra approval.
+    required = policy["approvals"] + 1
+    if required > summary["required_approvals"]:
+        summary["required_approvals"] = required
+        summary["missing_approvals"] = max(
+            0, required - summary["approved_count"]
+        )
+    for hit in hits:
+        group = hit.get("require")
+        if not group:
+            continue
+        members = policy["groups"].get(group)
+        existing = summary["groups"].get(group)
+        if not members:
+            summary["groups"][group] = {
+                "defined": False,
+                "members": [],
+                "satisfied": False,
+                "source": "protected",
+                "paths": sorted(
+                    {
+                        *(existing or {}).get("paths", []),
+                        hit["path"],
+                    }
+                ),
+            }
+            if group not in summary["missing_groups"]:
+                summary["missing_groups"].append(group)
+            continue
+        satisfied = any(item["reviewer"] in members for item in approvals)
+        summary["groups"][group] = {
+            "defined": True,
+            "members": list(members),
+            "satisfied": satisfied,
+            "source": "protected",
+            "paths": sorted(
+                {*(existing or {}).get("paths", []), hit["path"]}
+            ),
+        }
+        if satisfied:
+            summary["missing_groups"] = [
+                name for name in summary["missing_groups"] if name != group
+            ]
+        elif group not in summary["missing_groups"]:
+            summary["missing_groups"].append(group)
+
+
+def approval_summary(state, task, head=None, changed=None):
     """Evaluate every review against the task's effective review policy.
 
     Returns a serializable summary used by the gate, packets, CI, and the web
@@ -1019,6 +1186,12 @@ def approval_summary(state, task, head=None):
         "reviewers": list(policy["reviewers"]),
         "allowlist": policy["allowlist"],
         "ttl_seconds": policy["ttl_seconds"],
+        "sla_seconds": policy["sla_seconds"],
+        "pending_since": None,
+        "pending_seconds": None,
+        "overdue": False,
+        "protected": [],
+        "changed": None,
         "approvals": [],
         "expired": [],
         "stale": [],
@@ -1106,6 +1279,7 @@ def approval_summary(state, task, head=None):
                 "defined": False,
                 "members": [],
                 "satisfied": False,
+                "source": "policy",
             }
             summary["missing_groups"].append(name)
             continue
@@ -1114,9 +1288,16 @@ def approval_summary(state, task, head=None):
             "defined": True,
             "members": list(members),
             "satisfied": satisfied,
+            "source": "policy",
         }
         if not satisfied:
             summary["missing_groups"].append(name)
+
+    _apply_protected_policy(policy, summary, approvals, changed)
+    _apply_review_sla(summary, state, task, head)
+    summary["missing_approvals"] = max(
+        0, summary["required_approvals"] - summary["approved_count"]
+    )
 
     if latest and (latest.get("decision") or "approved") == "changes_requested":
         reviewer = reviewer_identity(latest) or "a reviewer"
@@ -1135,10 +1316,23 @@ def approval_summary(state, task, head=None):
             item["id"] == latest.get("id") for item in summary["ineligible"]
         )
 
-    if summary["reason"] is None and summary["approved_count"] < policy["approvals"]:
+    if summary["reason"] is None and summary["approved_count"] < summary["required_approvals"]:
         if not records:
+            extra = ""
+            if summary["protected"]:
+                paths = ", ".join(
+                    sorted({hit["path"] for hit in summary["protected"]})
+                )
+                groups = [
+                    name
+                    for name in summary["missing_groups"]
+                    if summary["groups"].get(name, {}).get("source") == "protected"
+                ]
+                extra = f" for the protected paths it touches ({paths})"
+                if groups:
+                    extra += f", including review group {', '.join(groups)}"
             summary["reason"] = (
-                f"{task['id']} requires a human approval — run "
+                f"{task['id']} requires a human approval{extra} — run "
                 f"`aghub review {task['id']} --approve --note ...`"
             )
         elif summary["approved_count"] == 0 and reasons.get((latest or {}).get("id")):
@@ -1154,36 +1348,64 @@ def approval_summary(state, task, head=None):
                 extra = f"; {len(summary['expired'])} review(s) expired"
             elif summary["stale"]:
                 extra = f"; {len(summary['stale'])} review(s) target another head"
+            protected = ""
+            if summary["protected"]:
+                paths = ", ".join(
+                    sorted({hit["path"] for hit in summary["protected"]})
+                )
+                protected = (
+                    f"; the patch touches protected paths ({paths}) and needs "
+                    f"{summary['required_approvals']} approvals"
+                )
             summary["reason"] = (
-                f"{task['id']} requires {policy['approvals']} approvals — "
+                f"{task['id']} requires {summary['required_approvals']} approvals — "
                 f"{summary['approved_count']} valid for the current head"
-                f"{extra}; still need "
+                f"{extra}{protected}; still need "
                 f"{summary['missing_approvals']} more"
             )
     if summary["reason"] is None and summary["missing_groups"]:
         missing = []
+        described = []
         for name in summary["missing_groups"]:
             group = summary["groups"][name]
+            paths = group.get("paths") or []
+            suffix = f" for {', '.join(paths)}" if paths else ""
+            described.append(name + suffix)
             if group["defined"]:
                 missing.append(
-                    f"'{name}' (members: {', '.join(group['members'])})"
+                    f"'{name}' (members: {', '.join(group['members'])}){suffix}"
                 )
             else:
                 missing.append(
                     f"'{name}' (undefined — add it with "
-                    f"`aghub policy set --group {name}=agent1,agent2`)"
+                    f"`aghub policy set --group {name}=agent1,agent2`){suffix}"
                 )
-        summary["reason"] = (
-            f"{task['id']} needs an approval from review group "
-            + ", ".join(missing)
+        if any(
+            summary["groups"][name].get("source") == "protected"
+            for name in summary["missing_groups"]
+        ):
+            summary["reason"] = (
+                f"{task['id']} touches protected paths and needs an approval "
+                "from review group " + ", ".join(missing)
+            )
+        else:
+            summary["reason"] = (
+                f"{task['id']} needs an approval from review group "
+                + ", ".join(missing)
+            )
+    if summary["overdue"] and summary["reason"]:
+        # Whatever is holding the review up, an overdue one says so.
+        summary["reason"] += (
+            f" — overdue: waiting {human_age(summary['pending_seconds'])}"
+            f" (SLA {human_age(summary['sla_seconds'])})"
         )
     summary["satisfied"] = summary["reason"] is None
     return summary
 
 
-def approval_gate(state, task, head=None):
+def approval_gate(state, task, head=None, changed=None):
     """Return a human-readable gap when a task still needs an approval."""
-    return approval_summary(state, task, head=head)["reason"]
+    return approval_summary(state, task, head=head, changed=changed)["reason"]
 
 
 def set_review_policy(state, updates, agent):
@@ -1206,6 +1428,15 @@ def set_review_policy(state, updates, agent):
             raw["ttl_seconds"] = ttl
         else:
             raw.pop("ttl_seconds", None)
+
+    if updates.get("clear_sla"):
+        raw.pop("sla_seconds", None)
+    elif updates.get("sla_seconds") is not None:
+        sla = max(0, int(updates["sla_seconds"]))
+        if sla:
+            raw["sla_seconds"] = sla
+        else:
+            raw.pop("sla_seconds", None)
 
     if updates.get("clear_reviewers"):
         raw.pop("reviewers", None)
@@ -1254,6 +1485,43 @@ def set_review_policy(state, updates, agent):
         if github:
             raw["github"] = github
 
+    if updates.get("clear_protected"):
+        raw.pop("protected", None)
+    protected = []
+    for item in raw.get("protected") or []:
+        if isinstance(item, str):
+            item = {"path": item}
+        if isinstance(item, dict) and str(item.get("path") or "").strip():
+            protected.append(
+                {
+                    "path": str(item["path"]).strip().strip("/"),
+                    "require": str(item.get("require") or "").strip() or None,
+                }
+            )
+    for spec in updates.get("protected") or []:
+        spec = str(spec).strip()
+        if not spec:
+            continue
+        pattern, sep, group = spec.partition("=")
+        pattern = pattern.strip().strip("/")
+        if not pattern:
+            raise AghubError("--protect needs PATH or PATH=GROUP")
+        group = group.strip() if sep else ""
+        entry = {"path": pattern, "require": group or None}
+        protected = [
+            item
+            for item in protected
+            if not (item["path"] == pattern and item["require"] == entry["require"])
+        ]
+        protected.append(entry)
+    for pattern in updates.get("unprotected") or []:
+        pattern = str(pattern).strip().strip("/")
+        protected = [item for item in protected if item["path"] != pattern]
+    if protected:
+        raw["protected"] = protected
+    else:
+        raw.pop("protected", None)
+
     missing = [name for name in required if name not in groups]
     if missing:
         raise AghubError(
@@ -1261,6 +1529,14 @@ def set_review_policy(state, updates, agent):
             + ", ".join(missing)
             + " — add them with `aghub policy set --group NAME=agent1,agent2`"
         )
+    for item in raw.get("protected") or []:
+        group = (item or {}).get("require")
+        if group and group not in groups:
+            raise AghubError(
+                f"protected path {item.get('path')} requires undefined review "
+                f"group '{group}' — define it with "
+                f"`aghub policy set --group {group}=agent1,agent2`"
+            )
     reviewers = _string_list(raw.get("reviewers"))
     if reviewers:
         outside = sorted(
@@ -1454,6 +1730,7 @@ def submit(
     private_key=None,
     public_key=None,
     head=None,
+    changed=None,
 ):
     require_role(state, agent, "writer", "submit tasks")
     task = state.tasks.get(task_id)
@@ -1468,7 +1745,7 @@ def submit(
     for entry in state.queue:
         if entry.get("task") == task_id and entry.get("status") in ("waiting", "merging"):
             raise AghubError(f"{task_id} is already in the queue ({entry['status']})")
-    missing = approval_gate(state, task, head=head)
+    missing = approval_gate(state, task, head=head, changed=changed)
     if missing and not force:
         raise AghubError(missing)
     entry_id = f"Q-{new_ulid()}"
@@ -2061,7 +2338,12 @@ def run_queue(board, agent, printer=print, private_key=None, public_key=None):
         task = state.tasks.get(entry["task"], {})
         printer(f"→ {entry['task']} {task.get('title', '')} ({entry['agent']}) on {entry['branch']}")
         head = remote_branch_head(board, entry["branch"]) if task.get("requires_approval") else None
-        missing = approval_gate(state, task, head=head)
+        changed = (
+            branch_changes(board, head)
+            if task.get("requires_approval") and head
+            else None
+        )
+        missing = approval_gate(state, task, head=head, changed=changed)
         if missing:
             result = {
                 "status": "rejected",

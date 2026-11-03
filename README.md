@@ -184,7 +184,7 @@ Every durable action that can be attributed to an agent is signed with a per-age
 - handoffs
 - queue submissions and queue results
 - failure traces
-- human reviews
+- human reviews, including diff-conditioned approvals on protected paths and reviewer SLAs
 - board events (when a local key exists)
 
 Private keys live in `.git/aghub.local.json` (mode `0600`) and never leave the clone. Only the public key is published on `agents/<id>.yaml`. Key rotation keeps the previous public key so old scorecards still verify; revocation makes old and future signatures from that key fail.
@@ -350,6 +350,56 @@ aghub policy set --approvals 2 --ttl 3600 \
 - `review.github` maps a GitHub login to a board identity, e.g. `alice=fe-1`.
   GitHub and web reviews are signed by the trusted worker, while `reviewer`
   records the human or board identity the decision belongs to.
+- `review.protected` conditions the gate on the patch itself. Each entry is a
+  path glob and an optional review group.
+- `review.sla_seconds` is how long a change may wait for review before it is
+  flagged as overdue.
+
+#### Diff-conditioned approvals
+
+Some paths should not merge on an ordinary approval, however many approvals the
+board requires. Protect them and the gate reads the branch's diff against trunk:
+
+```bash
+aghub policy set --group security=fe-1,sec-1 \
+  --protect 'src/payments/**=security' --protect 'migrations/**'
+aghub policy set --unprotect 'migrations/**'     # drop one pattern
+aghub policy set --clear-protected               # drop them all
+```
+
+- The change set is `git diff --name-only $(merge-base trunk head) head`, so
+  only commits on the task branch count — not other branches that landed on
+  trunk since it forked.
+- Touching a protected path raises the requirement to `review.approvals + 1`
+  distinct reviewers. The reviewer who satisfies the protected group counts
+  toward that extra approval, so a two-reviewer patch needs two reviewers, one
+  of them from the group.
+- `--protect PATH=GROUP` additionally requires an approval from that group for
+  these paths only; `GROUP` must already be defined.
+- A protected patch that is still short says which paths fired and which group
+  is missing, in `submit`, `queue run`, the inbox, `review --json`, `ci status`,
+  and the web board.
+- When git cannot compute the change set (no merge base, detached board), the
+  gate falls back to plain policy rather than blocking on an unknown diff.
+
+A merge queue reruns the same check against the remote head before merging, so a
+patch that grows a protected file after approval is rejected as stale.
+
+#### Reviewer SLAs
+
+```bash
+aghub policy set --sla 3600    # flag reviews waiting more than an hour
+aghub policy set --no-sla      # disable the clock
+```
+
+The clock starts when the current head began waiting: the queue entry that
+carried it, otherwise the claim, otherwise the task. A new head restarts it. An
+overdue review keeps its normal reason and gains an `— overdue: waiting 2h (SLA
+1h)` note; it is reported in `review --json` / the packet as
+`approval.sla_seconds`, `approval.pending_since`, `approval.pending_seconds`, and
+`approval.overdue`, appears in the hub `review_state`, and is promoted to the top
+of `aghub inbox` (priority `-1`, ahead of ordinary approvals). The SLA never
+gates a merge on its own — it only makes a slow review impossible to miss.
 
 Per-task fields can tighten the board policy but cannot loosen it:
 
@@ -737,7 +787,7 @@ reimplemented or bypassed.
 | `aghub next` | first ready task, or the exact blockers |
 | `aghub agent [ID] [--key] [--rotate-key] [--revoke-key] [--key-id ID]` | set identity and manage this clone's eval key |
 | `aghub acl init\|list\|set\|remove\|revoke-key` | manage roles and key revocation |
-| `aghub policy show [--json]` / `policy set [--approvals N] [--ttl S] [--reviewer A] [--group NAME=A,B] [--require-group NAME] [--github LOGIN=AGENT] [--clear]` | board-wide reviewer policy |
+| `aghub policy show [--json]` / `policy set [--approvals N] [--ttl S] [--reviewer A] [--group NAME=A,B] [--require-group NAME] [--github LOGIN=AGENT] [--protect PATH[=GROUP]] [--sla S] [--clear]` | board-wide reviewer policy |
 | `aghub task add TITLE --paths GLOB [--contract api@1] [--eval smoke] [--depends T-001] [--requires-approval] [--required-approvals N] [--reviewer-group NAME] [--reviewer A] [--review-ttl S] [--requires-sandbox]` | define work |
 | `aghub task show TASK` | full task YAML, including any failure trace |
 | `aghub approve TASK [--note TEXT] [--commit SHA] [--force]` | legacy alias for `review --approve` |
@@ -831,7 +881,7 @@ projects and delete their own rows; still, point them at a scratch database.
 ## Next
 
 1. Batched board writes and independent/sharded boards for swarms well beyond the serial writer-lease ceiling.
-2. Diff-conditioned approvals and reviewer SLAs: require a reviewer when a patch touches a protected path, or when a review has been pending too long.
+2. Reviewer escalation: when an SLA lapses, reassign the review, page a fallback group, or auto-request a second reviewer instead of only flagging the item. Diff-conditioned approvals on protected paths and SLA flagging are implemented.
 3. GitHub App path: OAuth/webhooks, fork-safe review recording, dismissed-review handling, richer check annotations, and multi-repository boards.
 4. Deeper codegen: parameter validation, auth schemes, and dialect-aware migrations.
 5. Hosted hub hardening: per-tenant isolation beyond token scopes, storage retention, and backup/restore workflows.
