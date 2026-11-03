@@ -6,6 +6,7 @@ from types import SimpleNamespace
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from aghub import service  # noqa: E402
+from aghub.cli import _parse_protect  # noqa: E402
 from aghub.errors import AghubError  # noqa: E402
 from aghub.util import ago_iso, now_iso  # noqa: E402
 
@@ -13,7 +14,7 @@ HEAD = "a" * 40
 OTHER = "b" * 40
 
 
-def fake_state(project=None, approvals=None, tasks=None):
+def fake_state(project=None, approvals=None, tasks=None, queue=None):
     def emit(*args, **kwargs):
         return None
 
@@ -22,7 +23,7 @@ def fake_state(project=None, approvals=None, tasks=None):
         approvals=list(approvals or []),
         tasks=dict(tasks or {}),
         agents={},
-        queue=[],
+        queue=list(queue or []),
         new_approvals=[],
         emit=emit,
     )
@@ -339,222 +340,422 @@ class ReviewPolicyTests(unittest.TestCase):
         self.assertIn("unknown review group", str(unknown.exception))
 
 
-class ProtectedPathPolicyTests(unittest.TestCase):
-    def project(self, **review):
-        base = {
-            "approvals": 1,
-            "groups": {
-                "payments": ["be-1"],
-                "security": ["sec-1", "fe-1"],
+class ProtectedPathTests(unittest.TestCase):
+    def _state(self, approvals_list):
+        return fake_state(
+            {
+                "review": {
+                    "approvals": 1,
+                    "groups": {"security": ["sec-1"]},
+                    "protected_paths": [
+                        {"paths": ["src/security/**"], "groups": ["security"]}
+                    ],
+                }
             },
+            approvals_list,
+        )
+
+    def test_protected_group_is_required_only_when_the_diff_matches(self):
+        # An ordinary reviewer satisfies the base policy off the protected path.
+        state = self._state([review("R-1", "ci")])
+        clean = service.approval_summary(
+            state, task(), head=HEAD, changed_paths=["src/api/items.py"]
+        )
+        self.assertTrue(clean["satisfied"])
+        self.assertEqual(clean["required_groups"], [])
+        self.assertIs(clean["protected"][0]["triggered"], False)
+
+        # The same approval no longer satisfies a diff that touches the path.
+        state = self._state([review("R-1", "ci")])
+        touched = service.approval_summary(
+            state, task(), head=HEAD, changed_paths=["src/security/keys.py"]
+        )
+        self.assertFalse(touched["satisfied"])
+        self.assertEqual(touched["required_groups"], ["security"])
+        self.assertEqual(touched["missing_groups"], ["security"])
+        self.assertTrue(touched["protected"][0]["triggered"])
+        self.assertEqual(
+            touched["protected"][0]["matched"], ["src/security/keys.py"]
+        )
+        self.assertIs(touched["protected"][0]["satisfied"], False)
+
+        # A member of the protected group clears it — once the patch carries
+        # its extra reviewer, as any protected change now needs two.
+        state = self._state([review("R-1", "sec-1"), review("R-2", "ci")])
+        ok = service.approval_summary(
+            state, task(), head=HEAD, changed_paths=["src/security/keys.py"]
+        )
+        self.assertTrue(ok["satisfied"])
+        self.assertIs(ok["protected"][0]["satisfied"], True)
+
+    def test_protected_rules_are_advisory_without_a_diff(self):
+        state = self._state([review("R-1", "ci")])
+        summary = service.approval_summary(state, task(), head=HEAD)
+        self.assertTrue(summary["satisfied"])
+        self.assertFalse(summary["protected_known"])
+        self.assertIsNone(summary["protected"][0]["triggered"])
+        self.assertEqual(summary["required_groups"], [])
+
+    def test_protected_path_can_require_a_named_reviewer(self):
+        project = {
+            "review": {
+                "approvals": 1,
+                "protected_paths": [
+                    {"paths": ["**/auth.py"], "reviewers": ["alice"]}
+                ],
+            }
         }
-        base.update(review)
-        return {"review": base}
-
-    def test_protected_paths_do_not_bite_when_untouched(self):
-        state = fake_state(
-            self.project(protected=[{"path": "src/payments/**", "require": "payments"}]),
-            [review("R-1", "fe-1")],
+        state = fake_state(project, [review("R-1", "bob")])
+        gated = service.approval_summary(
+            state, task(), head=HEAD, changed_paths=["src/auth.py"]
         )
-        summary = service.approval_summary(
-            state, task(), head=HEAD, changed=["src/web/app.py"]
-        )
-        self.assertTrue(summary["satisfied"])
-        self.assertEqual(summary["protected"], [])
-        self.assertEqual(summary["required_approvals"], 1)
-
-    def test_protected_paths_add_a_group_and_an_approval(self):
-        state = fake_state(
-            self.project(protected=[{"path": "src/payments/**", "require": "payments"}]),
-            [review("R-1", "fe-1")],
-        )
-        summary = service.approval_summary(
-            state, task(), head=HEAD, changed=["src/payments/charge.py"]
-        )
-        self.assertFalse(summary["satisfied"])
-        self.assertEqual(summary["required_approvals"], 2)
-        self.assertEqual([hit["path"] for hit in summary["protected"]], ["src/payments/**"])
-        self.assertEqual(summary["protected"][0]["files"], ["src/payments/charge.py"])
-        self.assertIn("payments", summary["missing_groups"])
-        self.assertIn("protected paths", summary["reason"])
-        self.assertIn("src/payments/**", summary["reason"])
+        self.assertFalse(gated["satisfied"])
+        self.assertIn("alice", gated["reason"])
+        self.assertIn("protected paths", gated["reason"])
 
         state = fake_state(
-            self.project(protected=[{"path": "src/payments/**", "require": "payments"}]),
-            [review("R-1", "fe-1"), review("R-2", "be-1")],
+            project, [review("R-1", "bob"), review("R-2", "alice")]
         )
-        summary = service.approval_summary(
-            state, task(), head=HEAD, changed=["src/payments/charge.py"]
+        ok = service.approval_summary(
+            state, task(), head=HEAD, changed_paths=["src/auth.py"]
         )
-        self.assertTrue(summary["satisfied"])
-        self.assertEqual(summary["required_approvals"], 2)
-        self.assertEqual(summary["groups"]["payments"]["source"], "protected")
+        self.assertTrue(ok["satisfied"])
 
-    def test_protected_paths_without_a_group_still_need_extra_reviewer(self):
-        state = fake_state(
-            self.project(protected=["migrations/**"]),
-            [review("R-1", "fe-1")],
+    def test_protected_path_can_raise_the_approval_count(self):
+        project = {
+            "review": {
+                "approvals": 1,
+                "protected_paths": [
+                    {"paths": ["migrations/**"], "approvals": 2}
+                ],
+            }
+        }
+        state = fake_state(project, [review("R-1", "ci")])
+        one = service.approval_summary(
+            state, task(), head=HEAD, changed_paths=["migrations/001.sql"]
         )
-        summary = service.approval_summary(
-            state, task(), head=HEAD, changed=["migrations/001.sql"]
-        )
-        self.assertFalse(summary["satisfied"])
-        self.assertEqual(summary["required_approvals"], 2)
-        self.assertIn("still need 1 more", summary["reason"])
+        self.assertFalse(one["satisfied"])
+        self.assertEqual(one["required_approvals"], 2)
+        self.assertIn("requires 2 approvals", one["reason"])
 
-        state = fake_state(
-            self.project(protected=["migrations/**"]),
-            [review("R-1", "fe-1"), review("R-2", "be-1")],
+        state = fake_state(project, [review("R-1", "ci"), review("R-2", "fe-1")])
+        two = service.approval_summary(
+            state, task(), head=HEAD, changed_paths=["migrations/001.sql"]
         )
-        self.assertTrue(
-            service.approval_summary(
-                state, task(), head=HEAD, changed=["migrations/001.sql"]
-            )["satisfied"]
-        )
+        self.assertTrue(two["satisfied"])
+        self.assertEqual(two["required_approvals"], 2)
 
-    def test_unknown_change_set_keeps_the_policy_intact(self):
-        state = fake_state(
-            self.project(protected=["migrations/**"]),
-            [review("R-1", "fe-1")],
+        # Off the protected path the base count of one still applies.
+        state = fake_state(project, [review("R-1", "ci")])
+        off = service.approval_summary(
+            state, task(), head=HEAD, changed_paths=["README.md"]
         )
-        summary = service.approval_summary(state, task(), head=HEAD, changed=None)
-        self.assertTrue(summary["satisfied"])
-        self.assertIsNone(summary["changed"])
+        self.assertTrue(off["satisfied"])
+        self.assertEqual(off["required_approvals"], 1)
 
-    def test_gate_accepts_the_change_set(self):
-        state = fake_state(
-            self.project(protected=["migrations/**"]),
-            [review("R-1", "fe-1")],
-        )
-        self.assertIsNone(
-            service.approval_gate(state, task(), head=HEAD, changed=["src/web.py"])
-        )
-        self.assertIn(
-            "requires 2 approvals",
-            service.approval_gate(
-                state, task(), head=HEAD, changed=["migrations/001.sql"]
-            ),
-        )
+    def test_policy_set_validates_and_stores_protected_rules(self):
+        state = fake_state({"review": {"groups": {"security": ["sec-1"]}}})
+        with self.assertRaises(AghubError) as undefined:
+            service.set_review_policy(
+                state,
+                {"protected_paths": [{"paths": ["x/**"], "groups": ["ghost"]}]},
+                "admin",
+            )
+        self.assertIn("undefined group", str(undefined.exception))
 
-    def test_policy_round_trips_protected_paths(self):
-        class Project(dict):
-            pass
+        with self.assertRaises(AghubError) as outside:
+            service.set_review_policy(
+                state,
+                {
+                    "reviewers": ["sec-1"],
+                    "protected_paths": [
+                        {"paths": ["x/**"], "reviewers": ["stranger"]}
+                    ],
+                },
+                "admin",
+            )
+        self.assertIn("not in the reviewer allowlist", str(outside.exception))
 
-        project = Project()
-        state = fake_state(project)
-        state.project = project
         policy = service.set_review_policy(
             state,
+            {"protected_paths": [{"paths": ["src/security/**"], "groups": ["security"]}]},
+            "admin",
+        )
+        self.assertEqual(len(policy["protected_paths"]), 1)
+        self.assertEqual(policy["protected_paths"][0]["groups"], ["security"])
+
+        cleared = service.set_review_policy(state, {"clear_protected": True}, "admin")
+        self.assertEqual(cleared["protected_paths"], [])
+
+
+    def test_any_protected_match_widens_the_approval_count(self):
+        project = {
+            "review": {
+                "approvals": 1,
+                # No group, reviewer, or approvals on the rule: protection alone
+                # still makes the patch higher risk than an ordinary one.
+                "protected_paths": [{"paths": ["migrations/**"]}],
+            }
+        }
+        state = fake_state(project, [review("R-1", "ci")])
+        one = service.approval_summary(
+            state, task(), head=HEAD, changed_paths=["migrations/001.sql"]
+        )
+        self.assertFalse(one["satisfied"])
+        self.assertEqual(one["required_approvals"], 2)
+        self.assertEqual(one["protected_paths_matched"], ["migrations/001.sql"])
+        self.assertIn("requires 2 approvals", one["reason"])
+        self.assertIn("migrations/001.sql", one["reason"])
+
+        state = fake_state(project, [review("R-1", "ci"), review("R-2", "fe-1")])
+        two = service.approval_summary(
+            state, task(), head=HEAD, changed_paths=["migrations/001.sql"]
+        )
+        self.assertTrue(two["satisfied"])
+
+        # Off the protected path nothing widens, and without a diff the rules
+        # stay advisory rather than blocking on an unknown change set.
+        state = fake_state(project, [review("R-1", "ci")])
+        self.assertTrue(
+            service.approval_summary(
+                state, task(), head=HEAD, changed_paths=["README.md"]
+            )["satisfied"]
+        )
+        self.assertTrue(
+            service.approval_summary(state, task(), head=HEAD)["satisfied"]
+        )
+
+    def test_a_group_member_can_fill_the_widened_approval(self):
+        state = fake_state(
             {
-                "groups": {"payments": ["be-1"]},
-                "protected": ["src/payments/**=payments"],
+                "review": {
+                    "approvals": 1,
+                    "groups": {"security": ["sec-1"]},
+                    "protected_paths": [
+                        {"paths": ["src/security/**"], "groups": ["security"]}
+                    ],
+                }
+            },
+            [review("R-1", "fe-1"), review("R-2", "sec-1")],
+        )
+        summary = service.approval_summary(
+            state, task(), head=HEAD, changed_paths=["src/security/keys.py"]
+        )
+        self.assertTrue(summary["satisfied"])
+        # The group member satisfies both the rule and the widened count.
+        self.assertEqual(summary["required_approvals"], 2)
+
+    def test_unprotect_drops_the_matching_rules(self):
+        state = fake_state({"review": {"groups": {"security": ["sec-1"]}}})
+        service.set_review_policy(
+            state,
+            {
+                "protected_paths": [
+                    {"paths": ["src/security/**"], "groups": ["security"]},
+                    {"paths": ["migrations/**", "db/**"]},
+                ]
             },
             "admin",
         )
-        self.assertEqual(
-            policy["protected"],
-            [{"path": "src/payments/**", "require": "payments"}],
+        kept = service.set_review_policy(
+            state, {"unprotected": ["migrations/**"]}, "admin"
         )
         self.assertEqual(
-            service.normalize_review_policy(state.project)["protected"],
-            policy["protected"],
+            [rule["paths"] for rule in kept["protected_paths"]],
+            [["src/security/**"]],
         )
-        normalized = service.normalize_review_policy(
-            {"review": {"protected": ["migrations/**"]}}
-        )
-        self.assertEqual(
-            normalized["protected"], [{"path": "migrations/**", "require": None}]
-        )
-        policy = service.set_review_policy(
-            state, {"unprotected": ["src/payments/**"]}, "admin"
-        )
-        self.assertEqual(policy["protected"], [])
-
-    def test_protected_paths_require_a_defined_group(self):
-        class Project(dict):
-            pass
-
-        project = Project()
-        state = fake_state(project)
-        state.project = project
-        with self.assertRaises(AghubError) as raised:
-            service.set_review_policy(
-                state, {"protected": ["src/payments/**=payments"]}, "admin"
-            )
-        self.assertIn("undefined review group", str(raised.exception))
+        self.assertEqual(len(kept["protected_paths"]), 1)
 
 
-class ReviewSlaTests(unittest.TestCase):
-    def test_sla_marks_a_stale_review_request_overdue(self):
-        state = fake_state({"review": {"approvals": 1, "sla_seconds": 3600}})
-        state.queue = [
-            {
-                "id": "Q-1",
-                "task": "T-1",
-                "status": "waiting",
-                "submitted_at": ago_iso(7200),
-                "submitted_commit": HEAD,
-            }
-        ]
+class ReviewerSlaTests(unittest.TestCase):
+    def test_sla_breaches_when_a_review_waits_past_the_threshold(self):
+        state = fake_state(
+            {"review": {"approvals": 1, "sla_seconds": 60}},
+            queue=[
+                {"task": "T-1", "status": "waiting", "submitted_at": ago_iso(120)}
+            ],
+        )
         summary = service.approval_summary(state, task(), head=HEAD)
+        self.assertFalse(summary["satisfied"])
+        self.assertTrue(summary["sla_breached"])
+        self.assertGreaterEqual(summary["pending_age"], 120)
+
+    def test_fresh_reviews_and_satisfied_tasks_are_not_overdue(self):
+        fresh = fake_state(
+            {"review": {"approvals": 1, "sla_seconds": 60}},
+            queue=[
+                {"task": "T-1", "status": "waiting", "submitted_at": ago_iso(5)}
+            ],
+        )
+        self.assertFalse(
+            service.approval_summary(fresh, task(), head=HEAD)["sla_breached"]
+        )
+
+        satisfied = fake_state(
+            {"review": {"approvals": 1, "sla_seconds": 60}},
+            [review("R-1", "fe-1")],
+            queue=[
+                {"task": "T-1", "status": "waiting", "submitted_at": ago_iso(900)}
+            ],
+        )
+        summary = service.approval_summary(satisfied, task(), head=HEAD)
+        self.assertTrue(summary["satisfied"])
+        self.assertFalse(summary["sla_breached"])
+
+    def test_overdue_note_rides_on_whatever_blocks_the_review(self):
+        project = {
+            "review": {
+                "approvals": 1,
+                "sla_seconds": 60,
+                "protected_paths": [{"paths": ["migrations/**"]}],
+            }
+        }
+        state = fake_state(
+            project,
+            queue=[
+                {"task": "T-1", "status": "waiting", "submitted_at": ago_iso(900)}
+            ],
+        )
+        summary = service.approval_summary(
+            state, task(), head=HEAD, changed_paths=["migrations/001.sql"]
+        )
         self.assertTrue(summary["overdue"])
-        self.assertGreaterEqual(summary["pending_seconds"], 7200)
-        self.assertIn("SLA", summary["reason"])
+        self.assertIn("requires 2 approvals", summary["reason"])
         self.assertIn("overdue", summary["reason"])
 
-    def test_sla_is_quiet_before_the_deadline(self):
-        state = fake_state({"review": {"approvals": 1, "sla_seconds": 3600}})
-        state.queue = [
-            {
-                "id": "Q-1",
-                "task": "T-1",
-                "status": "waiting",
-                "submitted_at": ago_iso(60),
-                "submitted_commit": HEAD,
-            }
-        ]
+    def test_a_new_head_restarts_the_clock(self):
+        state = fake_state(
+            {"review": {"approvals": 1, "sla_seconds": 60}},
+            queue=[
+                {
+                    "task": "T-1",
+                    "status": "rejected",
+                    "submitted_at": ago_iso(900),
+                    "submitted_commit": OTHER,
+                }
+            ],
+        )
+        waiting = task(branch="agent/be-1/T-1", claimed_at=ago_iso(5))
+        summary = service.approval_summary(state, waiting, head=HEAD)
+        self.assertFalse(summary["sla_breached"])
+        self.assertLess(summary["pending_age"], 120)
+
+    def test_per_task_sla_tightens_the_board_default(self):
+        state = fake_state(
+            {"review": {"approvals": 1, "sla_seconds": 3600}},
+            queue=[
+                {"task": "T-1", "status": "waiting", "submitted_at": ago_iso(900)}
+            ],
+        )
+        self.assertFalse(
+            service.approval_summary(state, task(), head=HEAD)["sla_breached"]
+        )
+        tight = service.approval_summary(
+            state, task(review_sla_seconds=600), head=HEAD
+        )
+        self.assertTrue(tight["sla_breached"])
+        self.assertEqual(tight["sla_seconds"], 600)
+
+    def test_changes_requested_pauses_the_reviewer_sla(self):
+        state = fake_state(
+            {"review": {"approvals": 1, "sla_seconds": 60}},
+            [review("R-1", "fe-1", decision="changes_requested", at=ago_iso(900))],
+            queue=[
+                {"task": "T-1", "status": "waiting", "submitted_at": ago_iso(900)}
+            ],
+        )
         summary = service.approval_summary(state, task(), head=HEAD)
-        self.assertFalse(summary["overdue"])
-        self.assertNotIn("SLA", summary["reason"])
+        self.assertFalse(summary["satisfied"])
+        self.assertEqual(summary["decision"], "changes_requested")
+        self.assertFalse(summary["sla_breached"])
 
-    def test_a_newer_head_restarts_the_clock(self):
-        state = fake_state({"review": {"approvals": 1, "sla_seconds": 3600}})
-        state.queue = [
-            {
-                "id": "Q-1",
-                "task": "T-1",
-                "status": "rejected",
-                "submitted_at": ago_iso(7200),
-                "submitted_commit": OTHER,
-            }
-        ]
-        task_record = task(claimed_at=ago_iso(30))
-        summary = service.approval_summary(state, task_record, head=HEAD)
-        self.assertFalse(summary["overdue"])
-        self.assertLess(summary["pending_seconds"], 120)
+    def test_pending_since_falls_back_to_the_task_when_not_queued(self):
+        state = fake_state({"review": {"approvals": 1, "sla_seconds": 60}})
+        waiting = task(branch="agent/be-1/T-1", updated_at=ago_iso(300))
+        summary = service.approval_summary(state, waiting, head=HEAD)
+        self.assertTrue(summary["sla_breached"])
 
-    def test_sla_is_absent_without_a_deadline_or_a_request(self):
-        state = fake_state({"review": {"approvals": 1}})
-        state.queue = []
+        unstarted = task(branch=None, owner=None, updated_at=ago_iso(300))
+        quiet = service.approval_summary(state, unstarted, head=HEAD)
+        self.assertIsNone(quiet["pending_since"])
+        self.assertFalse(quiet["sla_breached"])
+
+
+class ParseProtectTests(unittest.TestCase):
+    def test_paths_and_requirements_parse(self):
+        rule = _parse_protect("src/db/**,**/schema.sql:group=db,reviewer=carol,approvals=2")
+        self.assertEqual(rule["paths"], ["src/db/**", "**/schema.sql"])
+        self.assertEqual(rule["groups"], ["db"])
+        self.assertEqual(rule["reviewers"], ["carol"])
+        self.assertEqual(rule["approvals"], 2)
+
+    def test_shorthand_path_equals_group(self):
+        rule = _parse_protect("src/payments/**=payments")
+        self.assertEqual(rule["paths"], ["src/payments/**"])
+        self.assertEqual(rule["groups"], ["payments"])
+
+    def test_paths_only_is_allowed(self):
+        rule = _parse_protect("src/security/**")
+        self.assertEqual(rule["paths"], ["src/security/**"])
+        self.assertEqual(rule["groups"], [])
+
+    def test_bad_specs_are_rejected(self):
+        with self.assertRaises(AghubError):
+            _parse_protect(":group=db")
+        with self.assertRaises(AghubError):
+            _parse_protect("x/**:group")
+        with self.assertRaises(AghubError):
+            _parse_protect("x/**:approvals=lots")
+        with self.assertRaises(AghubError):
+            _parse_protect("x/**:weird=1")
+
+
+class DismissalTests(unittest.TestCase):
+    def _approved_with_external(self, external_id="9001"):
+        record = review("R-1", "fe-1")
+        record["external_id"] = external_id
+        record["source"] = "github"
+        return record
+
+    def _dismissal(self, external_id="9001", record_id="R-2"):
+        return {
+            "id": record_id,
+            "at": now_iso(),
+            "task": "T-1",
+            "agent": "ci",
+            "decision": "dismissed",
+            "dismisses": external_id,
+            "source": "github",
+        }
+
+    def test_dismissed_github_approval_stops_counting(self):
+        state = fake_state(
+            {"review": {"approvals": 1}},
+            [self._approved_with_external(), self._dismissal()],
+        )
         summary = service.approval_summary(state, task(), head=HEAD)
-        self.assertFalse(summary["overdue"])
-        self.assertIsNone(summary["pending_since"])
-        self.assertIsNone(summary["sla_seconds"])
+        self.assertFalse(summary["satisfied"])
+        self.assertEqual(summary["approved_count"], 0)
+        self.assertEqual(len(summary["dismissed"]), 1)
+        self.assertIn("dismissed", summary["reason"])
 
-    def test_sla_is_packaged_into_the_policy(self):
-        policy = service.normalize_review_policy(
-            {"review": {"approvals": 1, "sla_seconds": 900}}
+        # A fresh re-approval (new external id, not dismissed) satisfies again.
+        reapproved = review("R-3", "fe-1")
+        reapproved["external_id"] = "9002"
+        reapproved["source"] = "github"
+        state.approvals.append(reapproved)
+        self.assertTrue(service.approval_summary(state, task(), head=HEAD)["satisfied"])
+
+    def test_dismiss_review_is_idempotent(self):
+        state = fake_state(
+            {"review": {"approvals": 1}},
+            [self._approved_with_external()],
+            tasks={"T-1": task()},
         )
-        self.assertEqual(policy["sla_seconds"], 900)
-        self.assertIsNone(
-            service.normalize_review_policy({"review": {"sla_seconds": 0}})[
-                "sla_seconds"
-            ]
-        )
-        bits = service.describe_review_policy(
-            fake_state({"review": {"reviewers": [], "sla_seconds": 900}})
-        )
-        self.assertIn("review SLA", bits)
+        first = service.dismiss_review(state, "T-1", "ci", "9001")
+        self.assertIsNotNone(first)
+        self.assertEqual(first["decision"], "dismissed")
+        self.assertIsNone(service.dismiss_review(state, "T-1", "ci", "9001"))
 
 
 if __name__ == "__main__":

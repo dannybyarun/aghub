@@ -12,9 +12,11 @@ import yaml
 from . import codegen, gitops, hubclient, keys, render, sandbox, service
 from .board import (
     Board,
+    board_entries,
     ensure_local_agent_key,
     init_board,
     read_local_config,
+    read_yaml,
     write_local_config,
 )
 from .errors import AghubError
@@ -172,6 +174,7 @@ def cmd_init(args):
     if not args.no_remote and remote is None and gitops.has_remote(repo, "origin"):
         remote = "origin"
     agent = _resolve_agent(args, None)
+    shard = getattr(args, "shard", None) or os.environ.get("AGHUB_SHARD") or None
     board = init_board(
         repo,
         args.project,
@@ -185,11 +188,13 @@ def cmd_init(args):
         check_timeout=args.check_timeout,
         require_eval_sandbox=args.require_eval_sandbox,
         scope=args.scope,
+        shard=shard,
     )
     config = read_local_config(board.common)
     config["agent"] = agent
     write_local_config(board.common, config)
-    print(f'board {board.branch} ready for "{args.project}"')
+    label = f'shard "{slug(shard)}"' if shard else "board"
+    print(f'{label} {board.branch} ready for "{args.project}"')
     print(f"  worktree  {board.dir}")
     print(f"  remote    {remote or '(local only)'}")
     state = board.load()
@@ -311,6 +316,63 @@ def cmd_acl(args):
     raise AghubError(f"unknown acl command {args.acl_command}")
 
 
+def _parse_protect(spec):
+    """Parse a --protect rule: 'GLOB[,GLOB...]:key=value[,key=value...]'.
+
+    Keys after the colon are repeatable `group=NAME`, `reviewer=ID`, and a
+    single `approvals=N`. Examples::
+
+        src/security/**:group=security
+        src/security/**=security          (shorthand for the line above)
+        src/db/**,**/schema.sql:reviewer=carol,approvals=2
+    """
+    if ":" not in spec:
+        # Shorthand PATH=GROUP: the group must already exist.
+        path, sep, group = spec.partition("=")
+        path, group = path.strip(), group.strip()
+        if not path:
+            raise AghubError(
+                "--protect needs a path glob, e.g. 'src/security/**' or "
+                "'src/security/**=security'"
+            )
+        rule = {"paths": [path], "groups": [group] if sep and group else [], "reviewers": []}
+        return rule
+    paths_part, sep, req_part = spec.partition(":")
+    paths = [item.strip() for item in paths_part.split(",") if item.strip()]
+    if not paths:
+        raise AghubError(
+            "--protect needs at least one path glob, e.g. "
+            "'src/security/**:group=security'"
+        )
+    rule = {"paths": paths, "groups": [], "reviewers": []}
+    for token in req_part.split(",") if sep else []:
+        token = token.strip()
+        if not token:
+            continue
+        key, keysep, value = token.partition("=")
+        key, value = key.strip().lower(), value.strip()
+        if not keysep or not value:
+            raise AghubError(
+                f"--protect requirement '{token}' must be key=value "
+                "(group=, reviewer=, approvals=)"
+            )
+        if key in ("group", "groups"):
+            rule["groups"].append(value)
+        elif key in ("reviewer", "reviewers"):
+            rule["reviewers"].append(value)
+        elif key in ("approvals", "approval"):
+            try:
+                rule["approvals"] = int(value)
+            except ValueError:
+                raise AghubError(f"--protect approvals must be a number, got {value!r}")
+        else:
+            raise AghubError(
+                f"--protect has an unknown requirement {key!r} "
+                "(use group=, reviewer=, approvals=)"
+            )
+    return rule
+
+
 def cmd_policy(args):
     board = _fresh_board()
     state = board.load()
@@ -367,14 +429,17 @@ def cmd_policy(args):
         updates["github"] = github
     if args.clear_github:
         updates["clear_github"] = True
-    if args.protect:
-        updates["protected"] = args.protect
     if args.unprotect:
         updates["unprotected"] = args.unprotect
     if args.clear_protected:
         updates["clear_protected"] = True
+    if args.protect:
+        updates["protected_paths"] = [_parse_protect(spec) for spec in args.protect]
     if not updates:
-        raise AghubError("nothing to change — pass --approvals, --ttl, --group, ...")
+        raise AghubError(
+            "nothing to change — pass --approvals, --ttl, --sla, --group, "
+            "--protect, ..."
+        )
 
     policy = board.transaction(
         "review policy",
@@ -445,6 +510,26 @@ def _record_review(
             external_id=external_id,
             reviewer=reviewer,
             github_login=github_login,
+        ),
+        agent=agent,
+    )
+
+
+def _record_dismissal(board, agent, task_id, external_id, note="", source="github"):
+    """Record a dismissal that retracts an earlier (GitHub) review by its id."""
+    state = board.load()
+    key = _review_key(board, state, agent)
+    return board.transaction(
+        f"dismiss review {external_id} on {task_id}",
+        lambda current: service.dismiss_review(
+            current,
+            task_id,
+            agent,
+            external_id,
+            note=note,
+            private_key=key.get("private_key"),
+            public_key=key.get("public_key"),
+            source=source,
         ),
         agent=agent,
     )
@@ -1021,6 +1106,69 @@ def cmd_next(args):
     return 0
 
 
+def _load_task_specs(path):
+    if path == "-":
+        raw = sys.stdin.read()
+    else:
+        with open(os.path.expanduser(path), "r", encoding="utf-8") as handle:
+            raw = handle.read()
+    data = yaml.safe_load(raw)
+    if isinstance(data, dict) and "tasks" in data:
+        data = data["tasks"]
+    if not isinstance(data, list):
+        raise AghubError(
+            "task import expects a YAML/JSON list of task specs "
+            "(or a mapping with a top-level `tasks:` list)"
+        )
+    return data
+
+
+def _spec_add(spec, agent):
+    if not isinstance(spec, dict) or not spec.get("title"):
+        raise AghubError("each imported task needs at least a `title`")
+    return lambda state: service.add_task(
+        state,
+        spec["title"],
+        spec.get("paths") or [],
+        spec.get("contract") or spec.get("contracts") or [],
+        spec.get("depends") or spec.get("depends_on") or [],
+        spec.get("acceptance") or "",
+        agent,
+        spec.get("evals") or [],
+        require_sandbox=bool(spec.get("requires_sandbox")),
+        requires_approval=bool(spec.get("requires_approval")),
+        required_approvals=spec.get("required_approvals"),
+        review_groups=spec.get("review_groups") or spec.get("reviewer_groups") or [],
+        reviewers=spec.get("reviewers") or [],
+        review_ttl=spec.get("review_ttl"),
+        review_sla=spec.get("review_sla"),
+    )
+
+
+def cmd_boards(args):
+    repo = gitops.repo_root()
+    common = gitops.common_dir(repo)
+    if not read_local_config(common):
+        raise AghubError("aghub is not initialized here — run `aghub init --project <name>`")
+    rows = []
+    for entry in board_entries(common):
+        worktree = os.path.join(common, entry["worktree"])
+        head = gitops.short(worktree, "HEAD") if os.path.isdir(worktree) else None
+        project = (read_yaml(os.path.join(worktree, "project.yaml"), {}) or {}).get("name")
+        rows.append({**entry, "head": head, "project": project})
+    if args.json:
+        print(json.dumps(rows, indent=2))
+        return 0
+    print(f"boards ({len(rows)})")
+    for row in rows:
+        tag = " *" if row["default"] else "  "
+        print(
+            f" {tag} {row['name']:<12} {row['branch']:<22} "
+            f"{row.get('project') or '-':<16} {row.get('head') or '-'}"
+        )
+    return 0
+
+
 def cmd_task(args):
     board = _fresh_board()
     state = board.load()
@@ -1043,6 +1191,7 @@ def cmd_task(args):
                 review_groups=args.review_groups,
                 reviewers=args.reviewers,
                 review_ttl=args.review_ttl,
+                review_sla=args.review_sla,
             ),
             agent=agent,
         )
@@ -1052,6 +1201,18 @@ def cmd_task(args):
             print(f"  evals  {', '.join(task['evals'])}")
         if task.get("requires_approval"):
             print(f"  review {service.describe_task_review_policy(state, task)}")
+        return 0
+    if args.task_command == "import":
+        specs = _load_task_specs(args.file)
+        if not specs:
+            raise AghubError("no tasks to import")
+        mutations = [_spec_add(spec, agent) for spec in specs]
+        tasks = board.batch(
+            f"import {len(mutations)} task(s)", mutations, agent=agent
+        )
+        for task in tasks:
+            print(f"added {task['id']} {task['title']}")
+        print(f"imported {len(tasks)} task(s) in one board write")
         return 0
     if args.task_command == "show":
         task = state.tasks.get(args.task)
@@ -1234,7 +1395,7 @@ def cmd_codegen(args):
     with open(source, "rb") as handle:
         blob = handle.read()
     files = codegen.generate(
-        args.name, version, meta, codegen.load_spec(blob), args.target
+        args.name, version, meta, codegen.load_spec(blob), args.target, args.dialect
     )
     out = os.path.abspath(os.path.expanduser(args.out))
 
@@ -1445,8 +1606,7 @@ def cmd_submit(args):
         detail = (local.stderr or local.stdout or "").strip()
         raise AghubError(f"cannot resolve {branch}: {detail}")
     head = local.stdout.strip()
-    changed = service.branch_changes(board, head)
-    missing = service.approval_gate(state, task, head=head, changed=changed)
+    missing = service.approval_gate(state, task, head=head)
     if missing and not args.force:
         raise AghubError(missing)
     push = gitops.git(["push", "-u", board.remote, branch], cwd=board.repo, check=False)
@@ -1455,8 +1615,9 @@ def cmd_submit(args):
         raise AghubError(f"could not push {branch}: {detail}")
     local = gitops.git(["rev-parse", branch], cwd=board.repo, check=False)
     head = local.stdout.strip() or head
+    changed_paths = service.branch_changed_paths(board, task, state.project)
     missing = service.approval_gate(
-        state, task, head=head, changed=service.branch_changes(board, head)
+        state, task, head=head, changed_paths=changed_paths
     )
     if missing and not args.force:
         raise AghubError(missing)
@@ -1613,9 +1774,40 @@ def _github_sync_event(board, args, agent, event, token=None, api=None):
 
     recorded = None
     review_info = info.get("review") or {}
-    if (
+    action = info.get("action")
+    head_repo = info.get("head_repo")
+    base_repo = info.get("base_repo")
+    repository = args.repo or info.get("repository") or os.environ.get("GITHUB_REPOSITORY")
+    # A PR is a fork when its head repo differs from the repo it targets. Prefer
+    # the PR's base repo (correct for multi-repo webhook workers); fall back to
+    # the configured repository when the payload omits it.
+    reference_repo = base_repo or repository
+    fork = bool(head_repo and reference_repo and head_repo.lower() != reference_repo.lower())
+
+    if args.record_reviews and task.get("requires_approval") and action == "dismissed" and review_info:
+        external_id = review_info.get("id")
+        if not external_id:
+            messages.append("aghub: warning: dismissed review had no id; ignoring")
+        elif args.dry_run:
+            messages.append(f"would dismiss GitHub review {external_id} for {task['id']}")
+        else:
+            recorded = _record_dismissal(
+                board,
+                args.reviewer_agent or agent,
+                task["id"],
+                external_id,
+                note=f"GitHub dismissed review by {review_info.get('login') or '?'}",
+            )
+            state = board.load()
+            if recorded:
+                messages.append(
+                    f"recorded GitHub dismissal of review {external_id} for {task['id']}"
+                )
+            else:
+                messages.append(f"review {external_id} already dismissed")
+    elif (
         args.record_reviews
-        and info.get("action") == "submitted"
+        and action == "submitted"
         and review_info.get("state") in ("approved", "changes_requested")
         and task.get("requires_approval")
     ):
@@ -1629,9 +1821,6 @@ def _github_sync_event(board, args, agent, event, token=None, api=None):
                 f"GitHub reviewer {review_info.get('login') or '?'} is not trusted "
                 f"({review_info.get('association') or 'no association'})"
             )
-        head_repo = info.get("head_repo")
-        repository = args.repo or os.environ.get("GITHUB_REPOSITORY")
-        fork = bool(head_repo and repository and head_repo.lower() != repository.lower())
         if fork and not args.allow_fork_reviews:
             messages.append(
                 "aghub: warning: refusing to record an approval from a fork PR "
@@ -1639,9 +1828,14 @@ def _github_sync_event(board, args, agent, event, token=None, api=None):
             )
         else:
             external_id = review_info.get("id")
-            if not info.get("sha"):
+            # Bind to the exact commit the reviewer approved. On a fork the PR
+            # head sha lives on the fork; the review's own commit_id is the
+            # fork-safe source of truth, with the head sha as a fallback.
+            commit = review_info.get("commit_id") or info.get("sha")
+            if not commit:
                 raise AghubError(
-                    "pull request head sha is missing; cannot bind this review to a commit"
+                    "pull request review has no commit to bind to "
+                    "(missing review commit_id and head sha)"
                 )
             already = any(
                 item.get("source") == "github"
@@ -1659,6 +1853,8 @@ def _github_sync_event(board, args, agent, event, token=None, api=None):
                 note = f"GitHub review by {review_info.get('login') or '?'}"
                 if review_info.get("body"):
                     note += f": {review_info['body']}"
+                if fork:
+                    note += " (fork)"
                 signer = args.reviewer_agent or agent
                 login = review_info.get("login") or ""
                 reviewer = service.github_reviewer(state, login) or signer
@@ -1674,7 +1870,7 @@ def _github_sync_event(board, args, agent, event, token=None, api=None):
                         task["id"],
                         decision,
                         note,
-                        info.get("sha") or None,
+                        commit,
                         False,
                         source="github",
                         external_id=external_id,
@@ -1690,6 +1886,7 @@ def _github_sync_event(board, args, agent, event, token=None, api=None):
                     messages.append(
                         f"recorded GitHub {review_info['state']} from "
                         f"{review_info.get('login') or '?'} as {signer}{via}"
+                        + (" (fork)" if fork else "")
                     )
 
     packet = review.review_packet(board, state, task["id"])
@@ -1714,7 +1911,7 @@ def _github_sync_event(board, args, agent, event, token=None, api=None):
             "GitHub sync needs a pull_request or pull_request_review payload "
             "with a PR number and head sha"
         )
-    repo = args.repo or os.environ.get("GITHUB_REPOSITORY")
+    repo = args.repo or info.get("repository") or os.environ.get("GITHUB_REPOSITORY")
     if args.comment:
         published = github.upsert_comment(
             repo, info["number"], markdown, token=token, api=api
@@ -1996,6 +2193,8 @@ def cmd_hub(args):
             tokens=tokens,
             rate_limit=args.rate_limit,
             postgres=args.postgres,
+            retention_days=args.retention_days,
+            retention_events=args.retention_events,
         )
         return 0
 
@@ -2081,6 +2280,53 @@ def cmd_hub(args):
             sys.stdout.write(text)
         return 0
 
+    if args.hub_command == "backup":
+        try:
+            archive = hubclient.backup(
+                hubs, args.project, token=config.get("hub_token")
+            )
+        except hubclient.HubError as exc:
+            raise AghubError(f"backup failed: {exc}")
+        text = json.dumps(archive, indent=2)
+        if args.out:
+            path = os.path.abspath(args.out)
+            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(text)
+            print(f"wrote {path} (project {archive.get('project')})")
+        else:
+            sys.stdout.write(text + "\n")
+        return 0
+
+    if args.hub_command == "restore":
+        with open(os.path.expanduser(args.file), "r", encoding="utf-8") as handle:
+            archive = json.load(handle)
+        try:
+            result = hubclient.restore(
+                hubs, archive, replace=args.replace, token=config.get("hub_token")
+            )
+        except hubclient.HubError as exc:
+            raise AghubError(f"restore failed: {exc}")
+        restored = result.get("restored") or {}
+        print(f"restored project {restored.get('project')}")
+        return 0
+
+    if args.hub_command == "prune":
+        if args.max_age_days is None and args.max_events is None:
+            raise AghubError("pass --max-age-days and/or --max-events")
+        try:
+            result = hubclient.prune(
+                hubs,
+                max_age_days=args.max_age_days,
+                max_events=args.max_events,
+                token=config.get("hub_token"),
+            )
+        except hubclient.HubError as exc:
+            raise AghubError(f"prune failed: {exc}")
+        removed = result.get("removed") or {}
+        print("pruned " + (", ".join(f"{value} {key}" for key, value in removed.items()) or "nothing"))
+        return 0
+
     healthy = None
     for index, url in enumerate(hubs):
         label = "primary" if index == 0 else f"failover {index}"
@@ -2119,6 +2365,11 @@ def build_parser():
         description="A shared board so parallel coding agents can work without talking to each other.",
     )
     parser.add_argument("--agent", help="agent identity (default: $AGHUB_AGENT or local config)")
+    parser.add_argument(
+        "--shard",
+        default=None,
+        help="target an independent board shard (default: $AGHUB_SHARD or the default board)",
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
     init = sub.add_parser("init", help="create the shared board in this repository")
@@ -2216,9 +2467,9 @@ def build_parser():
         "--sla",
         type=int,
         default=None,
-        help="review SLA in seconds: flag pending reviews after this long (0 clears)",
+        help="flag a review pending longer than this many seconds (0 clears it)",
     )
-    policy_set.add_argument("--no-sla", action="store_true", help="disable the review SLA")
+    policy_set.add_argument("--no-sla", action="store_true", help="no reviewer SLA")
     policy_set.add_argument(
         "--reviewer",
         dest="reviewers",
@@ -2247,25 +2498,27 @@ def build_parser():
         default=[],
         help="map LOGIN=AGENT for GitHub pull-request reviews (repeatable)",
     )
-    policy_set.add_argument("--clear-reviewers", action="store_true")
-    policy_set.add_argument("--clear-groups", action="store_true")
-    policy_set.add_argument("--clear-required-groups", action="store_true")
     policy_set.add_argument(
         "--protect",
+        dest="protect",
         action="append",
         default=[],
         help=(
-            "condition approvals on touched paths: PATH[=GROUP] "
-            "(repeatable; GROUP adds that review group's approval)"
+            "condition approvals on touched paths: 'GLOB[,GLOB...]"
+            ":group=NAME[,reviewer=ID,approvals=N]' or the shorthand "
+            "'PATH=GROUP' (repeatable, replaces the rule set)"
         ),
     )
     policy_set.add_argument(
         "--unprotect",
         action="append",
         default=[],
-        help="remove a protected path pattern (repeatable)",
+        help="remove every protected-path rule mentioning this glob (repeatable)",
     )
     policy_set.add_argument("--clear-protected", action="store_true")
+    policy_set.add_argument("--clear-reviewers", action="store_true")
+    policy_set.add_argument("--clear-groups", action="store_true")
+    policy_set.add_argument("--clear-required-groups", action="store_true")
     policy_set.add_argument("--clear-github", action="store_true")
     policy_set.add_argument("--clear", action="store_true", help="reset the whole review policy")
     policy_set.add_argument("--json", action="store_true")
@@ -2416,6 +2669,12 @@ def build_parser():
         help="approval lifetime for this task in seconds (tightens the board policy)",
     )
     task_add.add_argument(
+        "--review-sla",
+        type=int,
+        default=None,
+        help="flag this task's review when pending longer than this many seconds",
+    )
+    task_add.add_argument(
         "--requires-sandbox",
         action="store_true",
         help="require bubblewrap for this task's merge check and eval gates",
@@ -2423,7 +2682,15 @@ def build_parser():
     task_sub.add_parser("list")
     task_show = task_sub.add_parser("show")
     task_show.add_argument("task")
+    task_import = task_sub.add_parser(
+        "import", help="add many tasks in one board write (YAML/JSON list, or - for stdin)"
+    )
+    task_import.add_argument("file", help="path to a task-spec list, or - to read stdin")
     task.set_defaults(func=cmd_task)
+
+    boards = sub.add_parser("boards", help="list the default board and any shards")
+    boards.add_argument("--json", action="store_true")
+    boards.set_defaults(func=cmd_boards)
 
     contract = sub.add_parser("contract", help="freeze interfaces before parallel work")
     contract_sub = contract.add_subparsers(dest="contract_command", required=True)
@@ -2451,6 +2718,12 @@ def build_parser():
     gen.add_argument("--out", default="generated", help="output directory (default: generated)")
     gen.add_argument(
         "--target", choices=("all", "ts", "py", "mock", "sql"), default="all"
+    )
+    gen.add_argument(
+        "--dialect",
+        choices=("postgres", "sqlite", "mysql"),
+        default="postgres",
+        help="SQL dialect for the generated migration (default: postgres)",
     )
     gen.add_argument(
         "--check", action="store_true", help="fail if the output directory is out of date"
@@ -2682,6 +2955,18 @@ def build_parser():
         help="Postgres DSN (requires the optional psycopg package)",
     )
     hub_serve.add_argument("--verbose", action="store_true")
+    hub_serve.add_argument(
+        "--retention-days",
+        type=int,
+        default=None,
+        help="prune audit events and resolved review requests older than N days (hourly)",
+    )
+    hub_serve.add_argument(
+        "--retention-events",
+        type=int,
+        default=None,
+        help="keep at most N audit events per project (hourly)",
+    )
     hub_connect = hub_sub.add_parser("connect")
     hub_connect.add_argument(
         "url", nargs="+", help="primary hub URL followed by optional failover URLs"
@@ -2695,6 +2980,25 @@ def build_parser():
     hub_audit.add_argument("--after", type=int, default=0)
     hub_audit.add_argument("--limit", type=int, default=1000)
     hub_audit.add_argument("--out", default=None, metavar="PATH")
+    hub_backup = hub_sub.add_parser(
+        "backup", help="export a project's hub state to a JSON archive (admin token)"
+    )
+    hub_backup.add_argument("--project", required=True)
+    hub_backup.add_argument("--out", default=None, metavar="PATH")
+    hub_restore = hub_sub.add_parser(
+        "restore", help="restore a project from a backup archive (admin token)"
+    )
+    hub_restore.add_argument("file", help="path to a backup archive")
+    hub_restore.add_argument(
+        "--replace",
+        action="store_true",
+        help="delete the project's existing hub rows before restoring",
+    )
+    hub_prune = hub_sub.add_parser(
+        "prune", help="trim old audit events and resolved reviews (admin token)"
+    )
+    hub_prune.add_argument("--max-age-days", type=int, default=None)
+    hub_prune.add_argument("--max-events", type=int, default=None)
     hub_sub.add_parser("status")
     hub.set_defaults(func=cmd_hub)
 
@@ -2714,6 +3018,8 @@ def build_parser():
 def main(argv=None):
     parser = build_parser()
     args = parser.parse_args(argv)
+    if getattr(args, "shard", None):
+        os.environ["AGHUB_SHARD"] = args.shard
     if args.command == "board":
         args.for_agent = None
     try:

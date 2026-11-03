@@ -22,9 +22,10 @@ class AgentError(RuntimeError):
 
 
 class Agent:
-    def __init__(self, agent_id, cwd=None):
+    def __init__(self, agent_id, cwd=None, shard=None):
         self.agent_id = agent_id
         self.cwd = cwd
+        self.shard = shard
 
     def __enter__(self):
         return self
@@ -38,10 +39,13 @@ class Agent:
         if self.cwd:
             previous = os.getcwd()
             os.chdir(self.cwd)
+        prefix = ["--agent", self.agent_id]
+        if self.shard:
+            prefix.extend(["--shard", self.shard])
         stdout, stderr = io.StringIO(), io.StringIO()
         try:
             with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
-                code = cli.main(["--agent", self.agent_id, *argv])
+                code = cli.main([*prefix, *argv])
         finally:
             if previous is not None:
                 os.chdir(previous)
@@ -108,6 +112,7 @@ class Agent:
         review_groups=None,
         reviewers=None,
         review_ttl=None,
+        review_sla=None,
     ):
         argv = ["task", "add", title]
         for path in paths or []:
@@ -128,7 +133,28 @@ class Agent:
             argv.extend(["--reviewer", reviewer])
         if review_ttl is not None:
             argv.extend(["--review-ttl", str(review_ttl)])
+        if review_sla is not None:
+            argv.extend(["--review-sla", str(review_sla)])
         return self.call(*argv)
+
+    def add_tasks(self, specs):
+        """Add many tasks in a single board write. `specs` is a list of dicts.
+
+        Each dict takes the same fields as `add_task` (title, paths, contract,
+        depends, acceptance, evals, requires_approval, required_approvals,
+        review_groups, reviewers, review_ttl, review_sla, requires_sandbox).
+        """
+        import tempfile
+
+        with tempfile.NamedTemporaryFile(
+            "w", suffix=".json", delete=False, encoding="utf-8"
+        ) as handle:
+            json.dump(list(specs), handle)
+            path = handle.name
+        try:
+            return self.call("task", "import", path)
+        finally:
+            os.unlink(path)
 
     def approve(self, task, note="", commit=None):
         argv = ["approve", task, "--note", note]

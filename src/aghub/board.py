@@ -11,7 +11,7 @@ import yaml
 from . import gitops, keys
 from .errors import AghubError
 from .ulid import new_ulid
-from .util import age_seconds, now_iso
+from .util import age_seconds, now_iso, slug
 
 BOARD_BRANCH = "aghub/board"
 BOARD_ATTEMPTS = max(
@@ -413,7 +413,8 @@ class Board:
     """The board branch, checked out in its own worktree under .git."""
 
     def __init__(
-        self, repo, common, worktree, remote, hub=None, hub_token=None, hub_failover=None
+        self, repo, common, worktree, remote, hub=None, hub_token=None,
+        hub_failover=None, branch=BOARD_BRANCH,
     ):
         self.repo = repo
         self.common = common
@@ -424,7 +425,7 @@ class Board:
         if isinstance(hub_failover, str):
             hub_failover = [hub_failover]
         self.hub_failover = hub_failover or []
-        self.branch = BOARD_BRANCH
+        self.branch = branch or BOARD_BRANCH
         self.retries = 0
         self.lock_waits = 0
 
@@ -441,13 +442,27 @@ class Board:
         return project.get("name") or "default"
 
     @classmethod
-    def discover(cls, cwd=None):
+    def discover(cls, cwd=None, shard=None):
         repo = gitops.repo_root(cwd)
         common = gitops.common_dir(repo)
         config = read_local_config(common)
         if not config:
             raise AghubError("aghub is not initialized here — run `aghub init --project <name>`")
-        worktree = os.path.join(common, config.get("worktree", "aghub-board"))
+        shard = shard if shard is not None else (os.environ.get("AGHUB_SHARD") or None)
+        if shard:
+            shard = slug(shard)
+            entry = (config.get("boards") or {}).get(shard)
+            if not entry:
+                raise AghubError(
+                    f"unknown board shard '{shard}' — create it with "
+                    f"`aghub --shard {shard} init --project <name>`"
+                )
+            worktree_name = entry.get("worktree") or f"aghub-board-{shard}"
+            branch = entry.get("branch") or f"{BOARD_BRANCH}-{shard}"
+        else:
+            worktree_name = config.get("worktree", "aghub-board")
+            branch = config.get("branch") or BOARD_BRANCH
+        worktree = os.path.join(common, worktree_name)
         if not os.path.isdir(worktree):
             raise AghubError("the board worktree is missing — run `aghub init` again")
         return cls(
@@ -458,6 +473,7 @@ class Board:
             config.get("hub"),
             config.get("hub_token"),
             config.get("hub_failover"),
+            branch=branch,
         )
 
     @property
@@ -620,6 +636,20 @@ class Board:
         colliding writers into a short queue, while the optimistic retry loop
         remains the fallback whenever the hub is absent or offline.
         """
+        return self.batch(label, [mutate], agent=agent)[0]
+
+    def batch(self, label, mutations, agent=None):
+        """Apply several mutations in one board transaction.
+
+        Each mutation is a function of the loaded state, applied in order. The
+        whole batch shares a single writer-lease acquisition, one fetch, one
+        commit, and one push — so seeding N tasks costs one round trip instead
+        of N. A rejected push re-reads the board and replays every mutation,
+        exactly like a single transaction, so mutations must stay pure
+        functions of the state passed to them. Returns the list of per-mutation
+        results in order.
+        """
+        mutations = list(mutations)
         lock = self._acquire_board_lock(label, agent)
         try:
             last_error = None
@@ -627,30 +657,25 @@ class Board:
                 self.sync()
                 state = State(self).load()
                 state.touch(agent)
-                result = mutate(state)
+                results = [mutate(state) for mutate in mutations]
                 self._sign_events(state, agent)
                 state.save()
+                fencing = lock.get("fencing") if lock else None
                 if not self._dirty():
-                    self._publish(
-                        state, agent, lock.get("fencing") if lock else None
-                    )
-                    return result
+                    self._publish(state, agent, fencing)
+                    return results
                 self._commit(label)
                 if not self.remote:
-                    self._publish(
-                        state, agent, lock.get("fencing") if lock else None
-                    )
-                    return result
+                    self._publish(state, agent, fencing)
+                    return results
                 push = gitops.git(
                     ["push", self.remote, f"HEAD:refs/heads/{self.branch}"],
                     cwd=self.dir,
                     check=False,
                 )
                 if push.returncode == 0:
-                    self._publish(
-                        state, agent, lock.get("fencing") if lock else None
-                    )
-                    return result
+                    self._publish(state, agent, fencing)
+                    return results
                 self.retries += 1
                 last_error = (push.stderr or push.stdout or "").strip()
                 if os.environ.get("AGHUB_TRACE_BOARD"):
@@ -729,6 +754,30 @@ class Board:
             )
 
 
+def board_entries(common):
+    """List the boards configured in this clone: the default plus any shards."""
+    config = read_local_config(common) or {}
+    entries = [
+        {
+            "name": "default",
+            "worktree": config.get("worktree", "aghub-board"),
+            "branch": config.get("branch") or BOARD_BRANCH,
+            "default": True,
+        }
+    ]
+    for name in sorted(config.get("boards") or {}):
+        meta = config["boards"][name] or {}
+        entries.append(
+            {
+                "name": name,
+                "worktree": meta.get("worktree") or f"aghub-board-{name}",
+                "branch": meta.get("branch") or f"{BOARD_BRANCH}-{name}",
+                "default": False,
+            }
+        )
+    return entries
+
+
 def init_board(
     repo,
     project,
@@ -743,10 +792,26 @@ def init_board(
     check_timeout=300,
     require_eval_sandbox=False,
     scope=None,
+    shard=None,
 ):
     common = gitops.common_dir(repo)
-    if read_local_config(common):
-        raise AghubError("aghub is already initialized in this repository")
+    existing = read_local_config(common)
+    shard_slug = slug(shard) if shard else None
+    if shard_slug:
+        if not existing:
+            raise AghubError(
+                "initialize the default board first: `aghub init --project <name>`"
+            )
+        if shard_slug in (existing.get("boards") or {}):
+            raise AghubError(f"board shard '{shard_slug}' already exists")
+        branch = f"{BOARD_BRANCH}-{shard_slug}"
+        worktree = f"aghub-board-{shard_slug}"
+        if remote is None:
+            remote = existing.get("remote")
+    else:
+        if existing:
+            raise AghubError("aghub is already initialized in this repository")
+        branch = BOARD_BRANCH
     if remote and not gitops.has_remote(repo, remote):
         raise AghubError(f"remote '{remote}' does not exist")
 
@@ -754,7 +819,6 @@ def init_board(
     if os.path.exists(target):
         raise AghubError(f"{target} already exists")
 
-    branch = BOARD_BRANCH
     remote_ready = bool(remote) and gitops.remote_branch_exists(repo, remote, branch)
     if remote_ready:
         gitops.git(
@@ -771,19 +835,37 @@ def init_board(
         gitops.git(["update-ref", f"refs/heads/{branch}", commit], cwd=repo)
         gitops.git(["worktree", "add", target, branch], cwd=repo)
 
-    write_local_config(
-        common,
-        {
+    if shard_slug:
+        existing.setdefault("boards", {})[shard_slug] = {
             "worktree": worktree,
-            "remote": remote,
-            "agent": None,
             "branch": branch,
-            "hub": None,
-            "hub_token": None,
-            "hub_failover": [],
-        },
-    )
-    board = Board(repo, common, target, remote)
+        }
+        write_local_config(common, existing)
+        board = Board(
+            repo,
+            common,
+            target,
+            remote,
+            existing.get("hub"),
+            existing.get("hub_token"),
+            existing.get("hub_failover"),
+            branch=branch,
+        )
+    else:
+        write_local_config(
+            common,
+            {
+                "worktree": worktree,
+                "remote": remote,
+                "agent": None,
+                "branch": branch,
+                "hub": None,
+                "hub_token": None,
+                "hub_failover": [],
+                "boards": {},
+            },
+        )
+        board = Board(repo, common, target, remote, branch=branch)
 
     def ensure(state):
         if not state.project:

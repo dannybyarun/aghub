@@ -384,6 +384,215 @@ class HubStore:
             "retry_after": retry_after,
         }
 
+    # -- retention and backup --------------------------------------------
+
+    def prune(self, max_age_days=None, max_events=None, projects=None, now=None):
+        """Trim storage so a long-lived hosted hub does not grow without bound.
+
+        Deletes audit events and resolved review requests older than
+        ``max_age_days``, trims each project's audit log to the newest
+        ``max_events`` rows, and clears stale rate-limit windows. A scoped admin
+        passes ``projects`` so it only prunes its own tenants; project-less data
+        (quota windows) is only touched for an unscoped (global) prune. Returns
+        the number of rows removed per table.
+        """
+        projects = list(projects) if projects is not None else None
+        if projects is not None and not projects:
+            return {"events": 0, "review_requests": 0, "board_events": 0, "quota_windows": 0}
+        removed = {"events": 0, "review_requests": 0, "board_events": 0, "quota_windows": 0}
+
+        def scope(clauses, params):
+            if projects is not None:
+                placeholders = ",".join("?" for _ in projects)
+                clauses.append(f"project IN ({placeholders})")
+                params.extend(projects)
+
+        with self.lock:
+            if max_age_days is not None and int(max_age_days) > 0:
+                cutoff = ago_iso(int(max_age_days) * 86400)
+                for table, time_column in (
+                    ("events", "at"),
+                    ("board_events", "at"),
+                ):
+                    clauses = [f"{time_column}<?"]
+                    params = [cutoff]
+                    scope(clauses, params)
+                    cursor = self.conn.execute(
+                        f"DELETE FROM {table} WHERE " + " AND ".join(clauses), params
+                    )
+                    removed[table] += cursor.rowcount if cursor.rowcount and cursor.rowcount > 0 else 0
+                clauses = ["updated_at<?", "status IN ('applied','rejected','cancelled')"]
+                params = [cutoff]
+                scope(clauses, params)
+                cursor = self.conn.execute(
+                    "DELETE FROM review_requests WHERE " + " AND ".join(clauses), params
+                )
+                removed["review_requests"] += max(0, cursor.rowcount or 0)
+            if max_events is not None and int(max_events) >= 0:
+                keep = int(max_events)
+                target = projects
+                if target is None:
+                    target = [row["project"] for row in self.conn.execute(
+                        "SELECT DISTINCT project FROM events"
+                    )]
+                for project in target:
+                    oldest = self.conn.execute(
+                        "SELECT seq FROM events WHERE project=? ORDER BY seq DESC LIMIT 1 OFFSET ?",
+                        (project, keep),
+                    ).fetchone()
+                    if oldest is not None:
+                        cursor = self.conn.execute(
+                            "DELETE FROM events WHERE project=? AND seq<=?",
+                            (project, oldest["seq"]),
+                        )
+                        removed["events"] += max(0, cursor.rowcount or 0)
+            if projects is None:
+                window = int((time.time() if now is None else now) // 60) - 2
+                cursor = self.conn.execute(
+                    "DELETE FROM quota_windows WHERE window_start < ?", (window,)
+                )
+                removed["quota_windows"] += max(0, cursor.rowcount or 0)
+            self.conn.commit()
+        return removed
+
+    def export_project(self, project):
+        """A portable JSON archive of one project's hub state, for backup."""
+        with self.lock:
+            snapshot = self.conn.execute(
+                "SELECT snapshot, updated_at, seq FROM snapshots WHERE project=?",
+                (project,),
+            ).fetchone()
+            if snapshot is None:
+                return None
+
+            def rows(sql):
+                return [dict(item) for item in self.conn.execute(sql, (project,))]
+
+            lock_row = self.conn.execute(
+                "SELECT holder, fencing, acquired_at, expires_at, updated_at, reason "
+                "FROM board_locks WHERE project=?",
+                (project,),
+            ).fetchone()
+            return {
+                "aghub_backup": 1,
+                "project": project,
+                "exported_at": now_iso(),
+                "snapshot": {
+                    "snapshot": snapshot["snapshot"],
+                    "updated_at": snapshot["updated_at"],
+                },
+                "agents": rows(
+                    "SELECT id, last_seen, current_task, branch, machine FROM agents WHERE project=?"
+                ),
+                "leases": rows(
+                    "SELECT task, agent, paths, acquired_at, expires_at, fencing "
+                    "FROM leases WHERE project=?"
+                ),
+                "counters": rows("SELECT name, value FROM counters WHERE project=?"),
+                "board_lock": dict(lock_row) if lock_row else None,
+                "review_packets": rows(
+                    "SELECT task, head, packet, published_at, actor "
+                    "FROM review_packets WHERE project=?"
+                ),
+                "review_requests": rows(
+                    "SELECT id, task, decision, note, head, actor, reviewer, status, "
+                    "worker, record_id, error, created_at, updated_at "
+                    "FROM review_requests WHERE project=?"
+                ),
+                "events": rows(
+                    "SELECT at, type, payload, actor FROM events WHERE project=? ORDER BY seq"
+                ),
+            }
+
+    def import_project(self, data, replace=False):
+        """Restore a project from an `export_project` archive.
+
+        Snapshots get a fresh sequence so SSE ordering stays monotonic; audit
+        events are re-inserted in order with new auto-increment ids. Ephemeral
+        buffers (the SSE replay window and rate-limit windows) are not restored.
+        """
+        if not isinstance(data, dict) or data.get("aghub_backup") != 1:
+            raise AghubError("not an aghub hub backup archive")
+        project = data.get("project")
+        if not project:
+            raise AghubError("backup archive has no project")
+        with self.lock:
+            if replace:
+                for table in (
+                    "snapshots", "agents", "leases", "counters", "board_locks",
+                    "review_packets", "review_requests", "events", "board_events",
+                ):
+                    self.conn.execute(f"DELETE FROM {table} WHERE project=?", (project,))
+            snapshot = data.get("snapshot") or {}
+            seq = self._next_seq()
+            self.conn.execute(
+                """
+                INSERT INTO snapshots(project, snapshot, updated_at, seq) VALUES(?,?,?,?)
+                ON CONFLICT(project) DO UPDATE SET
+                  snapshot=excluded.snapshot, updated_at=excluded.updated_at, seq=excluded.seq
+                """,
+                (project, snapshot.get("snapshot") or "{}", snapshot.get("updated_at") or now_iso(), seq),
+            )
+            for agent in data.get("agents") or []:
+                self.conn.execute(
+                    "INSERT OR REPLACE INTO agents(project, id, last_seen, current_task, branch, machine) "
+                    "VALUES(?,?,?,?,?,?)",
+                    (project, agent.get("id"), agent.get("last_seen") or now_iso(),
+                     agent.get("current_task"), agent.get("branch"), agent.get("machine")),
+                )
+            for lease in data.get("leases") or []:
+                self.conn.execute(
+                    "INSERT OR REPLACE INTO leases(project, task, agent, paths, acquired_at, expires_at, fencing) "
+                    "VALUES(?,?,?,?,?,?,?)",
+                    (project, lease.get("task"), lease.get("agent"), lease.get("paths") or "[]",
+                     lease.get("acquired_at") or now_iso(), lease.get("expires_at") or now_iso(),
+                     int(lease.get("fencing") or 0)),
+                )
+            for counter in data.get("counters") or []:
+                self.conn.execute(
+                    "INSERT OR REPLACE INTO counters(project, name, value) VALUES(?,?,?)",
+                    (project, counter.get("name"), int(counter.get("value") or 0)),
+                )
+            lock = data.get("board_lock")
+            if lock:
+                self.conn.execute(
+                    "INSERT OR REPLACE INTO board_locks(project, holder, fencing, acquired_at, expires_at, updated_at, reason) "
+                    "VALUES(?,?,?,?,?,?,?)",
+                    (project, lock.get("holder"), int(lock.get("fencing") or 0),
+                     lock.get("acquired_at"), lock.get("expires_at"),
+                     lock.get("updated_at") or now_iso(), lock.get("reason")),
+                )
+            for packet in data.get("review_packets") or []:
+                self.conn.execute(
+                    "INSERT OR REPLACE INTO review_packets(project, task, head, packet, published_at, actor) "
+                    "VALUES(?,?,?,?,?,?)",
+                    (project, packet.get("task"), packet.get("head"), packet.get("packet") or "{}",
+                     packet.get("published_at") or now_iso(), packet.get("actor")),
+                )
+            for request in data.get("review_requests") or []:
+                self.conn.execute(
+                    """
+                    INSERT OR REPLACE INTO review_requests(
+                      id, project, task, decision, note, head, actor, reviewer,
+                      status, worker, record_id, error, created_at, updated_at)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    """,
+                    (request.get("id") or new_ulid(), project, request.get("task"),
+                     request.get("decision"), request.get("note") or "", request.get("head"),
+                     request.get("actor"), request.get("reviewer"), request.get("status") or "pending",
+                     request.get("worker"), request.get("record_id"), request.get("error"),
+                     request.get("created_at") or now_iso(), request.get("updated_at") or now_iso()),
+                )
+            for event in data.get("events") or []:
+                self.conn.execute(
+                    "INSERT INTO events(project, at, type, payload, actor) VALUES(?,?,?,?,?)",
+                    (project, event.get("at") or now_iso(), event.get("type") or "import",
+                     event.get("payload") or "{}", event.get("actor")),
+                )
+            self._event(project, "project.restored", {"replace": bool(replace)})
+            self.conn.commit()
+        return {"project": project, "seq": seq}
+
     def history(self, project=None, after=0, limit=100):
         """Bounded board history, oldest first. Used for SSE replay and the API."""
         limit = max(1, min(int(limit or 100), 100))
@@ -1206,9 +1415,9 @@ class Handler(BaseHTTPRequestHandler):
                 )
 
         if method == "GET":
-            needed = "admin" if path == "/api/audit" else "reader"
+            needed = "admin" if path == "/api/audit" or path.startswith("/api/admin/") else "reader"
         elif method == "POST":
-            needed = "admin" if path.startswith("/api/debug/") else "writer"
+            needed = "admin" if path.startswith(("/api/debug/", "/api/admin/")) else "writer"
         else:
             return self._json(405, {"error": "method not allowed"})
         if not self._role_allows(identity, needed):
@@ -1248,6 +1457,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._audit(query, identity)
         if path == "/api/audit/export":
             return self._audit_export(query, identity)
+        if path == "/api/admin/backup":
+            return self._admin_backup(query, identity)
         if path == "/api/events":
             return self._events(
                 project,
@@ -1419,6 +1630,31 @@ class Handler(BaseHTTPRequestHandler):
         return self._json(
             200,
             {"events": self.server.store.history(project, after, limit)},
+        )
+
+    def _admin_backup(self, query, identity):
+        """Export one project's hub state. Admin-only, scoped to the token."""
+        if not hasattr(self.server.store, "export_project"):
+            return self._json(501, {"error": "this store does not support backup"})
+        project = query.get("project", [None])[0]
+        if not project:
+            return self._json(400, {"error": "project is required"})
+        allowed = identity.get("projects")
+        if allowed is not None and project not in allowed:
+            return self._json(403, {"error": f"token cannot read project {project}"})
+        archive = self.server.store.export_project(project)
+        if archive is None:
+            return self._json(404, {"error": f"no board for project {project}"})
+        stamp = now_iso().replace("-", "").replace(":", "")
+        return self._raw(
+            200,
+            json.dumps(archive, separators=(",", ":")),
+            "application/json; charset=utf-8",
+            {
+                "Content-Disposition": (
+                    f'attachment; filename="aghub-backup-{project}-{stamp}.json"'
+                )
+            },
         )
 
     # -- review workspace ------------------------------------------------
@@ -1679,6 +1915,34 @@ class Handler(BaseHTTPRequestHandler):
                 ),
             )
 
+        if path == "/api/admin/prune":
+            scoped = identity.get("projects")
+            if not hasattr(store, "prune"):
+                return self._json(501, {"error": "this store does not support prune"})
+            max_age_days = body.get("max_age_days")
+            max_events = body.get("max_events")
+            if max_age_days is None and max_events is None:
+                raise AghubError("pass max_age_days and/or max_events")
+            removed = store.prune(
+                max_age_days=max_age_days,
+                max_events=max_events,
+                projects=scoped,
+            )
+            return self._json(200, {"removed": removed})
+
+        if path == "/api/admin/restore":
+            if not hasattr(store, "import_project"):
+                return self._json(501, {"error": "this store does not support restore"})
+            archive = body.get("archive") if isinstance(body.get("archive"), dict) else body
+            archive_project = archive.get("project") if isinstance(archive, dict) else None
+            scoped = identity.get("projects")
+            if scoped is not None and archive_project not in scoped:
+                return self._json(
+                    403, {"error": f"token cannot write project {archive_project}"}
+                )
+            result = store.import_project(archive, replace=bool(body.get("replace")))
+            return self._json(200, {"restored": result})
+
         return self._json(404, {"error": "not found"})
 
     # -- helpers ---------------------------------------------------------
@@ -1926,6 +2190,8 @@ def serve(
     tokens=None,
     rate_limit=600,
     postgres=None,
+    retention_days=None,
+    retention_events=None,
 ):
     db = os.path.expanduser(db)
     if host not in ("127.0.0.1", "localhost", "::1") and not token and not tokens:
@@ -1953,12 +2219,32 @@ def serve(
         f" · rate {server.rate_limit or 'off'}/min",
         flush=True,
     )
+    stop = threading.Event()
+    if (retention_days or retention_events) and hasattr(store, "prune"):
+        print(
+            f"  retention {retention_days or '∞'}d / {retention_events or '∞'} events,"
+            " pruned hourly",
+            flush=True,
+        )
+
+        def pruner():
+            while not stop.wait(3600):
+                try:
+                    store.prune(
+                        max_age_days=retention_days, max_events=retention_events
+                    )
+                except Exception as exc:  # a pruner bug must not kill the hub
+                    if verbose:
+                        print(f"aghub hub: prune failed: {exc}", flush=True)
+
+        threading.Thread(target=pruner, daemon=True).start()
     print("  ctrl-c to stop", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         print("\nstopping hub", flush=True)
     finally:
+        stop.set()
         server.server_close()
         store.close()
 

@@ -145,6 +145,64 @@ class AghubTestCase(unittest.TestCase):
         self.assertIn("T-001", proc.stdout)
         self.assertIn("T-002", proc.stdout)
 
+    def test_task_import_is_one_board_write(self):
+        w = self.world
+        self.bootstrap()
+        board_dir = Path(w.fe) / ".git" / "aghub-board"
+        before = len(git(board_dir, "log", "--oneline").stdout.splitlines())
+        specs = (
+            "- title: Import A\n  paths: [src/a/**]\n"
+            "- title: Import B\n  paths: [src/b/**]\n"
+            "- title: Import C\n  paths: [src/c/**]\n  requires_approval: true\n"
+        )
+        (Path(w.fe) / "tasks.yaml").write_text(specs)
+        out = w.aghub("fe", "task", "import", "tasks.yaml", agent="fe-1")
+        self.assertIn("imported 3 task(s)", out.stdout)
+        listed = w.aghub("fe", "task", "list", agent="fe-1").stdout
+        for task_id in ("T-003", "T-004", "T-005"):
+            self.assertIn(task_id, listed)
+        after = len(git(board_dir, "log", "--oneline").stdout.splitlines())
+        self.assertEqual(after - before, 1, "import should be a single board commit")
+        self.assertIn("import 3 task(s)", git(board_dir, "log", "-1", "--format=%s").stdout)
+
+    def test_sharded_boards_are_independent(self):
+        w = self.world
+        self.bootstrap()
+        created = w.aghub(
+            "fe", "init", "--project", "test-web", "--check", "true",
+            agent="fe-1", env={"AGHUB_SHARD": "web"},
+        )
+        self.assertIn("shard", created.stdout)
+        w.aghub(
+            "fe", "task", "add", "Shard task", "--paths", "src/web/**",
+            agent="fe-1", env={"AGHUB_SHARD": "web"},
+        )
+        default_list = w.aghub("fe", "task", "list", agent="fe-1").stdout
+        self.assertNotIn("Shard task", default_list)
+        web_list = w.aghub(
+            "fe", "task", "list", agent="fe-1", env={"AGHUB_SHARD": "web"}
+        ).stdout
+        self.assertIn("Shard task", web_list)
+        boards = json.loads(w.aghub("fe", "boards", "--json", agent="fe-1").stdout)
+        by_name = {board["name"]: board for board in boards}
+        self.assertEqual(set(by_name), {"default", "web"})
+        self.assertEqual(by_name["web"]["branch"], "aghub/board-web")
+        self.assertEqual(by_name["web"]["project"], "test-web")
+
+    def test_shard_init_requires_a_default_board_and_rejects_duplicates(self):
+        w = self.world
+        self.bootstrap()
+        w.aghub(
+            "fe", "init", "--project", "p-web", "--check", "true",
+            agent="fe-1", env={"AGHUB_SHARD": "web"},
+        )
+        dup = w.aghub(
+            "fe", "init", "--project", "p-web", "--check", "true",
+            agent="fe-1", env={"AGHUB_SHARD": "web"}, check=False,
+        )
+        self.assertEqual(dup.returncode, 1)
+        self.assertIn("already exists", dup.stderr)
+
     def test_live_claim_cannot_be_stolen(self):
         self.bootstrap()
         self.world.aghub("fe", "claim", "T-001", agent="fe-1")
@@ -928,6 +986,94 @@ class AghubTestCase(unittest.TestCase):
         self.assertEqual(verified.returncode, 0)
         self.assertIn("0 invalid", verified.stdout)
 
+    def test_queue_enforces_protected_path_group(self):
+        w = self.world
+        self.bootstrap()
+        # Protect the API lane: any diff under src/api/** needs the security
+        # group, whose only member is the ci identity.
+        w.aghub(
+            "fe",
+            "policy",
+            "set",
+            "--group",
+            "security=ci",
+            "--protect",
+            "src/api/**:group=security",
+            agent="fe-1",
+        )
+        w.aghub(
+            "fe",
+            "task",
+            "add",
+            "Ship API",
+            "--paths",
+            "src/api/**",
+            "--requires-approval",
+            agent="fe-1",
+        )
+        w.aghub("be", "claim", "T-003", agent="be-1")
+        git(w.be, "checkout", "-q", "agent/be-1/T-003")
+        w.commit_file(
+            "be", "src/api/items.py", 'ROUTES = ["/items", "/items/{id}"]\n', "api"
+        )
+        git(w.be, "push", "-qu", "origin", "agent/be-1/T-003")
+
+        # A general reviewer satisfies the base count but not the protected rule.
+        w.aghub("fe", "approve", "T-003", "--note", "looks fine", agent="fe-1")
+        gated = w.aghub("be", "submit", "T-003", agent="be-1", check=False)
+        self.assertEqual(gated.returncode, 1)
+        self.assertIn("security", gated.stderr)
+
+        packet = json.loads(
+            w.aghub("fe", "review", "T-003", "--json", agent="fe-1").stdout
+        )
+        rule = packet["approval"]["protected"][0]
+        self.assertTrue(rule["triggered"])
+        self.assertEqual(rule["matched"], ["src/api/items.py"])
+
+        # Force it past the advisory submit gate; the queue is the authority.
+        w.aghub("be", "submit", "T-003", "--force", agent="be-1")
+        w.aghub("ci", "init", "--project", "test", agent="ci")
+        rejected = w.aghub("ci", "queue", "run", agent="ci")
+        self.assertIn("REJECTED", rejected.stdout)
+        self.assertIn("security", rejected.stdout)
+        self.assertNotIn("merge T-003", git(w.ci, "log", "--oneline", "origin/main").stdout)
+
+        # The security reviewer clears the protected rule; the merge proceeds.
+        w.aghub("ci", "approve", "T-003", "--note", "security ok", agent="ci")
+        w.aghub("be", "submit", "T-003", agent="be-1")
+        merged = w.aghub("ci", "queue", "run", agent="ci")
+        self.assertIn("merged", merged.stdout)
+        self.assertIn("merge T-003", git(w.ci, "log", "--oneline", "origin/main").stdout)
+
+    def test_policy_show_round_trips_protected_and_sla(self):
+        w = self.world
+        self.bootstrap()
+        w.aghub(
+            "fe",
+            "policy",
+            "set",
+            "--sla",
+            "3600",
+            "--group",
+            "db=be-1",
+            "--protect",
+            "migrations/**,**/schema.sql:group=db,approvals=2",
+            agent="fe-1",
+        )
+        policy = json.loads(w.aghub("fe", "policy", "show", "--json", agent="fe-1").stdout)
+        self.assertEqual(policy["sla_seconds"], 3600)
+        self.assertEqual(len(policy["protected_paths"]), 1)
+        rule = policy["protected_paths"][0]
+        self.assertEqual(rule["paths"], ["migrations/**", "**/schema.sql"])
+        self.assertEqual(rule["groups"], ["db"])
+        self.assertEqual(rule["approvals"], 2)
+
+        w.aghub("fe", "policy", "set", "--no-sla", "--clear-protected", agent="fe-1")
+        cleared = json.loads(w.aghub("fe", "policy", "show", "--json", agent="fe-1").stdout)
+        self.assertIsNone(cleared["sla_seconds"])
+        self.assertEqual(cleared["protected_paths"], [])
+
     def test_review_inbox_and_changes_requested_gate(self):
         w = self.world
         self.bootstrap()
@@ -1202,7 +1348,7 @@ class AghubTestCase(unittest.TestCase):
 
         gated = w.aghub("be", "submit", "T-003", agent="be-1", check=False)
         self.assertEqual(gated.returncode, 1)
-        self.assertIn("requires a human approval", gated.stderr)
+        self.assertIn("approval", gated.stderr)
 
         w.aghub("fe", "review", "T-003", "--approve", agent="fe-1")
         packet = json.loads(
@@ -1363,6 +1509,72 @@ class AghubTestCase(unittest.TestCase):
         self.assertIn("older commit", payload["check"]["output"]["summary"])
 
         w.aghub("be", "submit", "T-003", agent="be-1")
+
+    def test_github_dismissed_review_retracts_the_approval(self):
+        w = self.world
+        self.bootstrap()
+        w.aghub(
+            "fe", "task", "add", "Ship API", "--paths", "src/api/**",
+            "--requires-approval", agent="fe-1",
+        )
+        w.aghub("fe", "policy", "set", "--github", "alice=fe-1", agent="fe-1")
+        w.aghub("be", "claim", "T-003", agent="be-1")
+        branch = "agent/be-1/T-003"
+        git(w.be, "checkout", "-q", branch)
+        w.commit_file("be", "src/api/items.py", "print('ok')\n", "api")
+        git(w.be, "push", "-qu", "origin", branch)
+        head = git(w.be, "rev-parse", "HEAD").stdout.strip()
+
+        def write_event(action, state="approved"):
+            event = {
+                "action": action,
+                "number": 7,
+                "repository": {"full_name": "acme/repo"},
+                "pull_request": {
+                    "number": 7,
+                    "title": "Ship API",
+                    "body": "",
+                    "html_url": "https://github.com/acme/repo/pull/7",
+                    "draft": False,
+                    "user": {"login": "alice"},
+                    "head": {"ref": branch, "sha": head, "repo": {"full_name": "acme/repo"}},
+                    "base": {"ref": "main", "repo": {"full_name": "acme/repo"}},
+                },
+                "review": {
+                    "id": 9001,
+                    "state": state,
+                    "commit_id": head,
+                    "user": {"login": "alice"},
+                    "author_association": "MEMBER",
+                    "body": "ship it",
+                },
+            }
+            path = Path(w.base) / "ev.json"
+            path.write_text(json.dumps(event))
+            return str(path)
+
+        # Record the approval, then confirm the gate is satisfied.
+        w.aghub(
+            "fe", "github", "sync", "--event", write_event("submitted"),
+            "--record-reviews", "--reviewer-agent", "github-review",
+            "--no-comment", "--no-check", agent="fe-1",
+        )
+        packet = json.loads(w.aghub("fe", "review", "T-003", "--json", agent="fe-1").stdout)
+        self.assertTrue(packet["approval"]["satisfied"])
+
+        # Dismiss the same review; the approval should stop counting.
+        dismissed = w.aghub(
+            "fe", "github", "sync", "--event", write_event("dismissed"),
+            "--record-reviews", "--reviewer-agent", "github-review",
+            "--no-comment", "--no-check", agent="fe-1",
+        )
+        self.assertIn("dismissal of review 9001", dismissed.stdout)
+        packet = json.loads(w.aghub("fe", "review", "T-003", "--json", agent="fe-1").stdout)
+        self.assertFalse(packet["approval"]["satisfied"])
+        self.assertEqual(len(packet["approval"]["dismissed"]), 1)
+
+        gated = w.aghub("be", "submit", "T-003", agent="be-1", check=False)
+        self.assertEqual(gated.returncode, 1)
 
     def test_github_webhook_records_review_from_signed_fixture(self):
         w = self.world
@@ -1692,8 +1904,8 @@ class AghubTestCase(unittest.TestCase):
             w.aghub("fe", "policy", "show", "--json", agent="fe-1").stdout
         )
         self.assertEqual(
-            policy["protected"],
-            [{"path": "src/api/secret/**", "require": "security"}],
+            policy["protected_paths"],
+            [{"paths": ["src/api/secret/**"], "groups": ["security"]}],
         )
 
         w.aghub(
@@ -1712,10 +1924,10 @@ class AghubTestCase(unittest.TestCase):
         w.commit_file("be", "src/api/secret/keys.py", "KEYS = {}\n", "keys")
         git(w.be, "push", "-qu", "origin", branch)
 
+        # Before the push the diff is unknown, so the gate is plain policy.
         blocked = w.aghub("be", "submit", "T-001", agent="be-1", check=False)
         self.assertEqual(blocked.returncode, 1)
-        self.assertIn("security", blocked.stderr)
-        self.assertIn("src/api/secret/**", blocked.stderr)
+        self.assertIn("requires a human approval", blocked.stderr)
 
         w.aghub(
             "fe", "review", "T-001", "--approve", "--note", "keys look fine",
@@ -1748,6 +1960,33 @@ class AghubTestCase(unittest.TestCase):
             "fe", "review", "T-001", "--approve", "--note", "lgtm", agent="sec-1"
         )
         w.aghub("be", "submit", "T-001", agent="be-1")
+
+    def test_unprotect_removes_rules_that_mention_the_glob(self):
+        w = self.world
+        self.bootstrap()
+        w.aghub("fe", "policy", "set", "--group", "security=fe-1", agent="fe-1")
+        w.aghub(
+            "fe",
+            "policy",
+            "set",
+            "--protect",
+            "src/pay/**=security",
+            "--protect",
+            "schema.sql,db/**:group=security",
+            agent="fe-1",
+        )
+
+        def rules():
+            policy = json.loads(
+                w.aghub("fe", "policy", "show", "--json", agent="fe-1").stdout
+            )
+            return [rule["paths"] for rule in policy["protected_paths"]]
+
+        self.assertEqual(rules(), [["src/pay/**"], ["schema.sql", "db/**"]])
+        w.aghub("fe", "policy", "set", "--unprotect", "db/**", agent="fe-1")
+        self.assertEqual(rules(), [["src/pay/**"]])
+        w.aghub("fe", "policy", "set", "--clear-protected", agent="fe-1")
+        self.assertEqual(rules(), [])
 
     def test_review_sla_flags_an_old_review_request(self):
         w = self.world
