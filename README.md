@@ -2,6 +2,7 @@
 
 **Git-native coordination for parallel coding agents. Leases on the hub, history on the branch.**
 
+[![CI](https://github.com/dannybyarun/aghub/actions/workflows/ci.yml/badge.svg)](https://github.com/dannybyarun/aghub/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](pyproject.toml)
 
@@ -29,6 +30,47 @@ TASKS
 QUEUE  empty
 ```
 
+## Sixty-second tour
+
+![aghub quickstart](https://raw.githubusercontent.com/dannybyarun/aghub/main/docs/assets/quickstart.gif)
+
+*Rendered from a real local session against this checkout. The commands and output are verbatim; the typing animation is not a screen recording.*
+
+From a clone of a repo that has an `origin`:
+
+```bash
+python3 -m pip install .        # installs the `aghub` command
+
+# 1. Put a board on an orphan branch and pin the merge gate.
+aghub init --project my-app --check "npm test"
+
+# 2. Describe the work as lanes with path ownership.
+aghub task add "Auth API" --paths "src/api/**"
+aghub task add "Web UI"  --paths "src/web/**"
+
+# 3. Freeze the boundary before either side builds against it.
+aghub contract freeze api 1 --from contracts/api.yaml
+aghub codegen api 1 --out generated     # TS, Python, mock server, SQL
+aghub verify                            # signed, hash-chained board
+
+# 4. In a second clone, same repo: join and take the other lane.
+aghub agent fe-1
+aghub claim T-002
+aghub status
+
+# 5. Work, commit, then hand off in writing instead of chatting.
+git checkout agent/fe-1/T-002
+# ...edit src/web, commit...
+aghub handoff T-002 --next "wire the API client" --done
+
+# 6. Submit; the queue is the only thing that merges.
+aghub submit T-002
+aghub queue run
+aghub verify
+```
+
+That is the whole protocol. The [demo](demo/run_demo.sh) walks the same path with contracts, reviews, a rejected cross-lane edit, and a failing merge check; the [swarm demo](demo/run_swarm.sh) runs it with 10–50 agents.
+
 ## Why this exists
 
 Agents working in parallel fail in three ways:
@@ -46,6 +88,21 @@ Chat does not fix this. It is nondeterministic, expensive in context, and leaves
 - **Signed history + reviews** let humans and other agents verify what happened, request changes, and stop high-risk merges.
 
 Claims are advisory at write time (fast, works offline, catches most races). The queue is authoritative at merge time (path check + contract check + serial merge). That split is deliberate: you cannot make git leases truly authoritative across machines without a leader, so don't pretend — enforce at integration. With a hub, live leases become authoritative at write time too, and the hub's writer lease serializes board transactions without becoming the durable record.
+
+## How it compares
+
+`aghub` is not an agent framework and not a merge queue. It is the protocol between agents that already know how to code and run in separate clones of one repo. The nearest neighbours solve different parts:
+
+| Approach | What it already gives you | Where `aghub` differs |
+|---|---|---|
+| **Git worktrees** | Several checkouts of one repo, so two agents stop fighting over one working tree. | Worktrees isolate files, not decisions. `aghub` adds ownership (path claims), a shared board, frozen contracts, handoffs, and a merge gate. It works with worktrees or without them. |
+| **GitHub merge queue** | Serialized, tested merges into a protected trunk; no broken `main`. | It starts at the pull request. `aghub` starts before the branch: who owns which paths, what the boundary is, and what "done" means. Its queue is git-remote-agnostic and runs the repo's own check. |
+| **Beads** ([gastownhall/beads](https://github.com/gastownhall/beads)) | A git-backed issue tracker and memory layer for coding agents, with dependencies and ready-work queries. | Complementary. Beads remembers work; `aghub` also arbitrates live ownership (leases), freezes interfaces, and enforces a serial merge queue with signed history. A board task can be created from anywhere, including a Beads export. |
+| **Temporal** | Durable workflow execution: retries, timers, signals, and state that survives process death. | Temporal coordinates code you wrote as workflows; `aghub` coordinates agents you did not write. There is no worker cluster: git is the durable record, and the hub is optional and disposable. |
+| **LangGraph / CrewAI** | Frameworks for building and running multi-agent applications in one runtime, with shared state and orchestration. | Those decide *how agents run*. `aghub` assumes they already run — different tools, models, machines, or vendors — and gives them one repo-scoped contract for claiming work, handing off, and merging. |
+| **Chat / shared prompt** | Fast to start; flexible; familiar. | Nondeterministic, context-expensive, and leaves no auditable record. `aghub` replaces the conversation with a board, written handoffs, and a hash-chained history. |
+
+They compose. Use worktrees for checkouts, a merge queue or CI for the trunk, Beads or an issue tracker for backlog, and `aghub` for the part between "agent starts" and "change lands": lease, claim, contract, handoff, queue, verify.
 
 ## Quick start
 
@@ -971,6 +1028,7 @@ src/aghub/             board, service, review, github, codegen, render, sandbox,
 demo/run_demo.sh       the two-agent story
 demo/run_hub.sh        the live layer: leases, presence, web board
 demo/run_swarm.sh      concurrent board writes: hub writer lease, N agents, serial queue
+bench/ten-machine/     as-run scripts and EVIDENCE extracts from the ten-machine cloud run
 tests/                 protocol, trust, codegen, hub, MCP, sandbox, swarm, and end-to-end tests
 ```
 
@@ -996,6 +1054,7 @@ projects and delete their own rows; still, point them at a scratch database.
 ## Documentation
 
 - [Ten machines, one board](docs/REAL-PROJECT-10-MACHINE.md) — the real-world validation run.
+- [Ten-machine as-run harness](bench/ten-machine/README.md) — the scripts and `EVIDENCE` extracts, with scope and limits.
 - [Why chat doesn't coordinate parallel agents](docs/blog/why-chat-doesnt-coordinate-agents.md) — the design argument.
 - [Docker demo](demo/docker/README.md) — three agent containers, one board.
 - [Contributing](CONTRIBUTING.md) · [Security policy](SECURITY.md)

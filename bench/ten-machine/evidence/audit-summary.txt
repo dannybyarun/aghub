@@ -1,0 +1,27 @@
+audit events: 225
+window: 2026-11-06T16:44:04Z -> 2026-11-06T16:47:48Z
+
+events by type:
+  board.lock               67
+  board.unlock             67
+  lease.claim              12
+  lease.release            1
+  review.packet            11
+  snapshot.publish         67
+
+board.lock cycles: 67
+fencing: 1 -> 67
+lease.claim rows: 12
+lease claims by task/agent:
+  T-011  a5
+  T-003  a3
+  T-999  ghost-b
+  T-004  a4
+  T-008  b3
+  T-009  b4
+  T-002  a2
+  T-010  b5
+  T-005  a5
+  T-001  a1
+  T-006  b1
+  T-007  b2

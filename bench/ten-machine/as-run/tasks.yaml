@@ -1,0 +1,59 @@
+# Real-project lanes for the verbatim project copy under app/ (not published).
+# Imported once by the leader in one board write, in this order -> T-001..T-011.
+
+tasks:
+  - title: Money split
+    paths:
+      - app/src/22_MoneySplit.gs
+      - app/tests/lanes/money-split.test.js
+    acceptance: node app/tests/run-lanes.js passes for money-split
+  - title: BS date spans
+    paths:
+      - app/src/22_BsSpan.gs
+      - app/tests/lanes/bs-span.test.js
+    acceptance: node app/tests/run-lanes.js passes for bs-span
+  - title: Ledger aging buckets
+    paths:
+      - app/src/22_Aging.gs
+      - app/tests/lanes/aging.test.js
+    acceptance: node app/tests/run-lanes.js passes for aging
+  - title: Stock health
+    paths:
+      - app/src/22_StockHealth.gs
+      - app/tests/lanes/stock-health.test.js
+    acceptance: node app/tests/run-lanes.js passes for stock-health
+  - title: Quality verdict
+    paths:
+      - app/src/22_QualityVerdict.gs
+      - app/tests/lanes/quality-verdict.test.js
+    acceptance: node app/tests/run-lanes.js passes for quality-verdict
+  - title: Payment waterfall
+    paths:
+      - app/src/22_PaymentWaterfall.gs
+      - app/tests/lanes/payment-waterfall.test.js
+    acceptance: node app/tests/run-lanes.js passes for payment-waterfall
+  - title: Report rollup
+    paths:
+      - app/src/22_Rollup.gs
+      - app/tests/lanes/rollup.test.js
+    acceptance: node app/tests/run-lanes.js passes for rollup
+  - title: Branch scope view
+    paths:
+      - app/src/22_BranchScope.gs
+      - app/tests/lanes/branch-scope.test.js
+    acceptance: node app/tests/run-lanes.js passes for branch-scope
+  - title: Rate selection
+    paths:
+      - app/src/22_RatePick.gs
+      - app/tests/lanes/rate-pick.test.js
+    acceptance: node app/tests/run-lanes.js passes for rate-pick
+  - title: CSV merge
+    paths:
+      - app/src/22_CsvMerge.gs
+      - app/tests/lanes/csv-merge.test.js
+    acceptance: node app/tests/run-lanes.js passes for csv-merge
+  - title: Shared winner race
+    paths:
+      - app/src/22_SharedWinner.gs
+      - app/tests/lanes/shared-winner.test.js
+    acceptance: shared winner module and its test agree with the winning machine

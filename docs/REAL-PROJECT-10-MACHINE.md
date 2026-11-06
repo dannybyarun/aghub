@@ -165,3 +165,7 @@ SWARM_AGENTS=50 ./demo/run_swarm.sh  # 50 agents
 ```
 
 `run_swarm.sh` creates one clone per agent, starts a local hub, fires every claim at the same instant, then every submit, and merges all branches through the serial queue. `run_hub.sh` starts a hub and two clones and reproduces the ghost-lease case: a live hub lease rejecting a claim the git board knows nothing about. The cloud run is the evidence; the local demo is the part you can run yourself.
+
+The as-run scripts and the `EVIDENCE` extracts from both runner logs are published in
+[`bench/ten-machine/`](../bench/ten-machine/README.md). The private project and its lane payloads are
+not included, so `agent.sh` is there to be inspected rather than run end to end.

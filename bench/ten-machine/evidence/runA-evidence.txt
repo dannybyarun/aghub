@@ -1,0 +1,68 @@
+EVIDENCE|a5|machine|runnervmlby3q Linux 6.8.0-1070-azure
+EVIDENCE|a5|machine_id|70dc8f72314340c48ab2f00af896d8e8
+EVIDENCE|a5|boot_id|e9e29474-f77b-4440-aeaa-e6077e2b3957
+EVIDENCE|a5|runner|GitHub Actions 1000000932
+EVIDENCE|a5|account_repo|<account-a>/aghub-swarm-live
+EVIDENCE|a5|hub|<hub-url>
+EVIDENCE|a5|joined|board=swarm-real
+EVIDENCE|a5|tasks|T-001,T-002,T-003,T-004,T-005,T-006,T-007,T-008,T-009,T-010,T-011
+EVIDENCE|a5|race|won T-011
+EVIDENCE|a5|submitted|T-011
+EVIDENCE|a5|submitted|T-005
+EVIDENCE|a5|trunk|all 10 lane modules + shared winner present on origin/main
+EVIDENCE|a5|verify|signed board verified
+EVIDENCE|a5|done|real-project multi-machine trial complete
+EVIDENCE|a3|machine|runnervmlby3q Linux 6.8.0-1070-azure
+EVIDENCE|a3|machine_id|70dc8f72314340c48ab2f00af896d8e8
+EVIDENCE|a3|boot_id|3945e371-9d8e-4ae8-871e-39e0afaa8201
+EVIDENCE|a3|runner|GitHub Actions 1000000928
+EVIDENCE|a3|account_repo|<account-a>/aghub-swarm-live
+EVIDENCE|a3|hub|<hub-url>
+EVIDENCE|a3|joined|board=swarm-real
+EVIDENCE|a3|tasks|T-001,T-002,T-003,T-004,T-005,T-006,T-007,T-008,T-009,T-010,T-011
+EVIDENCE|a3|race|lost T-011 exit=1
+EVIDENCE|a3|submitted|T-003
+EVIDENCE|a3|trunk|all 10 lane modules + shared winner present on origin/main
+EVIDENCE|a3|verify|signed board verified
+EVIDENCE|a3|done|real-project multi-machine trial complete
+EVIDENCE|a1|machine|runnervmlby3q Linux 6.8.0-1070-azure
+EVIDENCE|a1|machine_id|70dc8f72314340c48ab2f00af896d8e8
+EVIDENCE|a1|boot_id|e888f84f-8912-4bef-8803-49adb9cf5cd8
+EVIDENCE|a1|runner|GitHub Actions 1000000929
+EVIDENCE|a1|account_repo|<account-a>/aghub-swarm-live
+EVIDENCE|a1|hub|<hub-url>
+EVIDENCE|a1|joined|board=swarm-real
+EVIDENCE|a1|tasks|T-001,T-002,T-003,T-004,T-005,T-006,T-007,T-008,T-009,T-010,T-011
+EVIDENCE|a1|hub_only_lease|blocked claim T-001 exit=1
+EVIDENCE|a1|race|lost T-011 exit=1
+EVIDENCE|a1|submitted|T-001
+EVIDENCE|a1|queue|merged T-001,T-002,T-003,T-004,T-005,T-006,T-007,T-008,T-009,T-010,T-011
+EVIDENCE|a1|trunk|all 10 lane modules + shared winner present on origin/main
+EVIDENCE|a1|verify|signed board verified
+EVIDENCE|a1|done|real-project multi-machine trial complete
+EVIDENCE|a2|machine|ip-10-0-142-3 Linux 7.0.0-1014-aws
+EVIDENCE|a2|machine_id|ec2613b8de3fe74e75978be7974390e5
+EVIDENCE|a2|boot_id|b6a2003b-1fb5-413c-a057-5953c579c537
+EVIDENCE|a2|runner|GitHub Actions 1000000930
+EVIDENCE|a2|account_repo|<account-a>/aghub-swarm-live
+EVIDENCE|a2|hub|<hub-url>
+EVIDENCE|a2|joined|board=swarm-real
+EVIDENCE|a2|tasks|T-001,T-002,T-003,T-004,T-005,T-006,T-007,T-008,T-009,T-010,T-011
+EVIDENCE|a2|race|lost T-011 exit=1
+EVIDENCE|a2|submitted|T-002
+EVIDENCE|a2|trunk|all 10 lane modules + shared winner present on origin/main
+EVIDENCE|a2|verify|signed board verified
+EVIDENCE|a2|done|real-project multi-machine trial complete
+EVIDENCE|a4|machine|runnervm7aw5e Linux 7.0.0-1017-azure
+EVIDENCE|a4|machine_id|8d4ace31bca84511b5238b15acaeac38
+EVIDENCE|a4|boot_id|9b5a77e7-9823-4e75-81ab-0ebb0560ebf9
+EVIDENCE|a4|runner|GitHub Actions 1000000931
+EVIDENCE|a4|account_repo|<account-a>/aghub-swarm-live
+EVIDENCE|a4|hub|<hub-url>
+EVIDENCE|a4|joined|board=swarm-real
+EVIDENCE|a4|tasks|T-001,T-002,T-003,T-004,T-005,T-006,T-007,T-008,T-009,T-010,T-011
+EVIDENCE|a4|race|lost T-011 exit=1
+EVIDENCE|a4|submitted|T-004
+EVIDENCE|a4|trunk|all 10 lane modules + shared winner present on origin/main
+EVIDENCE|a4|verify|signed board verified
+EVIDENCE|a4|done|real-project multi-machine trial complete

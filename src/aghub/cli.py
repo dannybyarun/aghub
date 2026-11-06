@@ -9,7 +9,7 @@ import time
 
 import yaml
 
-from . import codegen, gitops, hubclient, keys, render, sandbox, service
+from . import __version__, codegen, gitops, hubclient, keys, render, sandbox, service
 from .board import (
     Board,
     board_entries,
@@ -2367,6 +2367,7 @@ def build_parser():
         prog="aghub",
         description="A shared board so parallel coding agents can work without talking to each other.",
     )
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     parser.add_argument("--agent", help="agent identity (default: $AGHUB_AGENT or local config)")
     parser.add_argument(
         "--shard",

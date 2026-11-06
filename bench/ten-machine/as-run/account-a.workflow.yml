@@ -1,0 +1,98 @@
+name: aghub real-project swarm (account A)
+
+on:
+  workflow_dispatch:
+    inputs:
+      hub_url:
+        description: Public URL of the aghub hub
+        required: true
+        type: string
+      hub_token:
+        description: Hub token scoped to this project
+        required: true
+        type: string
+      project:
+        description: Board project name
+        required: true
+        default: swarm-real
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: aghub-real-swarm-a
+  cancel-in-progress: false
+
+jobs:
+  machine:
+    name: ${{ matrix.agent }} (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      max-parallel: 5
+      matrix:
+        include:
+          - agent: a1
+            role: leader
+            lane: T-001
+            ghost: "0"
+            runner: ubuntu-22.04
+          - agent: a2
+            role: follower
+            lane: T-002
+            ghost: "0"
+            runner: ubuntu-24.04
+          - agent: a3
+            role: follower
+            lane: T-003
+            ghost: "0"
+            runner: ubuntu-22.04
+          - agent: a4
+            role: follower
+            lane: T-004
+            ghost: "0"
+            runner: ubuntu-24.04
+          - agent: a5
+            role: follower
+            lane: T-005
+            ghost: "0"
+            runner: ubuntu-22.04
+
+    steps:
+      - name: Check out the real-project swarm repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install aghub's only dependency and put its launcher on PATH
+        run: |
+          python -m pip install --quiet PyYAML
+          chmod +x bin/aghub
+          chmod +x swarm/agent.sh swarm/check.sh
+          echo "$GITHUB_WORKSPACE/bin" >> "$GITHUB_PATH"
+
+      - name: Join the board and run this machine's lane
+        env:
+          AGENT_NAME: ${{ matrix.agent }}
+          ROLE: ${{ matrix.role }}
+          LANE: ${{ matrix.lane }}
+          GHOST: ${{ matrix.ghost }}
+          HUB_URL: ${{ inputs.hub_url }}
+          HUB_TOKEN: ${{ inputs.hub_token }}
+          PROJECT: ${{ inputs.project }}
+        run: bash swarm/agent.sh
+
+      - name: Show the final board
+        if: always()
+        run: |
+          aghub status || true
+          git log --oneline -15 origin/main || true
+          node app/tests/run-tests.js || true
+          node app/tests/run-lanes.js || true
