@@ -30,6 +30,11 @@ SAFE_KEYS = (
     "TERM",
     "TZ",
     "SYSTEMROOT",
+    "WINDIR",
+    "COMSPEC",
+    "PATHEXT",
+    "NUMBER_OF_PROCESSORS",
+    "PROCESSOR_ARCHITECTURE",
     "TEMP",
     "TMP",
 )
@@ -52,6 +57,7 @@ def _bwrap_ok(path):
         [path, "--unshare-all", "--ro-bind", "/", "/", "--", "/bin/true"],
         capture_output=True,
         text=True,
+        errors="replace",
         timeout=5,
     )
     return probe.returncode == 0
@@ -146,6 +152,9 @@ def _safe_env(home, tmp):
         "HOME": home,
         "TMPDIR": tmp,
     }
+    if os.name == "nt":
+        # Keep the Windows home label inside the snapshot as well.
+        env["USERPROFILE"] = home
     for key in SAFE_KEYS:
         if key in os.environ:
             env[key] = os.environ[key]
@@ -175,7 +184,10 @@ def _limits(timeout):
     return apply
 
 
-def _execute(argv, cwd, env, timeout, sandbox, preexec=None, cleanup=None):
+def _execute(argv, cwd, env, timeout, sandbox, preexec=None, cleanup=None, shell=False):
+    options = {}
+    if preexec is not None and os.name != "nt":
+        options["preexec_fn"] = preexec
     proc = subprocess.Popen(
         argv,
         cwd=cwd,
@@ -183,8 +195,10 @@ def _execute(argv, cwd, env, timeout, sandbox, preexec=None, cleanup=None):
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        errors="replace",
         start_new_session=True,
-        preexec_fn=preexec,
+        shell=shell,
+        **options,
     )
     timed_out = False
     try:
@@ -192,9 +206,20 @@ def _execute(argv, cwd, env, timeout, sandbox, preexec=None, cleanup=None):
     except subprocess.TimeoutExpired:
         timed_out = True
         try:
-            os.killpg(proc.pid, signal.SIGKILL)
-        except OSError:
+            if os.name == "nt":
+                subprocess.run(
+                    ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                    capture_output=True,
+                    timeout=10,
+                )
+            else:
+                os.killpg(proc.pid, signal.SIGKILL)
+        except (AttributeError, OSError, subprocess.SubprocessError):
+            pass
+        try:
             proc.kill()
+        except OSError:
+            pass
         stdout, stderr = proc.communicate()
     finally:
         if cleanup:
@@ -214,11 +239,12 @@ def run(command, repo, timeout=300, mode="auto"):
         raise AghubError(f"unknown sandbox mode '{mode}'")
     if mode == "off":
         return _execute(
-            ["/bin/sh", "-c", command],
+            command,
             repo,
             None,
             timeout,
             {"mode": "off", "backend": "none", "network": "host", "snapshot": False},
+            shell=True,
         )
 
     bwrap = bubblewrap()
@@ -305,13 +331,14 @@ def run(command, repo, timeout=300, mode="auto"):
     }
     try:
         return _execute(
-            ["/bin/sh", "-c", command],
+            command,
             work,
             env,
             timeout,
             metadata,
             preexec=_limits(timeout),
             cleanup=work,
+            shell=True,
         )
     except OSError as exc:
         shutil.rmtree(work, ignore_errors=True)

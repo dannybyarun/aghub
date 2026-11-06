@@ -1,5 +1,6 @@
 import json
 import os
+import shlex
 import shutil
 import socket
 import subprocess
@@ -17,8 +18,23 @@ ROOT = Path(__file__).resolve().parents[1]
 PYTHONPATH = str(ROOT / "src")
 sys.path.insert(0, PYTHONPATH)
 
+
+def py(code):
+    """A Python one-liner that survives the platform shell used by the sandbox."""
+    if os.name == "nt":
+        escaped = code.replace('"', '\\"')
+        return f'"{sys.executable}" -c "{escaped}"'
+    return f"{shlex.quote(sys.executable)} -c {shlex.quote(code)}"
+
+
+def py_script(name):
+    """Run a script with the interpreter running the tests."""
+    if os.name == "nt":
+        return f'"{sys.executable}" {name}'
+    return f"{shlex.quote(sys.executable)} {name}"
+
 from aghub import github, hubclient, render  # noqa: E402
-from aghub.board import Board  # noqa: E402
+from aghub.board import Board, ensure_local_agent_key  # noqa: E402
 from aghub.hub import build_server  # noqa: E402
 
 CONTRACT = """\
@@ -130,7 +146,8 @@ class AghubTestCase(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def bootstrap(self, ttl=60, check="python3 check.py"):
+    def bootstrap(self, ttl=60, check=None):
+        check = check or py_script("check.py")
         w = self.world
         w.aghub("fe", "init", "--project", "test", "--ttl", str(ttl), "--check", check, agent="fe-1")
         w.aghub("fe", "contract", "freeze", "api", "1", "--from", "contracts/api.yaml", agent="fe-1")
@@ -165,6 +182,46 @@ class AghubTestCase(unittest.TestCase):
         after = len(git(board_dir, "log", "--oneline").stdout.splitlines())
         self.assertEqual(after - before, 1, "import should be a single board commit")
         self.assertIn("import 3 task(s)", git(board_dir, "log", "-1", "--format=%s").stdout)
+
+    def test_task_paths_accept_a_comma_separated_glob(self):
+        w = self.world
+        w.aghub("fe", "init", "--project", "test", agent="fe-1")
+        out = w.aghub(
+            "fe",
+            "task",
+            "add",
+            "Both",
+            "--paths",
+            "src/a/**,src/b/**",
+            agent="fe-1",
+        )
+        self.assertIn("src/a/**", out.stdout)
+        self.assertIn("src/b/**", out.stdout)
+        state = json.loads(w.aghub("fe", "status", "--json", agent="fe-1").stdout)
+        self.assertEqual(state["tasks"][0]["paths"], ["src/a/**", "src/b/**"])
+
+    def test_signing_publishes_a_key_created_before_joining_a_board(self):
+        w = self.world
+        w.aghub("fe", "init", "--project", "test", agent="fe-1")
+        # A clone can already hold a key that this board has never seen, for
+        # example when the key was created before a shard was initialized.
+        entry = ensure_local_agent_key(str(Path(w.fe) / ".git"), "fe-1")
+        w.aghub("fe", "task", "add", "Signed", agent="fe-1")
+
+        state = json.loads(w.aghub("fe", "status", "--json", agent="fe-1").stdout)
+        self.assertEqual(state["agents"][0]["public_key"], entry["public_key"])
+        verified = w.aghub("fe", "verify")
+        self.assertIn("signed", verified.stdout.lower())
+        self.assertNotIn("BROKEN", verified.stdout)
+
+    def test_joining_a_board_with_a_different_project_name_is_refused(self):
+        w = self.world
+        w.aghub("fe", "init", "--project", "test", agent="fe-1")
+        proc = w.aghub(
+            "be", "init", "--project", "other", agent="be-1", check=False
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("already belongs to project 'test'", proc.stderr)
 
     def test_sharded_boards_are_independent(self):
         w = self.world
@@ -359,7 +416,7 @@ class AghubTestCase(unittest.TestCase):
             "--project",
             "test",
             "--check",
-            "python3 check.py",
+            py_script("check.py"),
             "--eval-ttl",
             "0",
             agent="fe-1",
@@ -392,7 +449,7 @@ class AghubTestCase(unittest.TestCase):
             "run",
             "smoke",
             "--command",
-            "python3 -c 'print(\"ok\")'",
+            py('print("ok")'),
             agent="fe-1",
         )
         self.assertIn("attested  hmac-sha256", passed.stdout)
@@ -429,7 +486,7 @@ class AghubTestCase(unittest.TestCase):
             "run",
             "smoke",
             "--command",
-            "python3 -c 'print(\"ok\")'",
+            py('print("ok")'),
             agent="be-1",
         )
         self.assertIn("passed", passed.stdout)
@@ -442,7 +499,7 @@ class AghubTestCase(unittest.TestCase):
         self.assertEqual(latest["suite"], "smoke")
         self.assertEqual(latest["agent"], "be-1")
         self.assertTrue(latest["passed"])
-        self.assertEqual(latest["machine"], os.uname().nodename)
+        self.assertEqual(latest["machine"], socket.gethostname())
         self.assertEqual(latest["attestation"]["scheme"], "ed25519")
         self.assertIn(latest["sandbox"]["backend"], ("bubblewrap", "copy"))
         self.assertTrue(latest["sandbox"]["snapshot"])
@@ -479,7 +536,7 @@ class AghubTestCase(unittest.TestCase):
             "run",
             "lint",
             "--command",
-            "python3 -c 'import sys; sys.exit(2)'",
+            py("import sys; sys.exit(2)"),
             agent="be-1",
             check=False,
         )
@@ -508,7 +565,7 @@ class AghubTestCase(unittest.TestCase):
             "run",
             "smoke",
             "--command",
-            "python3 -c 'print(\"ok\")'",
+            py('print("ok")'),
             agent="be-1",
         )
         first_id = first.stdout.split()[1]
@@ -539,7 +596,7 @@ class AghubTestCase(unittest.TestCase):
             "run",
             "smoke",
             "--command",
-            "python3 -c 'print(\"ok\")'",
+            py('print("ok")'),
             agent="be-1",
         )
         first_id = first.stdout.split()[1]
@@ -566,7 +623,7 @@ class AghubTestCase(unittest.TestCase):
             "run",
             "smoke",
             "--command",
-            "python3 -c 'print(\"again\")'",
+            py('print("again")'),
             agent="be-1",
         )
         second_id = second.stdout.split()[1]
@@ -598,7 +655,7 @@ class AghubTestCase(unittest.TestCase):
             "run",
             "smoke",
             "--command",
-            "python3 -c 'print(\"ok\")'",
+            py('print("ok")'),
             agent="be-1",
         )
         w.aghub("be", "claim", "T-003", agent="be-1")
@@ -610,7 +667,7 @@ class AghubTestCase(unittest.TestCase):
             "run",
             "smoke",
             "--command",
-            "python3 -c 'import sys; sys.exit(1)'",
+            py("import sys; sys.exit(1)"),
             agent="be-1",
             check=False,
         )
@@ -912,7 +969,7 @@ class AghubTestCase(unittest.TestCase):
             "run",
             "smoke",
             "--command",
-            "python3 -c 'print(1)'",
+            py("print(1)"),
             agent="fe-1",
         )
         eval_id = first.stdout.split()[1]
@@ -928,7 +985,7 @@ class AghubTestCase(unittest.TestCase):
             "run",
             "smoke",
             "--command",
-            "python3 -c 'print(1)'",
+            py("print(1)"),
             agent="fe-1",
             check=False,
         )
@@ -942,7 +999,7 @@ class AghubTestCase(unittest.TestCase):
             "run",
             "smoke",
             "--command",
-            "python3 -c 'print(1)'",
+            py("print(1)"),
             agent="fe-1",
         )
         self.assertIn("passed", again.stdout)
@@ -1878,7 +1935,7 @@ class AghubTestCase(unittest.TestCase):
 
     def test_protected_paths_condition_the_approval_on_the_patch(self):
         w = self.world
-        w.aghub("fe", "init", "--project", "gate", "--check", "python3 check.py", agent="fe-1")
+        w.aghub("fe", "init", "--project", "gate", "--check", py_script("check.py"), agent="fe-1")
         w.aghub("fe", "acl", "init", agent="fe-1")
         w.aghub("fe", "acl", "set", "sec-1", "admin", agent="fe-1")
         w.aghub("be", "init", "--project", "gate", agent="be-1")

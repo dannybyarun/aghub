@@ -13,6 +13,8 @@ def git(args, cwd=None, check=True, input=None, timeout=180):
             input=input,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=timeout,
         )
     except FileNotFoundError:

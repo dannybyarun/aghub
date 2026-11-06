@@ -17,6 +17,26 @@ from .errors import AghubError
 HTTP_METHODS = ("get", "put", "post", "delete", "options", "head", "patch", "trace")
 
 
+class _ContractLoader(yaml.SafeLoader):
+    """SafeLoader without implicit timestamp parsing.
+
+    An unquoted date such as `example: 2026-01-01` is valid YAML but becomes a
+    `datetime.date`, which is neither valid JSON on the board nor a string in
+    generated code. OpenAPI has no date scalar, so keep every timestamp
+    implicit as the string the author wrote.
+    """
+
+
+_ContractLoader.yaml_implicit_resolvers = {
+    key: [
+        (tag, pattern)
+        for tag, pattern in patterns
+        if tag != "tag:yaml.org,2002:timestamp"
+    ]
+    for key, patterns in yaml.SafeLoader.yaml_implicit_resolvers.items()
+}
+
+
 # -- contract model ------------------------------------------------------
 
 
@@ -26,7 +46,7 @@ def load_spec(blob):
     except UnicodeDecodeError as exc:
         raise AghubError(f"contract artifact is not UTF-8: {exc}") from exc
     try:
-        spec = yaml.safe_load(text)
+        spec = yaml.load(text, Loader=_ContractLoader)
     except yaml.YAMLError as exc:
         raise AghubError(f"contract artifact is not valid YAML/JSON: {exc}") from exc
     if spec is None:
@@ -1336,7 +1356,8 @@ def _body_error(
             return where + ": expected object"
         for key in schema.get("required") or []:
             if key not in value:
-                return where + ": missing required property " + _json.dumps(key)
+                pointer = f"{path}/{key}"
+                return pointer + ": missing required property " + _json.dumps(key)
         properties = schema.get("properties")
         if not isinstance(properties, dict):
             properties = {}

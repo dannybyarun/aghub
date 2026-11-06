@@ -22,6 +22,11 @@ def git(repo, *args):
     )
 
 
+def py(code):
+    """A shell command that runs Python with platform-appropriate quoting."""
+    return f'"{sys.executable}" -c "{code}"'
+
+
 class SandboxTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="aghub-sandbox-test-")
@@ -69,9 +74,11 @@ class SandboxTests(unittest.TestCase):
         os.environ["AGHUB_SANDBOX_SECRET"] = "do-not-leak"
         try:
             result = sandbox.run(
-                "python3 -c 'import os; print(os.getcwd()); "
-                "print(os.getenv(\"AGHUB_SANDBOX_SECRET\")); "
-                "open(\"created.txt\", \"w\").write(\"inside\")'",
+                py(
+                    "import os; print(os.getcwd()); "
+                    "print(os.getenv('AGHUB_SANDBOX_SECRET')); "
+                    "open('created.txt', 'w').write('inside')"
+                ),
                 str(self.repo),
                 timeout=30,
             )
@@ -87,9 +94,9 @@ class SandboxTests(unittest.TestCase):
 
     def test_timeout_is_reported_and_cleaned_up(self):
         result = sandbox.run(
-            "python3 -c 'import time; time.sleep(10)'",
+            py("import time; time.sleep(10)"),
             str(self.repo),
-            timeout=0.5,
+            timeout=1,
         )
         self.assertTrue(result.timed_out)
         self.assertEqual(result.exit_code, 124)
@@ -101,7 +108,7 @@ class SandboxTests(unittest.TestCase):
 
     def test_off_mode_runs_in_the_checkout(self):
         result = sandbox.run(
-            "python3 -c 'import os; print(os.getcwd())'",
+            py("import os; print(os.getcwd())"),
             str(self.repo),
             timeout=30,
             mode="off",

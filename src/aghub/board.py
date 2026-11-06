@@ -713,6 +713,24 @@ class Board:
         entry = local_agent_key(self.common, agent)
         if not entry or not entry.get("private_key") or not entry.get("public_key"):
             return
+        profile = state.agents.get(agent) or {}
+        fingerprint = keys.key_id(entry["public_key"])
+        revoked = {
+            str(item.get("key_id") if isinstance(item, dict) else item)
+            for item in profile.get("revoked_key_ids") or []
+        }
+        if fingerprint in revoked:
+            # A revoked key must not sign new events; eval attestation reports
+            # the revocation to the user instead.
+            return
+        if not profile.get("public_key"):
+            from . import service
+
+            # A signature is only useful if the board publishes the matching
+            # key. `agent --key` normally does this, but a key created before
+            # joining a shard (or a board) would otherwise sign events that can
+            # never verify.
+            service.register_agent_key(state, agent, entry["public_key"])
         for event in state.new_events:
             if event.get("signature") or not event.get("hash"):
                 continue
@@ -888,6 +906,13 @@ def init_board(
         board = Board(repo, common, target, remote, branch=branch)
 
     def ensure(state):
+        existing_name = (state.project or {}).get("name")
+        if existing_name and existing_name != project:
+            raise AghubError(
+                f"the board already belongs to project '{existing_name}', not "
+                f"'{project}'; a remote hosts one board, so use a separate "
+                f"remote or a board shard"
+            )
         if not state.project:
             state.project = {
                 "name": project,

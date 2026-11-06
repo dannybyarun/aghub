@@ -151,6 +151,27 @@ class CodegenTests(unittest.TestCase):
             diff["schemas_changed"]["Item"]["properties_removed"], ["state"]
         )
 
+    def test_yaml_dates_are_kept_as_strings(self):
+        spec = codegen.load_spec(
+            b"openapi: 3.0.0\n"
+            b"info: {title: Items, version: '1'}\n"
+            b"paths:\n"
+            b"  /items:\n"
+            b"    get:\n"
+            b"      responses:\n"
+            b"        '200':\n"
+            b"          description: ok\n"
+            b"          content:\n"
+            b"            application/json:\n"
+            b"              example: 2026-01-01\n"
+        )
+        example = spec["paths"]["/items"]["get"]["responses"]["200"]["content"][
+            "application/json"
+        ]["example"]
+        self.assertEqual(example, "2026-01-01")
+        self.assertIsInstance(example, str)
+        json.dumps(spec)  # the board snapshots contracts as JSON
+
     def test_invalid_artifact_is_rejected(self):
         with self.assertRaises(AghubError):
             codegen.load_spec(b"[1, 2, 3]")
@@ -483,6 +504,11 @@ class CodegenRequestBodyTests(unittest.TestCase):
             with self.assertRaises(ValueError) as caught:
                 client._check_body("POST", "/items", body)
             self.assertIn(expected, str(caught.exception))
+        with self.assertRaises(ValueError) as missing:
+            client._check_body("POST", "/items", {"qty": 1})
+        self.assertIn(
+            "/name: missing required property", str(missing.exception)
+        )
         with self.assertRaises(ValueError) as caught:
             client._check_body("POST", "/items", module["_UNSET"])
         self.assertIn("missing required request body", str(caught.exception))
@@ -514,7 +540,7 @@ class CodegenRequestBodyTests(unittest.TestCase):
             "POST", "/items", b'{"qty":2}', "application/json"
         )
         self.assertEqual(problem["error"], "invalid request body")
-        self.assertEqual(problem["path"], "/")
+        self.assertEqual(problem["path"], "/name")
         self.assertIn("name", problem["detail"])
         self.assertEqual(
             mock["validate_body"]("POST", "/items", b"{}", "text/plain")[
@@ -584,7 +610,7 @@ class CodegenRequestBodyTests(unittest.TestCase):
             payload = json.load(caught.exception)
             caught.exception.close()
             self.assertEqual(payload["error"], "invalid request body")
-            self.assertEqual(payload["path"], "/")
+            self.assertEqual(payload["path"], "/name")
         finally:
             server.shutdown()
             server.server_close()

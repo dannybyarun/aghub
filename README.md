@@ -43,7 +43,8 @@ Claims are advisory at write time (fast, works offline, catches most races). The
 ## Quick start
 
 Requires Python 3.10+ and `git`. On Windows, run `python -m aghub` with `src`
-on `PYTHONPATH`; the `bin/aghub` wrapper is a bash script.
+on `PYTHONPATH`; the `bin/aghub` wrapper is a bash script. Eval and merge-check
+commands run through `cmd.exe` there; the Bubblewrap backend remains POSIX-only.
 
 ```bash
 python3 -m pip install -r requirements.txt
@@ -257,9 +258,14 @@ Git cannot arbitrate a race that happens in the next two seconds. The hub can.
 
 ```bash
 aghub hub serve --port 8787 --db ~/.aghub/hub.db   # once, anywhere reachable
+aghub init --project my-app                        # per clone, before connecting
 aghub hub connect http://hub-a:8787 http://hub-b:8787   # per clone; first is primary
 aghub hub status
 ```
+
+`hub connect` stores the URL in the clone's local config, so it needs an
+initialized board. Each remote hosts one board; use `--shard` or a separate
+remote for an unrelated project.
 
 - **Leases are authoritative at write time.** `claim` asks the hub first. A 409 aborts the claim; a grant carries a fencing token that increases on every lease. Heartbeats extend the lease.
 - **Board writes can take a writer lease.** When a hub is configured, every `Board.transaction` acquires a project-scoped, TTL-bounded writer lease before it fetches, mutates, pushes and publishes. The lease carries a fencing token, is released in a `finally` block, and a stale token cannot publish a snapshot. A busy lease is waited on; an unreachable hub falls back to the original optimistic retry loop.
@@ -996,7 +1002,7 @@ projects and delete their own rows; still, point them at a scratch database.
 - **The merge check is sandboxed by default but is still not a security boundary.** `submit`/`queue run` execute `project.check` through the same sandbox runner as evals (`auto` uses Bubblewrap, otherwise a scrubbed snapshot). `--check-sandbox off` and `--sandbox off` intentionally opt out. Traces are signed evidence, not proof of isolation; re-run the command to reproduce.
 - **Codegen covers an OpenAPI subset.** Paths, methods, `operationId`, component schemas, `$ref`, arrays, enums, unions, examples, common scalar formats, parameters (path/query/header with `required` and `enum`), request bodies (required properties, types, enums, compositions, array/string/number bounds, and `additionalProperties`), `http`/`apiKey` security schemes, and a dialect-aware starting SQL migration (`postgres`, `sqlite`, `mysql`). `format`, `pattern`, `multipleOf`, `uniqueItems`, remote `$ref`s, and discriminator/oauth2 flows are not validated, `oneOf` is treated as "at least one", and only JSON media types are schema-checked; callbacks and non-JSON bodies pass through as opaque values.
 - **Eval fingerprints identify an input, not a whole environment.** They cover command, suite, commit, tree, dirty/untracked input, and timeout. `eval rerun` compares fingerprints but does not pin toolchain or container images, and ignored files are not hashed.
-- **The eval sandbox is pragmatic.** The snapshot omits ignored files such as `.venv` or `node_modules`, so a command that needs them must install them inside the eval or use `--sandbox off`. Bubblewrap is optional and detected at runtime; without it, the fallback hides the environment but not the host filesystem or network.
+- **The eval sandbox is pragmatic.** The snapshot omits ignored files such as `.venv` or `node_modules`, so a command that needs them must install them inside the eval or use `--sandbox off`. Bubblewrap is optional and detected at runtime; without it, the fallback hides the environment but not the host filesystem or network. On Windows the fallback runs commands through `cmd.exe` and skips the POSIX resource limits, so treat it as isolation from the environment and the checkout, not from the host.
 - **Evals are still local and BYOK.** The platform records the command, sandbox policy, scorecard, and freshness; it does not verify the machine or reproduce the environment.
 - **Scope is a path prefix.** `--scope packages/web` keeps tasks and merged changes inside that subtree. It does not model nested projects, independent remotes, or workspace-level dependency graphs.
 - **Agents must commit.** The queue merges branches; it does not snapshot working trees.

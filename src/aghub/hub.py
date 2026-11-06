@@ -26,6 +26,7 @@ from .ulid import new_ulid
 from .util import ago_iso, in_iso, now_iso
 
 MAX_BODY_BYTES = 16 * 1024 * 1024
+DRAIN_BYTES = 1024 * 1024
 MAX_PACKET_BYTES = 4 * 1024 * 1024
 MAX_REVIEW_NOTE = 4000
 REVIEW_DECISIONS = ("approved", "changes_requested")
@@ -1486,6 +1487,15 @@ class Handler(BaseHTTPRequestHandler):
 
     def _events(self, project, last_event_id=None):
         """Server-sent board updates. One thread per browser connection."""
+        try:
+            self._stream_events(project, last_event_id)
+        except (OSError, sqlite3.ProgrammingError):
+            # The browser or proxy hung up; nothing left to do.
+            pass
+        finally:
+            self.close_connection = True
+
+    def _stream_events(self, project, last_event_id=None):
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
         self.send_header("Cache-Control", "no-cache, no-transform")
@@ -1508,30 +1518,25 @@ class Handler(BaseHTTPRequestHandler):
                 )
 
         last_ping = time.monotonic()
-        try:
-            while True:
-                data = self.server.store.board(project)
-                signature = (
-                    json.dumps(data, sort_keys=True, separators=(",", ":"))
-                    if data is not None
-                    else None
-                )
-                if signature != last:
-                    last = signature
-                    if data is None:
-                        self._sse("waiting", {"project": project})
-                    else:
-                        self._sse("board", data, event_id=data.get("seq"))
-                now = time.monotonic()
-                if now - last_ping >= 15:
-                    self.wfile.write(b": keepalive\n\n")
-                    self.wfile.flush()
-                    last_ping = now
-                time.sleep(1)
-        except (OSError, sqlite3.ProgrammingError):
-            pass
-        finally:
-            self.close_connection = True
+        while True:
+            data = self.server.store.board(project)
+            signature = (
+                json.dumps(data, sort_keys=True, separators=(",", ":"))
+                if data is not None
+                else None
+            )
+            if signature != last:
+                last = signature
+                if data is None:
+                    self._sse("waiting", {"project": project})
+                else:
+                    self._sse("board", data, event_id=data.get("seq"))
+            now = time.monotonic()
+            if now - last_ping >= 15:
+                self.wfile.write(b": keepalive\n\n")
+                self.wfile.flush()
+                last_ping = now
+            time.sleep(1)
 
     def _sse(self, event, payload, event_id=None):
         body = json.dumps(payload, separators=(",", ":"))
@@ -1972,12 +1977,23 @@ class Handler(BaseHTTPRequestHandler):
         if token_max > 0:
             maximum = min(maximum, token_max)
         if length > maximum:
+            # Discard a bounded amount of the rejected body first. Closing a
+            # socket with unread bytes makes Windows send a reset, which can
+            # hide the 413 from the client.
+            self._drain(min(length, DRAIN_BYTES))
             raise AghubError(f"request body exceeds {maximum} bytes")
         raw = self.rfile.read(length)
         try:
             return json.loads(raw.decode("utf-8"))
         except ValueError:
             raise AghubError("request body must be JSON")
+
+    def _drain(self, remaining):
+        while remaining > 0:
+            chunk = self.rfile.read(min(remaining, 65536))
+            if not chunk:
+                break
+            remaining -= len(chunk)
 
     def _identity(self, query):
         tokens = getattr(self.server, "tokens", {}) or {}

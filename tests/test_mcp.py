@@ -1,6 +1,7 @@
 import io
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -11,6 +12,14 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from aghub import mcp  # noqa: E402
+
+
+def py(code):
+    """A Python one-liner that survives the platform shell."""
+    if os.name == "nt":
+        escaped = code.replace('"', '\\"')
+        return f'"{sys.executable}" -c "{escaped}"'
+    return f"{shlex.quote(sys.executable)} -c {shlex.quote(code)}"
 
 
 def git(repo, *args):
@@ -152,7 +161,7 @@ class McpTests(unittest.TestCase):
             "aghub_eval_run",
             {
                 "suite": "smoke",
-                "command": "python3 -c 'print(1)'",
+                "command": py("print(1)"),
                 "timeout": 30,
             },
         )

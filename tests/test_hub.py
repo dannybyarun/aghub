@@ -814,27 +814,28 @@ class HubHttpTests(unittest.TestCase):
         )
 
     def test_quota_is_shared_across_hubs(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            db = str(Path(tmp) / "hub.db")
-            tokens = {
-                "tenant": {
-                    "role": "writer",
-                    "projects": ["tenant"],
-                    "name": "tenant",
-                    "quota": {"requests_per_minute": 2},
-                }
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        db = str(Path(tmp.name) / "hub.db")
+        tokens = {
+            "tenant": {
+                "role": "writer",
+                "projects": ["tenant"],
+                "name": "tenant",
+                "quota": {"requests_per_minute": 2},
             }
-            _, _, first = self._local_server(
-                db=db, token="root", tokens=tokens, rate_limit=0
-            )
-            _, _, second = self._local_server(
-                db=db, token="root", tokens=tokens, rate_limit=0
-            )
+        }
+        _, _, first = self._local_server(
+            db=db, token="root", tokens=tokens, rate_limit=0
+        )
+        _, _, second = self._local_server(
+            db=db, token="root", tokens=tokens, rate_limit=0
+        )
+        hubclient.projects(first, token="tenant")
+        hubclient.projects(second, token="tenant")
+        with self.assertRaises(hubclient.HubError) as limited:
             hubclient.projects(first, token="tenant")
-            hubclient.projects(second, token="tenant")
-            with self.assertRaises(hubclient.HubError) as limited:
-                hubclient.projects(first, token="tenant")
-            self.assertIn("token quota", str(limited.exception))
+        self.assertIn("token quota", str(limited.exception))
 
     def test_per_token_audit_export(self):
         _, _, base = self._local_server(

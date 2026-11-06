@@ -1174,12 +1174,15 @@ def cmd_task(args):
     state = board.load()
     agent = _resolve_agent(args, read_local_config(board.common))
     if args.task_command == "add":
+        paths = []
+        for value in args.paths:
+            paths.extend(part.strip() for part in value.split(",") if part.strip())
         task = board.transaction(
             f"add {args.title}",
             lambda current: service.add_task(
                 current,
                 args.title,
-                args.paths,
+                paths,
                 args.contract,
                 args.depends,
                 args.acceptance,
@@ -2630,7 +2633,7 @@ def build_parser():
     task_sub = task.add_subparsers(dest="task_command", required=True)
     task_add = task_sub.add_parser("add")
     task_add.add_argument("title")
-    task_add.add_argument("--paths", action="append", default=[], help="glob this task may write")
+    task_add.add_argument("--paths", action="append", default=[], help="glob this task may write (repeat, or comma-separate)")
     task_add.add_argument("--contract", action="append", default=[], help="contract dependency, e.g. api@1")
     task_add.add_argument("--depends", action="append", default=[], help="task dependency")
     task_add.add_argument(
