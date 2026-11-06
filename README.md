@@ -1,10 +1,17 @@
 # aghub
 
-**A shared board so parallel coding agents can work on one repo without talking to each other.**
+**Git-native coordination for parallel coding agents. Leases on the hub, history on the branch.**
+
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](pyproject.toml)
 
 Two agents, two clones, one project. One takes the backend, one takes the frontend. Neither sends a message. They read a board, claim a lane, build against a frozen contract, and hand off in writing.
 
-This is a working vertical slice of that protocol: the board, claims, contracts, handoffs, codegen from frozen contracts, a serial merge queue that turns failures into trace-carrying tasks, locally signed and sandboxed evals, hash-chained board history, project ACLs, human review inboxes and approval gates with board-wide reviewer policy, a web review workspace, a GitHub pull-request bridge with App auth and signed webhooks, an MCP server and Python SDK, and a hub that arbitrates live leases, serializes board writes with a TTL-bounded writer lease, and serves a web board.
+`aghub` is that protocol end to end: a board on an orphan git branch, path claims, frozen contracts with codegen, written handoffs, a serial merge queue that turns failures into trace-carrying tasks, signed and sandboxed evals, hash-chained history, project ACLs, review inboxes and approval gates, a GitHub pull-request bridge, an MCP server and Python SDK, and an optional hub that arbitrates live leases, serializes board writes with a TTL-bounded writer lease, and serves a web board.
+
+> **The split that matters:** claims are advisory in git and authoritative on the hub; the merge queue is the backstop either way. Git is the durable record, not the lock.
+
+**Evidence:** a [ten-machine, two-account run](docs/REAL-PROJECT-10-MACHINE.md) on a real 414-file project, with the project's own test suite as the merge gate — 11 tasks merged, 41 core + 79 lane tests passing on a fresh clone, 0 failed, 0 retries. A [ten-way race](docs/REAL-PROJECT-10-MACHINE.md#5-one-winner-from-ten-simultaneous-claims) produced one winner, and a [hub-only lease](docs/REAL-PROJECT-10-MACHINE.md#4-why-the-hub-mattered-the-ghost-lease) blocked a claim that git could not see. The [accessible version](demo/run_swarm.sh) runs locally at 10, 20, or 50 agents.
 
 ```
 $ aghub status
@@ -47,8 +54,15 @@ on `PYTHONPATH`; the `bin/aghub` wrapper is a bash script. Eval and merge-check
 commands run through `cmd.exe` there; the Bubblewrap backend remains POSIX-only.
 
 ```bash
+python3 -m pip install .   # installs the `aghub` command
+aghub --help
+```
+
+Or run from a checkout without installing:
+
+```bash
 python3 -m pip install -r requirements.txt
-export PATH="$PWD/bin:$PATH"
+export PATH="$PWD/bin:$PATH"   # Windows: use `python -m aghub`
 
 # in a repo with a shared remote
 aghub init --project my-app --check "npm test"
@@ -978,6 +992,13 @@ AGHUB_TEST_POSTGRES_DSN='postgresql://postgres@127.0.0.1:5432/aghub_test' \
 They cover store and HTTP behavior, claim and board-writer-lock races, and
 concurrent first startup against an empty schema. The tests use uniquely named
 projects and delete their own rows; still, point them at a scratch database.
+
+## Documentation
+
+- [Ten machines, one board](docs/REAL-PROJECT-10-MACHINE.md) — the real-world validation run.
+- [Why chat doesn't coordinate parallel agents](docs/blog/why-chat-doesnt-coordinate-agents.md) — the design argument.
+- [Docker demo](demo/docker/README.md) — three agent containers, one board.
+- [Contributing](CONTRIBUTING.md) · [Security policy](SECURITY.md)
 
 ## Known limits (on purpose)
 

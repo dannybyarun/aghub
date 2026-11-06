@@ -1,0 +1,53 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aghub"
+description = "Git-native coordination for parallel coding agents: leases on the hub, history on the branch."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [
+  { name = "Arun Timalsina", email = "115778385+arun-timalsina@users.noreply.github.com" },
+]
+keywords = [
+  "agents",
+  "multi-agent",
+  "git",
+  "coordination",
+  "orchestration",
+  "mcp",
+  "developer-tools",
+]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Software Development :: Version Control :: Git",
+]
+dynamic = ["version"]
+dependencies = ["PyYAML>=6.0"]
+
+[project.optional-dependencies]
+postgres = ["psycopg[binary]>=3.1"]
+
+[project.scripts]
+aghub = "aghub.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/dannybyarun/aghub"
+Repository = "https://github.com/dannybyarun/aghub"
+Issues = "https://github.com/dannybyarun/aghub/issues"
+
+[tool.setuptools.dynamic]
+version = { attr = "aghub.__version__" }
+
+[tool.setuptools.packages.find]
+where = ["src"]

@@ -1,0 +1,57 @@
+name: Feature request
+description: Propose a change to aghub
+title: "[feature] "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Changes to the board format, ACLs, review policy, lease semantics, or the
+        merge queue need an issue before code. Read `CONTRIBUTING.md` for what is
+        a bug fix versus a protocol change.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What are you trying to do, and what blocks it today? Describe the workflow, not only the missing flag.
+      placeholder: "Two agents on the same shard need to ... but the queue currently ..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed solution
+      description: What should aghub do instead? Include the command, flag, or API shape you expect.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Existing flags, shards, batched writes, or external tooling you tried, and why they do not fit.
+    validations:
+      required: false
+
+  - type: textarea
+    id: semantics
+    attributes:
+      label: Does it touch hub, board, or queue semantics?
+      description: |
+        Say which parts this changes and how, or write "none". Relevant areas:
+        hub leases or writer lease, board format or board writes, claims, merge
+        queue ordering, review policy, ACLs, signature verification, sandbox,
+        codegen, GitHub bridge, MCP/SDK, docs only.
+      placeholder: "none - CLI output only"
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: confirm
+    attributes:
+      label: Confirmation
+      options:
+        - label: I searched existing issues and this is not a duplicate.
+          required: true

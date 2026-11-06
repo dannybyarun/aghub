@@ -1,0 +1,85 @@
+name: Bug report
+description: Report a reproducible bug in aghub
+title: "[bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not report security vulnerabilities here. See the `SECURITY.md` file
+        in this repository and use a private security advisory instead.
+
+  - type: input
+    id: version
+    attributes:
+      label: aghub version or commit
+      description: Release tag, or the commit you are running (`git rev-parse --short HEAD`).
+      placeholder: "0.x.y or commit SHA"
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      description: OS and version, including WSL or Git Bash if relevant.
+      placeholder: "Ubuntu 24.04, macOS 15.1, Windows 11"
+    validations:
+      required: true
+
+  - type: input
+    id: python
+    attributes:
+      label: Python version
+      description: Output of `python3 --version`.
+      placeholder: "Python 3.12.4"
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: The smallest sequence of commands and repository state that reproduces the bug.
+      placeholder: |
+        1. aghub init --project demo
+        2. aghub task add "Example" --paths 'src/**'
+        3. ...
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: What you expected to happen.
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: What happened instead. Include the exit code.
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs and trace
+      description: Relevant output. Redact tokens, keys, and private URLs. Set `AGHUB_TRACE_BOARD=1` for board lease and retry detail.
+      render: shell
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: confirm
+    attributes:
+      label: Confirmation
+      options:
+        - label: I searched existing issues and this is not a duplicate.
+          required: true
+        - label: This is not a security vulnerability, and I have not included secrets or private keys.
+          required: true

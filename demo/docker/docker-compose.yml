@@ -1,0 +1,116 @@
+name: aghub-demo
+
+x-image: &image
+  build:
+    context: ../..
+    dockerfile: demo/docker/Dockerfile
+
+services:
+  seed:
+    <<: *image
+    entrypoint: ["/bin/bash", "/opt/aghub/demo/docker/seed.sh"]
+    environment:
+      AGHUB_PROJECT: demo
+    volumes:
+      - repos:/repos
+    restart: "no"
+
+  hub:
+    <<: *image
+    entrypoint: ["/bin/bash", "/opt/aghub/demo/docker/hub.sh"]
+    environment:
+      AGHUB_HUB_TOKEN: demo
+    ports:
+      - "${AGHUB_DEMO_PORT:-8788}:8788"
+    volumes:
+      - hubdata:/hubdata
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - import urllib.request; urllib.request.urlopen('http://127.0.0.1:8788/api/health', timeout=2)
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 2s
+
+  agent-a:
+    <<: *image
+    entrypoint: ["/bin/bash", "/opt/aghub/demo/docker/agent.sh"]
+    environment: &agent-env
+      AGHUB_PROJECT: demo
+      AGHUB_HUB_TOKEN: demo
+      HUB_URL: http://hub:8788
+      AGENT_NAME: alpha
+      TASK_ID: T-001
+      LANE: a
+    volumes:
+      - work:/work
+      - repos:/repos
+    depends_on:
+      seed:
+        condition: service_completed_successfully
+      hub:
+        condition: service_healthy
+    restart: "no"
+
+  agent-b:
+    <<: *image
+    entrypoint: ["/bin/bash", "/opt/aghub/demo/docker/agent.sh"]
+    environment:
+      <<: *agent-env
+      AGENT_NAME: beta
+      TASK_ID: T-002
+      LANE: b
+    volumes:
+      - work:/work
+      - repos:/repos
+    depends_on:
+      seed:
+        condition: service_completed_successfully
+      hub:
+        condition: service_healthy
+    restart: "no"
+
+  agent-c:
+    <<: *image
+    entrypoint: ["/bin/bash", "/opt/aghub/demo/docker/agent.sh"]
+    environment:
+      <<: *agent-env
+      AGENT_NAME: gamma
+      TASK_ID: T-003
+      LANE: c
+    volumes:
+      - work:/work
+      - repos:/repos
+    depends_on:
+      seed:
+        condition: service_completed_successfully
+      hub:
+        condition: service_healthy
+    restart: "no"
+
+  merger:
+    <<: *image
+    entrypoint: ["/bin/bash", "/opt/aghub/demo/docker/merger.sh"]
+    environment:
+      AGHUB_PROJECT: demo
+      AGHUB_HUB_TOKEN: demo
+      HUB_URL: http://hub:8788
+    volumes:
+      - work:/work
+      - repos:/repos
+    depends_on:
+      agent-a:
+        condition: service_completed_successfully
+      agent-b:
+        condition: service_completed_successfully
+      agent-c:
+        condition: service_completed_successfully
+    restart: "no"
+
+volumes:
+  repos:
+  hubdata:
+  work:

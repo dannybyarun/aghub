@@ -184,11 +184,13 @@ class FakeGitHub:
 
 class GitHubTests(unittest.TestCase):
     def test_event_kind_and_pull_request_info(self):
-        self.assertEqual(github.event_kind({"pull_request": {}}), "pull_request")
-        self.assertEqual(
-            github.event_kind({"review": {}, "pull_request": {}}),
-            "pull_request_review",
-        )
+        # CI exports GITHUB_EVENT_NAME; blank it so the payload is what decides.
+        with mock.patch.dict(os.environ, {"GITHUB_EVENT_NAME": ""}):
+            self.assertEqual(github.event_kind({"pull_request": {}}), "pull_request")
+            self.assertEqual(
+                github.event_kind({"review": {}, "pull_request": {}}),
+                "pull_request_review",
+            )
         info = github.pull_request_info(review_event())
         self.assertEqual(info["number"], 7)
         self.assertEqual(info["branch"], "agent/be-1/T-003")
