@@ -1,7 +1,14 @@
+import os
 import re
+import socket
 from datetime import datetime, timedelta, timezone
 
 ISO = "%Y-%m-%dT%H:%M:%SZ"
+
+
+def machine_name():
+    """A stable host label; `os.uname` does not exist on Windows."""
+    return socket.gethostname() or os.environ.get("COMPUTERNAME") or "localhost"
 
 
 def now():

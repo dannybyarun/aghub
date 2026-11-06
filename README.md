@@ -42,7 +42,8 @@ Claims are advisory at write time (fast, works offline, catches most races). The
 
 ## Quick start
 
-Requires Python 3.10+ and `git`.
+Requires Python 3.10+ and `git`. On Windows, run `python -m aghub` with `src`
+on `PYTHONPATH`; the `bin/aghub` wrapper is a bash script.
 
 ```bash
 python3 -m pip install -r requirements.txt
@@ -554,19 +555,23 @@ lanes get the same bytes for the same `name@version`.
 
 | File | Contents |
 |---|---|
-| `<name>.ts` | route literals, operation keys, schema types, parameter/security metadata, and a typed `ContractClient` that attaches auth and validates parameters |
-| `<name>.py` | route tuple, operation map, dataclasses, raw schema map, and a stdlib `Client` that attaches auth and validates parameters |
-| `<name>_mock.py` | standalone stdlib mock server with CORS, example responses, parameter validation (`400`), and auth enforcement (`401`) |
+| `<name>.ts` | route literals, operation keys, schema types, parameter/security metadata, body types, and a typed `ContractClient` that attaches auth and validates parameters and request bodies |
+| `<name>.py` | route tuple, operation map, dataclasses, raw schema map, and a stdlib `Client` that attaches auth and validates parameters and request bodies |
+| `<name>_mock.py` | standalone stdlib mock server with CORS, example responses, parameter and request-body validation (`400`), and auth enforcement (`401`) |
 | `<name>.sql` | starting migration inferred from component schemas, in the chosen `--dialect` |
-| `manifest.json` | contract id, sha256, dialect, security schemes, routes, and operations with their parameters and required schemes |
+| `manifest.json` | contract id, sha256, dialect, security schemes, routes, and operations with their parameters, request bodies, and required schemes |
 
 ```bash
 python3 generated/api_mock.py --port 4010
 ```
 
-The generator covers the pragmatic OpenAPI subset this protocol needs: `paths`, HTTP methods, `operationId`, `components.schemas` / Swagger `definitions`, `$ref`, arrays, enums, unions, examples, and the common scalar formats. It also reads **parameters** (path/query/header, with `required` and `enum`) and **security schemes** (`http` bearer/basic and `apiKey` in header or query, plus Swagger 2 `securityDefinitions`), threading both into the clients and the mock. The SQL migration is **dialect-aware** — `--dialect postgres` (default), `sqlite`, or `mysql` — and is a reviewable starting point, not a live schema diff.
+The generator covers the pragmatic OpenAPI subset this protocol needs: `paths`, HTTP methods, `operationId`, `components.schemas` / Swagger `definitions`, `$ref`, arrays, enums, unions, examples, and the common scalar formats. It also reads **parameters** (path/query/header, with `required` and `enum`), **request bodies** (OpenAPI 3 `requestBody`, or Swagger 2 `in: body` / `in: formData`), and **security schemes** (`http` bearer/basic and `apiKey` in header or query, plus Swagger 2 `securityDefinitions`), threading all three into the clients and the mock. The SQL migration is **dialect-aware** — `--dialect postgres` (default), `sqlite`, or `mysql` — and is a reviewable starting point, not a live schema diff.
 
-<b>Parameter validation.</b> The generated clients and mock reject a request that omits a required parameter or sends a value outside a declared `enum`. The clients raise before the request leaves the process; the mock answers `400`. Only runtime-checkable constraints are enforced — `required` and `enum` — not full JSON Schema.
+<b>Input validation.</b> The generated clients and mock reject a request that omits a required parameter or body, sends a value outside a declared `enum`, or breaks the body schema. The clients raise before the request leaves the process; the mock answers `400` with the JSON Pointer path and the reason. A required body is a compile-time obligation in TypeScript (`options: Omit<RequestOptions, "body"> & { body: CreateItem }`) and a runtime one in Python, so an agent cannot silently ship a contract violation.
+
+For request bodies the enforced subset is: `type`, `required` properties, `enum`, `nullable`, `allOf`, `anyOf` / `oneOf` (at least one branch must match), `items`, `additionalProperties` (a `false` gate or a schema), `minItems` / `maxItems`, `minLength` / `maxLength`, and `minimum` / `maximum`. A `$ref` inside the body is resolved against the contract's component schemas. Only `application/json` and `+json` media types are schema-validated; anything else (`application/octet-stream`, `multipart/form-data`) is presence-checked and passed through unchanged. `format`, `pattern`, `multipleOf`, `uniqueItems`, and remote `$ref`s are not enforced, and a `oneOf` is treated as "at least one" rather than "exactly one". Constraints outside that subset remain documentation, not a gate.
+
+Omit `body` to send no body; pass `None` in Python (or `null` in TypeScript) to send an explicit JSON `null`. That distinction is what lets a required-but-nullable body pass while a missing body is still rejected.
 
 <b>Auth schemes.</b> The clients accept a bearer token, an API key, or basic credentials and attach whatever the contract's schemes declare (an `Authorization` header, a custom header, or a query parameter). The mock returns `401` when an operation's security is non-empty and no matching credential is present; an operation with `security: []` is always public.
 
@@ -989,7 +994,7 @@ projects and delete their own rows; still, point them at a scratch database.
 - **Retention is pruning, not archival.** `--retention-days` / `--retention-events` (and `aghub hub prune`) delete old audit events and resolved review requests to bound storage; they do not archive them first, so export anything you need to keep with `aghub hub audit` beforehand. Durable task history always lives in git, not the hub.
 - **Backup/restore covers hub state, scoped per tenant.** `aghub hub backup` / `restore` move one project's snapshot, agents, leases, counters, writer lease, review packets/requests, and audit log; a token scoped to a project can only back up or restore that project. The restore skips the ephemeral SSE replay buffer and rate-limit windows and re-sequences the snapshot. It is hub state only — the board's git history is the durable record — and is implemented on the SQLite store (a Postgres-backed hub returns `501` until it grows the same methods).
 - **The merge check is sandboxed by default but is still not a security boundary.** `submit`/`queue run` execute `project.check` through the same sandbox runner as evals (`auto` uses Bubblewrap, otherwise a scrubbed snapshot). `--check-sandbox off` and `--sandbox off` intentionally opt out. Traces are signed evidence, not proof of isolation; re-run the command to reproduce.
-- **Codegen covers an OpenAPI subset.** Paths, methods, `operationId`, component schemas, `$ref`, arrays, enums, unions, examples, common scalar formats, parameters (path/query/header with `required` and `enum`), `http`/`apiKey` security schemes, and a dialect-aware starting SQL migration (`postgres`, `sqlite`, `mysql`). Parameter validation enforces only `required` and `enum`, not full JSON Schema; callbacks, discriminators, oauth2 flows, and `oneOf`-style request-body validation are not generated.
+- **Codegen covers an OpenAPI subset.** Paths, methods, `operationId`, component schemas, `$ref`, arrays, enums, unions, examples, common scalar formats, parameters (path/query/header with `required` and `enum`), request bodies (required properties, types, enums, compositions, array/string/number bounds, and `additionalProperties`), `http`/`apiKey` security schemes, and a dialect-aware starting SQL migration (`postgres`, `sqlite`, `mysql`). `format`, `pattern`, `multipleOf`, `uniqueItems`, remote `$ref`s, and discriminator/oauth2 flows are not validated, `oneOf` is treated as "at least one", and only JSON media types are schema-checked; callbacks and non-JSON bodies pass through as opaque values.
 - **Eval fingerprints identify an input, not a whole environment.** They cover command, suite, commit, tree, dirty/untracked input, and timeout. `eval rerun` compares fingerprints but does not pin toolchain or container images, and ignored files are not hashed.
 - **The eval sandbox is pragmatic.** The snapshot omits ignored files such as `.venv` or `node_modules`, so a command that needs them must install them inside the eval or use `--sandbox off`. Bubblewrap is optional and detected at runtime; without it, the fallback hides the environment but not the host filesystem or network.
 - **Evals are still local and BYOK.** The platform records the command, sandbox policy, scorecard, and freshness; it does not verify the machine or reproduce the environment.
@@ -999,7 +1004,7 @@ projects and delete their own rows; still, point them at a scratch database.
 ## Next
 
 1. Postgres parity for backup/restore/prune, plus scheduled off-box backups and point-in-time restore.
-2. Deeper codegen still: request-body validation, discriminated unions, and oauth2 flows.
+2. Deeper codegen still: discriminated unions and oauth2 flows (request bodies are now validated).
 3. Cross-shard views: a read-only aggregate over several board shards for a single pane of glass.
 4. GitHub App OAuth device flow and dismissed-review audit history across multiple boards.
 5. Reviewer-SLA escalation: auto-request a backup reviewer, page a fallback group, or reassign the review when it goes overdue, instead of only flagging it.

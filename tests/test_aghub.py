@@ -84,7 +84,8 @@ class World:
             cwd=cwd,
             env=merged,
             capture_output=True,
-            text=True,
+            encoding="utf-8",
+            errors="replace",
         )
         if check and proc.returncode != 0:
             raise AssertionError(

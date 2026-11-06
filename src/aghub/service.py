@@ -8,7 +8,7 @@ from . import codegen, gitops, keys, sandbox
 from .errors import AghubError
 from .paths import matches, overlaps
 from .ulid import new_ulid
-from .util import age_seconds, human_age, now_iso, slug
+from .util import age_seconds, human_age, machine_name, now_iso, slug
 
 EVAL_TTL_DEFAULT = 7 * 24 * 60 * 60
 EVAL_ED25519_SCHEME = "ed25519"
@@ -2223,7 +2223,7 @@ def eval_record(
         "id": new_ulid(),
         "at": now_iso(),
         "agent": agent,
-        "machine": machine or os.uname().nodename,
+        "machine": machine or machine_name(),
         "suite": suite,
         "command": command,
         "exit_code": exit_code,

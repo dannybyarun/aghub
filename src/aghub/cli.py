@@ -20,7 +20,7 @@ from .board import (
     write_local_config,
 )
 from .errors import AghubError
-from .util import ago_iso, now_iso, slug
+from .util import ago_iso, machine_name, now_iso, slug
 
 
 def _resolve_agent(args, config):
@@ -2103,7 +2103,7 @@ def cmd_heartbeat(args):
                 record.get("branch"),
                 int(state.project.get("ttl_seconds", 600)),
                 board.hub_token,
-                machine=os.uname().nodename,
+                machine=machine_name(),
             )
         except hubclient.HubError as exc:
             hubclient.warn_once(f"hub at {board.hub} is unreachable ({exc})")
@@ -3015,7 +3015,17 @@ def build_parser():
     return parser
 
 
+def _utf8_stdio():
+    """Boards print non-ASCII (`·`, `→`); never crash on a cp1252 console."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
+
+
 def main(argv=None):
+    _utf8_stdio()
     parser = build_parser()
     args = parser.parse_args(argv)
     if getattr(args, "shard", None):

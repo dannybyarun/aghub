@@ -57,6 +57,7 @@ def extract(spec):
                 security = _security_names(operation.get("security"), schemes)
             else:
                 security = list(default_security)
+            raw_parameters = _merged_parameters(item, operation, spec)
             operations.append(
                 {
                     "method": method.upper(),
@@ -66,7 +67,10 @@ def extract(spec):
                     "summary": operation.get("summary")
                     or operation.get("description")
                     or "",
-                    "parameters": _parameters(item, operation, spec),
+                    "parameters": _parameters(raw_parameters),
+                    "request_body": _request_body(
+                        item, operation, spec, raw_parameters
+                    ),
                     "security": security,
                     "response": _response_example(operation, spec),
                 }
@@ -113,8 +117,8 @@ def _param_type(schema):
     return _PARAM_KINDS.get(kind, "string")
 
 
-def _parameters(item, operation, spec):
-    """Merge path- and operation-level parameters, operation wins on conflict."""
+def _merged_parameters(item, operation, spec):
+    """Path- and operation-level parameters, operation wins on conflict."""
     collected = {}
     for source in (item.get("parameters"), operation.get("parameters")):
         if not isinstance(source, list):
@@ -128,21 +132,114 @@ def _parameters(item, operation, spec):
             location = param.get("in")
             if not name or not location:
                 continue
-            schema = param.get("schema")
-            if not isinstance(schema, dict):
-                # Swagger 2 keeps type/enum directly on the parameter.
-                schema = {
-                    "type": param.get("type"),
-                    "enum": param.get("enum"),
-                }
-            collected[(location, name)] = {
-                "name": str(name),
-                "in": str(location),
-                "required": bool(param.get("required")) or location == "path",
-                "type": _param_type(schema),
-                "enum": [value for value in (schema.get("enum") or [])],
-            }
+            collected[(location, name)] = param
     return [collected[key] for key in sorted(collected)]
+
+
+def _parameters(raw_parameters):
+    """Normalize request parameters; body/formData are handled as a request body."""
+    collected = {}
+    for param in raw_parameters:
+        name = param.get("name")
+        location = param.get("in")
+        if not name or not location or location in ("body", "formData"):
+            continue
+        schema = param.get("schema")
+        if not isinstance(schema, dict):
+            # Swagger 2 keeps type/enum directly on the parameter.
+            schema = {
+                "type": param.get("type"),
+                "enum": param.get("enum"),
+            }
+        collected[(location, name)] = {
+            "name": str(name),
+            "in": str(location),
+            "required": bool(param.get("required")) or location == "path",
+            "type": _param_type(schema),
+            "enum": [value for value in (schema.get("enum") or [])],
+        }
+    return [collected[key] for key in sorted(collected)]
+
+
+def _json_media(content):
+    """Pick the JSON media type from an OpenAPI 3 `content` map."""
+    if not isinstance(content, dict) or not content:
+        return "application/json", None
+    if "application/json" in content:
+        media = content.get("application/json")
+        return "application/json", media if isinstance(media, dict) else {}
+    for media_type in sorted(str(key) for key in content):
+        if media_type.endswith("+json"):
+            media = content.get(media_type)
+            return media_type, media if isinstance(media, dict) else {}
+    return None, None
+
+
+def _request_body(item, operation, spec, raw_parameters):
+    """Describe the request body: presence, media type, and JSON schema.
+
+    OpenAPI 3 `requestBody` wins; Swagger 2 `in: body` / `in: formData` fall back.
+    Only JSON bodies carry a schema we can validate; other media types are
+    presence-checked and passed through as opaque bytes.
+    """
+    body = operation.get("requestBody")
+    if body is None:
+        body = item.get("requestBody")
+    if isinstance(body, dict) and body.get("$ref"):
+        body = _resolve(spec, body["$ref"])
+    if isinstance(body, dict):
+        media_type, media = _json_media(body.get("content"))
+        if media_type is None:
+            content = body.get("content")
+            candidates = sorted(str(key) for key in content) if isinstance(content, dict) else []
+            media_type = candidates[0] if candidates else "application/json"
+            media = {}
+        schema = media.get("schema") if isinstance(media, dict) else None
+        return {
+            "required": bool(body.get("required")),
+            "content_type": media_type,
+            "json": media_type == "application/json" or media_type.endswith("+json"),
+            "schema": schema if isinstance(schema, dict) else None,
+            "description": str(body.get("description") or ""),
+        }
+
+    for param in raw_parameters:
+        if param.get("in") == "body":
+            schema = param.get("schema")
+            consumes = (
+                operation.get("consumes")
+                or item.get("consumes")
+                or spec.get("consumes")
+                or ["application/json"]
+            )
+            media_type = "application/json"
+            if isinstance(consumes, list):
+                json_types = [
+                    str(value)
+                    for value in consumes
+                    if str(value) == "application/json" or str(value).endswith("+json")
+                ]
+                chosen = json_types[:1] or [str(value) for value in consumes][:1]
+                if chosen:
+                    media_type = chosen[0]
+            return {
+                "required": bool(param.get("required")),
+                "content_type": media_type,
+                "json": media_type == "application/json" or media_type.endswith("+json"),
+                "schema": schema if isinstance(schema, dict) else None,
+                "description": str(param.get("description") or ""),
+            }
+
+    form = [param for param in raw_parameters if param.get("in") == "formData"]
+    if form:
+        return {
+            "required": any(bool(param.get("required")) for param in form),
+            "content_type": "multipart/form-data",
+            "json": False,
+            "schema": None,
+            "description": "",
+        }
+    return None
 
 
 def _security_schemes(spec):
@@ -221,7 +318,7 @@ def diff_specs(old_spec, new_spec):
         after = new_operations[(method, path)]
         fields = [
             field
-            for field in ("operation_id", "summary", "response")
+            for field in ("operation_id", "summary", "request_body", "response")
             if _canonical(before.get(field)) != _canonical(after.get(field))
         ]
         if fields:
@@ -334,6 +431,7 @@ def generate(name, version, meta, spec, target="all", dialect="postgres"):
                     for param in operation["parameters"]
                 ],
                 "security": operation["security"],
+                "request_body": _body_manifest(operation["request_body"]),
             }
             for operation in model["operations"]
         ],
@@ -341,6 +439,18 @@ def generate(name, version, meta, spec, target="all", dialect="postgres"):
     }
     files["manifest.json"] = json.dumps(manifest, indent=2, ensure_ascii=False) + "\n"
     return files
+
+
+def _body_manifest(body):
+    """The manifest view of a request body: small, stable, and machine-readable."""
+    if body is None:
+        return None
+    return {
+        "required": body["required"],
+        "content_type": body["content_type"],
+        "json": body["json"],
+        "schema": body["schema"],
+    }
 
 
 # -- shared helpers ------------------------------------------------------
@@ -505,6 +615,149 @@ def render_ts(name, version, sha, model):
         + ";"
     )
 
+    op_bodies = {
+        f"{operation['method']} {operation['path']}": {
+            "required": operation["request_body"]["required"],
+            "contentType": operation["request_body"]["content_type"],
+            "json": operation["request_body"]["json"],
+            "schema": operation["request_body"]["schema"],
+        }
+        for operation in model["operations"]
+        if operation["request_body"] is not None
+    }
+    lines.extend(
+        [
+            "",
+            "export interface BodySpec { required: boolean; contentType: string; "
+            "json: boolean; schema: unknown; }",
+            "export const OPERATION_BODIES: Record<string, BodySpec> = "
+            + json.dumps(op_bodies, indent=2)
+            + ";",
+            "",
+            "export const SCHEMAS: Record<string, unknown> = "
+            + json.dumps(model["schemas"], indent=2)
+            + ";",
+            "",
+            "function resolveRef(ref: string, schemas: Record<string, unknown>): "
+            "Record<string, any> {",
+            '  const match = /^#\\/(?:components\\/schemas|definitions)\\/(.+)$/.exec(ref);',
+            "  if (!match) return {};",
+            "  let node: any = schemas;",
+            "  for (const raw of match[1].split(\"/\")) {",
+            "    const part = raw.replace(/~1/g, \"/\").replace(/~0/g, \"~\");",
+            "    if (!node || typeof node !== \"object\" || !(part in node)) return {};",
+            "    node = node[part];",
+            "  }",
+            "  return node && typeof node === \"object\" && !Array.isArray(node) ? node : {};",
+            "}",
+            "",
+            "function bodyError(",
+            "  schema: unknown,",
+            "  value: unknown,",
+            "  path: string,",
+            "  schemas: Record<string, unknown>,",
+            "  depth = 0,",
+            "): string | null {",
+            "  if (!schema || typeof schema !== \"object\" || depth > 16) return null;",
+            "  let node = schema as Record<string, any>;",
+            "  let hops = 0;",
+            "  while (typeof node.$ref === \"string\" && hops < 32) {",
+            "    node = resolveRef(node.$ref, schemas);",
+            "    hops += 1;",
+            "  }",
+            "  if (!node || typeof node !== \"object\") return null;",
+            "  const where = path || \"/\";",
+            "  const kinds: string[] = Array.isArray(node.type) ? node.type : "
+            "node.type ? [node.type] : [];",
+            "  const nullable = node.nullable === true || kinds.includes(\"null\");",
+            "  if (value === null) return nullable ? null : where + \": null is not allowed\";",
+            "  if (Array.isArray(node.enum) && node.enum.length) {",
+            "    const rendered = node.enum.map((item: unknown) => JSON.stringify(item));",
+            "    if (!rendered.includes(JSON.stringify(value))) {",
+            "      return where + \": must be one of \" + JSON.stringify(node.enum);",
+            "    }",
+            "  }",
+            "  if (Array.isArray(node.allOf)) {",
+            "    for (const part of node.allOf) {",
+            "      const error = bodyError(part, value, path, schemas, depth + 1);",
+            "      if (error) return error;",
+            "    }",
+            "  }",
+            "  const union = Array.isArray(node.anyOf) ? node.anyOf : "
+            "Array.isArray(node.oneOf) ? node.oneOf : null;",
+            "  if (union) {",
+            "    const matched = union.some(",
+            "      (part: unknown) => bodyError(part, value, path, schemas, depth + 1) === null,",
+            "    );",
+            "    if (!matched) return where + \": does not match any allowed schema\";",
+            "  }",
+            "  const kind = kinds.find((item) => item !== \"null\") || \"\";",
+            "  if (kind === \"object\" || (!kind && node.properties)) {",
+            "    if (typeof value !== \"object\" || Array.isArray(value)) {",
+            "      return where + \": expected object\";",
+            "    }",
+            "    const record = value as Record<string, unknown>;",
+            "    for (const key of node.required || []) {",
+            "      if (!(key in record)) return where + \": missing required property \" + JSON.stringify(key);",
+            "    }",
+            "    const properties = node.properties && typeof node.properties === \"object\" "
+            "? node.properties : {};",
+            "    for (const key of Object.keys(record)) {",
+            "      if (key in properties) {",
+            "        const error = bodyError(properties[key], record[key], path + \"/\" + key, "
+            "schemas, depth + 1);",
+            "        if (error) return error;",
+            "      } else if (node.additionalProperties === false) {",
+            "        return where + \": unexpected property \" + JSON.stringify(key);",
+            "      } else if (node.additionalProperties && "
+            "typeof node.additionalProperties === \"object\") {",
+            "        const error = bodyError(node.additionalProperties, record[key], "
+            "path + \"/\" + key, schemas, depth + 1);",
+            "        if (error) return error;",
+            "      }",
+            "    }",
+            "  } else if (kind === \"array\" || (!kind && node.items)) {",
+            "    if (!Array.isArray(value)) return where + \": expected array\";",
+            "    if (typeof node.minItems === \"number\" && value.length < node.minItems) {",
+            "      return where + \": expected at least \" + node.minItems + \" item(s)\";",
+            "    }",
+            "    if (typeof node.maxItems === \"number\" && value.length > node.maxItems) {",
+            "      return where + \": expected at most \" + node.maxItems + \" item(s)\";",
+            "    }",
+            "    if (node.items && typeof node.items === \"object\") {",
+            "      for (let index = 0; index < value.length; index += 1) {",
+            "        const error = bodyError(node.items, value[index], path + \"/\" + index, "
+            "schemas, depth + 1);",
+            "        if (error) return error;",
+            "      }",
+            "    }",
+            "  } else if (kind === \"string\") {",
+            "    if (typeof value !== \"string\") return where + \": expected string\";",
+            "    if (typeof node.minLength === \"number\" && value.length < node.minLength) {",
+            "      return where + \": expected at least \" + node.minLength + \" character(s)\";",
+            "    }",
+            "    if (typeof node.maxLength === \"number\" && value.length > node.maxLength) {",
+            "      return where + \": expected at most \" + node.maxLength + \" character(s)\";",
+            "    }",
+            "  } else if (kind === \"integer\" || kind === \"number\") {",
+            "    const numeric = typeof value === \"number\" && Number.isFinite(value);",
+            "    if (!numeric || (kind === \"integer\" && !Number.isInteger(value as number))) {",
+            "      return where + \": expected \" + kind;",
+            "    }",
+            "    if (typeof node.minimum === \"number\" && (value as number) < node.minimum) {",
+            "      return where + \": must be >= \" + node.minimum;",
+            "    }",
+            "    if (typeof node.maximum === \"number\" && (value as number) > node.maximum) {",
+            "      return where + \": must be <= \" + node.maximum;",
+            "    }",
+            "  } else if (kind === \"boolean\") {",
+            "    if (typeof value !== \"boolean\") return where + \": expected boolean\";",
+            "  }",
+            "  return null;",
+            "}",
+        ]
+    )
+
     schemas = model["schemas"]
     if schemas:
         lines.extend(["", "// -- schemas --"])
@@ -563,6 +816,20 @@ def render_ts(name, version, sha, model):
             "JSON.stringify(spec.enum));",
             "      }",
             "    }",
+            "    const bodySpec = OPERATION_BODIES[operation];",
+            "    if (!bodySpec) return;",
+            "    if (options.body === undefined) {",
+            '      if (bodySpec.required) throw new Error(operation + ": missing required request body");',
+            "      return;",
+            "    }",
+            "    if (!bodySpec.json || !bodySpec.schema) return;",
+            "    const error = bodyError(bodySpec.schema, options.body, \"\", SCHEMAS);",
+            "    if (error) throw new Error(operation + \": invalid request body at \" + error);",
+            "  }",
+            "",
+            "  private bodyContentType(operation: string): string {",
+            "    const spec = OPERATION_BODIES[operation];",
+            '    return spec ? spec.contentType : "application/json";',
             "  }",
             "",
             "  private applyAuth(headers: Record<string, string>, search: URLSearchParams): void {",
@@ -592,15 +859,21 @@ def render_ts(name, version, sha, model):
             "      if (value !== undefined) search.set(key, String(value));",
             "    }",
             "    const headers: Record<string, string> = {",
-            '      "Content-Type": "application/json",',
+            '      "Content-Type": this.bodyContentType(operation),',
             "      ...(options.headers || {}),",
             "    };",
             "    this.applyAuth(headers, search);",
             '    if (search.toString()) url += "?" + search.toString();',
+            "    const bodySpec = OPERATION_BODIES[operation];",
+            "    const body = options.body === undefined",
+            "      ? undefined",
+            "      : bodySpec && !bodySpec.json",
+            "        ? (options.body as BodyInit)",
+            "        : JSON.stringify(options.body);",
             "    const response = await this.fetcher(url, {",
             "      method,",
             "      headers,",
-            "      body: options.body === undefined ? undefined : JSON.stringify(options.body),",
+            "      body,",
             "    });",
             "    const text = await response.text();",
             "    const data = text ? JSON.parse(text) : null;",
@@ -621,12 +894,38 @@ def render_ts(name, version, sha, model):
             counter += 1
         used.add(method_name)
         key = f"{operation['method']} {operation['path']}"
+        signature = "options: RequestOptions = {}"
+        body = operation.get("request_body")
+        if body and body.get("json") and body.get("schema"):
+            rendered = _body_ts_type(body["schema"], model)
+            if rendered:
+                if body["required"]:
+                    signature = (
+                        'options: Omit<RequestOptions, "body"> & { body: '
+                        + rendered
+                        + " }"
+                    )
+                else:
+                    signature = (
+                        "options: RequestOptions & { body?: " + rendered + " } = {}"
+                    )
         lines.append(
-            f"  async {method_name}(options: RequestOptions = {{}}): Promise<unknown> "
+            f"  async {method_name}({signature}): Promise<unknown> "
             f"{{ return this.call({json.dumps(key)}, options); }}"
         )
     lines.append("}")
     return "\n".join(lines).rstrip() + "\n"
+
+
+def _body_ts_type(schema, model):
+    """The TypeScript type for a request body, or None if its $ref is unknown."""
+    if not isinstance(schema, dict):
+        return None
+    ref = schema.get("$ref")
+    if ref:
+        name = str(ref).rsplit("/", 1)[-1]
+        return _type_name(name) if name in model["schemas"] else None
+    return _ts_type(schema, model["spec"])
 
 
 def _ts_property(name, schema, required, spec):
@@ -706,6 +1005,7 @@ def render_py(name, version, sha, model):
         "from __future__ import annotations",
         "",
         "import json as _json",
+        "import math as _math",
         "import base64 as _base64",
         "import urllib.parse as _urlparse",
         "import urllib.request as _urlreq",
@@ -756,6 +1056,15 @@ def render_py(name, version, sha, model):
         schema = model["schemas"][key]
         lines.append(f"    {key!r}: {_py_literal(schema)},")
     lines.append("}")
+    lines.append("")
+    lines.append("OPERATION_BODIES: dict[str, Any] = {")
+    for operation in model["operations"]:
+        if operation["request_body"] is None:
+            continue
+        key = f"{operation['method']} {operation['path']}"
+        lines.append(f"    {key!r}: {_py_literal(_body_manifest(operation['request_body']))},")
+    lines.append("}")
+    lines.extend(_py_body_helpers())
 
     for key in sorted(model["schemas"]):
         schema = model["schemas"][key]
@@ -821,6 +1130,24 @@ def render_py(name, version, sha, model):
             "                    f\"{spec['enum']}\"",
             "                )",
             "",
+            "    def _check_body(self, method: str, path_template: str, body: Any) -> None:",
+            "        spec = OPERATION_BODIES.get(method + ' ' + path_template)",
+            "        if spec is None:",
+            "            return",
+            "        if body is _UNSET:",
+            "            if spec.get('required'):",
+            "                raise ValueError(",
+            "                    f\"{method} {path_template}: missing required request body\"",
+            "                )",
+            "            return",
+            "        if not spec.get('json') or not spec.get('schema'):",
+            "            return",
+            "        error = _body_error(spec['schema'], body, '', SCHEMAS)",
+            "        if error:",
+            "            raise ValueError(",
+            "                f\"{method} {path_template}: invalid request body at {error}\"",
+            "            )",
+            "",
             "    def _apply_auth(self, headers: dict[str, str], values: dict[str, Any]) -> None:",
             "        for scheme in SECURITY_SCHEMES.values():",
             "            kind = scheme.get('type')",
@@ -841,10 +1168,11 @@ def render_py(name, version, sha, model):
             "        path_template: str,",
             "        path_params: dict[str, Any] | None = None,",
             "        query: dict[str, Any] | None = None,",
-            "        body: Any = None,",
+            "        body: Any = _UNSET,",
             "        headers: dict[str, str] | None = None,",
             "    ) -> Any:",
             "        self._validate(method, path_template, path_params, query)",
+            "        self._check_body(method, path_template, body)",
             "        path = path_template",
             "        for key, value in (path_params or {}).items():",
             "            path = path.replace('{' + key + '}', _urlparse.quote(str(value), safe=''))",
@@ -854,9 +1182,21 @@ def render_py(name, version, sha, model):
             "        if values:",
             "            path += ('&' if '?' in path else '?') + _urlparse.urlencode(values)",
             "        payload = None",
-            "        if body is not None:",
-            "            payload = _json.dumps(body).encode('utf-8')",
-            "            request_headers.setdefault('Content-Type', 'application/json')",
+            "        if body is not _UNSET:",
+            "            spec = OPERATION_BODIES.get(method + ' ' + path_template) or {}",
+            "            if (",
+            "                spec",
+            "                and not spec.get('json')",
+            "                and isinstance(body, (bytes, bytearray, str))",
+            "            ):",
+            "                payload = (",
+            "                    body.encode('utf-8') if isinstance(body, str) else bytes(body)",
+            "                )",
+            "            else:",
+            "                payload = _json.dumps(body).encode('utf-8')",
+            "            request_headers.setdefault(",
+            "                'Content-Type', spec.get('content_type', 'application/json')",
+            "            )",
             "        request = _urlreq.Request(",
             "            self.base_url + path, data=payload, method=method, headers=request_headers",
             "        )",
@@ -881,7 +1221,7 @@ def render_py(name, version, sha, model):
                 "        self,",
                 "        path_params: dict[str, Any] | None = None,",
                 "        query: dict[str, Any] | None = None,",
-                "        body: Any = None,",
+                "        body: Any = _UNSET,",
                 "    ) -> Any:",
                 f"        return self.call({operation['method']!r}, {operation['path']!r}, "
                 "path_params, query, body)",
@@ -929,6 +1269,142 @@ def _py_ann(schema, spec, depth=0):
 
 def _py_literal(value):
     return pprint.pformat(value, width=100, sort_dicts=False)
+
+
+_PY_BODY_HELPERS = '''\
+_UNSET = object()
+
+
+def _resolve_ref(ref: Any, schemas: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(ref, str) or not ref.startswith("#/"):
+        return {}
+    parts = ref[2:].split("/")
+    if parts[0] == "components":
+        if len(parts) < 3 or parts[1] != "schemas":
+            return {}
+        parts = parts[2:]
+    elif parts[0] == "definitions":
+        parts = parts[1:]
+    else:
+        return {}
+    node: Any = schemas
+    for raw in parts:
+        part = raw.replace("~1", "/").replace("~0", "~")
+        if not isinstance(node, dict) or part not in node:
+            return {}
+        node = node[part]
+    return node if isinstance(node, dict) else {}
+
+
+def _body_error(
+    schema: Any, value: Any, path: str, schemas: dict[str, Any], depth: int = 0
+) -> str | None:
+    if not isinstance(schema, dict) or depth > 16:
+        return None
+    hops = 0
+    while isinstance(schema.get("$ref"), str) and hops < 32:
+        schema = _resolve_ref(schema["$ref"], schemas)
+        hops += 1
+    if not isinstance(schema, dict):
+        return None
+    where = path or "/"
+    kinds = schema.get("type")
+    kinds = kinds if isinstance(kinds, list) else ([kinds] if kinds else [])
+    nullable = schema.get("nullable") is True or "null" in kinds
+    if value is None:
+        return None if nullable else where + ": null is not allowed"
+    enum = schema.get("enum")
+    if isinstance(enum, list) and enum and value not in enum:
+        return where + ": must be one of " + _json.dumps(enum)
+    if isinstance(schema.get("allOf"), list):
+        for part in schema["allOf"]:
+            error = _body_error(part, value, path, schemas, depth + 1)
+            if error:
+                return error
+    union = schema.get("anyOf")
+    if not isinstance(union, list):
+        union = schema.get("oneOf")
+    if isinstance(union, list) and union:
+        if not any(
+            _body_error(part, value, path, schemas, depth + 1) is None
+            for part in union
+        ):
+            return where + ": does not match any allowed schema"
+    kind = next((item for item in kinds if item != "null"), "")
+    if kind == "object" or (not kind and isinstance(schema.get("properties"), dict)):
+        if not isinstance(value, dict):
+            return where + ": expected object"
+        for key in schema.get("required") or []:
+            if key not in value:
+                return where + ": missing required property " + _json.dumps(key)
+        properties = schema.get("properties")
+        if not isinstance(properties, dict):
+            properties = {}
+        for key, item in value.items():
+            if key in properties:
+                error = _body_error(
+                    properties[key], item, path + "/" + str(key), schemas, depth + 1
+                )
+                if error:
+                    return error
+            elif schema.get("additionalProperties") is False:
+                return where + ": unexpected property " + _json.dumps(key)
+            elif isinstance(schema.get("additionalProperties"), dict):
+                error = _body_error(
+                    schema["additionalProperties"],
+                    item,
+                    path + "/" + str(key),
+                    schemas,
+                    depth + 1,
+                )
+                if error:
+                    return error
+    elif kind == "array" or (not kind and isinstance(schema.get("items"), dict)):
+        if not isinstance(value, list):
+            return where + ": expected array"
+        minimum = schema.get("minItems")
+        if isinstance(minimum, int) and len(value) < minimum:
+            return where + ": expected at least " + str(minimum) + " item(s)"
+        maximum = schema.get("maxItems")
+        if isinstance(maximum, int) and len(value) > maximum:
+            return where + ": expected at most " + str(maximum) + " item(s)"
+        if isinstance(schema.get("items"), dict):
+            for index, item in enumerate(value):
+                error = _body_error(
+                    schema["items"], item, path + "/" + str(index), schemas, depth + 1
+                )
+                if error:
+                    return error
+    elif kind == "string":
+        if not isinstance(value, str):
+            return where + ": expected string"
+        minimum = schema.get("minLength")
+        if isinstance(minimum, int) and len(value) < minimum:
+            return where + ": expected at least " + str(minimum) + " character(s)"
+        maximum = schema.get("maxLength")
+        if isinstance(maximum, int) and len(value) > maximum:
+            return where + ": expected at most " + str(maximum) + " character(s)"
+    elif kind in ("integer", "number"):
+        numeric = isinstance(value, (int, float)) and not isinstance(value, bool)
+        if isinstance(value, float) and not _math.isfinite(value):
+            numeric = False
+        if not numeric or (kind == "integer" and not isinstance(value, int)):
+            return where + ": expected " + kind
+        minimum = schema.get("minimum")
+        if isinstance(minimum, (int, float)) and value < minimum:
+            return where + ": must be >= " + str(minimum)
+        maximum = schema.get("maximum")
+        if isinstance(maximum, (int, float)) and value > maximum:
+            return where + ": must be <= " + str(maximum)
+    elif kind == "boolean":
+        if not isinstance(value, bool):
+            return where + ": expected boolean"
+    return None
+'''
+
+
+def _py_body_helpers():
+    return _PY_BODY_HELPERS.splitlines()
 
 
 # -- SQL migration -------------------------------------------------------
@@ -1096,11 +1572,25 @@ def render_mock(name, version, sha, model):
         width=100,
         sort_dicts=False,
     )
+    bodies = pprint.pformat(
+        {
+            (operation["method"], operation["path"]): _body_manifest(
+                operation["request_body"]
+            )
+            for operation in model["operations"]
+            if operation["request_body"] is not None
+        },
+        width=100,
+        sort_dicts=False,
+    )
+    schemas = pprint.pformat(model["schemas"], width=100, sort_dicts=False)
+    body_helpers = _PY_BODY_HELPERS.replace("_json.", "json.").replace("_math.", "math.")
     template = '''#!/usr/bin/env python3
 """Mock server generated by aghub from $CONTRACT$ (sha256 $SHA$)."""
 
 import argparse
 import json
+import math
 import re
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
@@ -1115,9 +1605,15 @@ RESPONSES = $RESPONSES$
 
 PARAMETERS = $PARAMETERS$
 
+BODIES = $BODIES$
+
 SECURITY = $SECURITY$
 
 SECURITY_SCHEMES = $SCHEMES$
+
+SCHEMAS = $SCHEMAS$
+
+$BODY_HELPERS$
 
 
 def route_pattern(route):
@@ -1188,6 +1684,29 @@ def validate_params(method, route, query):
     return None
 
 
+def validate_body(method, route, raw, content_type=""):
+    spec = BODIES.get((method, route))
+    if spec is None:
+        return None
+    if not raw:
+        if spec["required"]:
+            return {"error": "missing request body", "required": True}
+        return None
+    if not spec["json"] or not spec["schema"]:
+        return None
+    if content_type and "json" not in content_type.lower():
+        return {"error": "unsupported content type", "expected": spec["content_type"]}
+    try:
+        value = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return {"error": "invalid JSON body"}
+    problem = _body_error(spec["schema"], value, "", SCHEMAS)
+    if problem:
+        where, _, detail = problem.partition(": ")
+        return {"error": "invalid request body", "path": where, "detail": detail}
+    return None
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "aghub-mock/1.0"
 
@@ -1236,6 +1755,23 @@ class Handler(BaseHTTPRequestHandler):
         if param_error is not None:
             self._send(400, param_error)
             return
+        length = self.headers.get("Content-Length")
+        raw = b""
+        if length:
+            try:
+                size = int(length)
+            except ValueError:
+                size = 0
+            if size > 1048576:
+                self._send(413, {"error": "request body too large"})
+                return
+            raw = self.rfile.read(size) if size else b""
+        body_error = validate_body(
+            self.command, route, raw, self.headers.get("Content-Type", "")
+        )
+        if body_error is not None:
+            self._send(400, body_error)
+            return
         self._send(200, result["response"])
 
     do_GET = _handle
@@ -1274,8 +1810,11 @@ if __name__ == "__main__":
         .replace("$OPERATIONS$", operations)
         .replace("$RESPONSES$", responses)
         .replace("$PARAMETERS$", parameters)
+        .replace("$BODIES$", bodies)
         .replace("$SECURITY$", security)
         .replace("$SCHEMES$", schemes)
+        .replace("$SCHEMAS$", schemas)
+        .replace("$BODY_HELPERS$", body_helpers)
     )
 
 

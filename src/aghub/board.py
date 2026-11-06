@@ -11,7 +11,7 @@ import yaml
 from . import gitops, keys
 from .errors import AghubError
 from .ulid import new_ulid
-from .util import age_seconds, now_iso, slug
+from .util import age_seconds, machine_name, now_iso, slug
 
 BOARD_BRANCH = "aghub/board"
 BOARD_ATTEMPTS = max(
@@ -405,7 +405,7 @@ class State:
         age = age_seconds(agent.get("last_seen"))
         if age is None or age >= min_interval:
             agent["last_seen"] = now_iso()
-        agent["machine"] = os.uname().nodename
+        agent["machine"] = machine_name()
         return agent
 
 
@@ -509,7 +509,17 @@ class Board:
 
     def _commit(self, label):
         gitops.git(["add", "-A"], cwd=self.dir)
-        gitops.git(["commit", "-m", f"aghub: {label}"], cwd=self.dir)
+        result = gitops.git(
+            ["commit", "-m", f"aghub: {label}"], cwd=self.dir, check=False
+        )
+        if result.returncode != 0:
+            detail = (result.stdout or "") + (result.stderr or "")
+            if "nothing to commit" in detail or "no changes added" in detail:
+                # A rewritten-but-identical file (e.g. Windows autocrlf) can
+                # look dirty to `git status` and clean to `git add`.
+                return False
+            raise AghubError(f"git commit failed: {detail.strip()}")
+        return True
 
     def _board_lock_settings(self):
         try:
@@ -542,7 +552,7 @@ class Board:
         from . import hubclient
 
         project = self.project_name()
-        holder = f"{agent or 'board'}@{os.uname().nodename}:{os.getpid()}"
+        holder = f"{agent or 'board'}@{machine_name()}:{os.getpid()}"
         ttl, wait = self._board_lock_settings()
         deadline = time.monotonic() + wait
         delay = 0.05
@@ -664,7 +674,9 @@ class Board:
                 if not self._dirty():
                     self._publish(state, agent, fencing)
                     return results
-                self._commit(label)
+                if not self._commit(label):
+                    self._publish(state, agent, fencing)
+                    return results
                 if not self.remote:
                     self._publish(state, agent, fencing)
                     return results
@@ -742,7 +754,7 @@ class Board:
                     record.get("branch"),
                     int(state.project.get("ttl_seconds", 600)),
                     self.hub_token,
-                    machine=os.uname().nodename,
+                    machine=machine_name(),
                 )
         except hubclient.HubConflict as exc:
             hubclient.warn_once(
@@ -834,6 +846,14 @@ def init_board(
         ).stdout.strip()
         gitops.git(["update-ref", f"refs/heads/{branch}", commit], cwd=repo)
         gitops.git(["worktree", "add", target, branch], cwd=repo)
+
+    # Board files are data, not source: keep LF on checkout so a rewritten
+    # YAML file is byte-identical on every platform. Without this, Windows
+    # `core.autocrlf` makes every read -> write cycle look dirty.
+    attributes = os.path.join(target, ".gitattributes")
+    if not os.path.exists(attributes):
+        with open(attributes, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write("* text eol=lf\n")
 
     if shard_slug:
         existing.setdefault("boards", {})[shard_slug] = {
