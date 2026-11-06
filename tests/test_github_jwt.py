@@ -6,6 +6,7 @@ secrets or real GitHub API calls are needed.
 """
 
 import base64
+import http.client
 import json
 import sys
 import threading
@@ -390,20 +391,20 @@ class WebhookServerTests(unittest.TestCase):
         thread.start()
         try:
             port = server.server_address[1]
-            bad = urllib.request.Request(
-                f"http://127.0.0.1:{port}/",
-                data=b"{" + b" " * github.MAX_WEBHOOK_BYTES + b"}",
-                headers={
-                    "X-GitHub-Event": "push",
-                    "X-Hub-Signature-256": github.webhook_signature(
-                        WEBHOOK_SECRET, b"{" + b" " * github.MAX_WEBHOOK_BYTES + b"}"
-                    ),
-                },
-                method="POST",
-            )
-            with self.assertRaises(urllib.error.HTTPError) as raised:
-                urllib.request.urlopen(bad)
-            self.assertEqual(raised.exception.code, 413)
+            # Announce an oversized body but send none. The handler rejects on
+            # Content-Length before reading, so this cannot race the client's
+            # upload the way a real oversized body can (BrokenPipeError).
+            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+            try:
+                conn.putrequest("POST", "/")
+                conn.putheader("X-GitHub-Event", "push")
+                conn.putheader("Content-Length", str(github.MAX_WEBHOOK_BYTES + 2))
+                conn.endheaders()
+                response = conn.getresponse()
+                self.assertEqual(response.status, 413)
+                response.read()
+            finally:
+                conn.close()
         finally:
             server.shutdown()
             server.server_close()

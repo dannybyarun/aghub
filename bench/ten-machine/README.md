@@ -67,6 +67,8 @@ Only these changes were made:
 - The tunnel URL, account names, and token literals were removed from the evidence extracts and
   moved to `AGHUB_HUB_URL`, `AGHUB_TOKEN`, and `AGHUB_PROJECT` in the collector scripts.
 - `agent.sh` gained a header stating that the private `app/` tree is absent.
+- The project name was removed from the `tasks.yaml` header comment; lane titles and paths are
+  unchanged.
 
 The `EVIDENCE` lines are otherwise verbatim. Nothing was added to make the numbers look better.
 
